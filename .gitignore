@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Recording outputs
+records/
+records_*/
+image_records/
+image_records_*/
+*_sample/
+ui_debug_sample/
+alignment_meta_sample/
+
+# Temporary/debug artifacts
+.DS_Store
+*.log
+*.tmp
