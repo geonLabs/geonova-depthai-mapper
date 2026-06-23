@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import shutil
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,37 +43,46 @@ def _duration_text(seconds: float) -> str:
 def _progress_text(
     completed: int,
     total: int,
-    current_frame: int,
     batch_detections: int,
     total_detections: int,
-    total_points: int,
     elapsed_s: float,
 ) -> str:
     ratio = completed / total if total else 1.0
-    progress_width = 28
+    terminal_width = shutil.get_terminal_size((120, 20)).columns
+    progress_width = 12 if terminal_width < 96 else 20
     filled = min(progress_width, int(ratio * progress_width))
     progress_bar = "█" * filled + "·" * (progress_width - filled)
-
-    detection_width = 8
-    detection_level = min(detection_width, batch_detections)
-    detection_bar = "█" * detection_level + "·" * (detection_width - detection_level)
-    detection_suffix = "+" if batch_detections > detection_width else ""
 
     fps = completed / elapsed_s if elapsed_s > 0 else 0.0
     remaining = total - completed
     eta_s = remaining / fps if fps > 0 else 0.0
+    if terminal_width < 96:
+        return (
+            f"[{progress_bar}] {ratio * 100:5.1f}% {completed}/{total} "
+            f"ETA {_duration_text(eta_s)} DET +{batch_detections}/{total_detections}"
+        )
+
+    detection_width = 5
+    detection_level = min(detection_width, batch_detections)
+    detection_bar = "█" * detection_level + "·" * (detection_width - detection_level)
     return (
-        f"[{progress_bar}] {ratio * 100:6.2f}% | "
-        f"{completed}/{total} | frame {current_frame} | {fps:5.2f} fps | "
-        f"ETA {_duration_text(eta_s)} | "
-        f"detect [{detection_bar}]{detection_suffix} +{batch_detections} "
-        f"total={total_detections} | points={total_points}"
+        f"YOLO [{progress_bar}] {ratio * 100:5.1f}%  {completed}/{total}  "
+        f"{fps:4.1f}fps  ETA {_duration_text(eta_s)}  "
+        f"DET [{detection_bar}] +{batch_detections}  total {total_detections}"
     )
 
 
 def _draw_progress(line: str, finished: bool = False) -> None:
-    # Padding clears characters left from a previously longer status line.
-    print(f"\r{line:<180}", end="\n" if finished else "", flush=True)
+    if not sys.stdout.isatty():
+        if finished:
+            print(line, flush=True)
+        return
+    terminal_width = max(20, shutil.get_terminal_size((120, 20)).columns)
+    visible_line = line[: terminal_width - 1]
+    sys.stdout.write("\r\033[2K" + visible_line)
+    if finished:
+        sys.stdout.write("\n")
+    sys.stdout.flush()
 
 
 @dataclass(frozen=True)
@@ -250,7 +261,7 @@ def run_dataset(
     print(f"[YOLO] Save: {output_dir}", flush=True)
     progress_started_at = time.monotonic()
     _draw_progress(
-        _progress_text(0, len(indices), indices[0], 0, 0, 0, 0.0)
+        _progress_text(0, len(indices), 0, 0, 0.0)
     )
 
     def batched_predictions():
@@ -293,10 +304,8 @@ def run_dataset(
                 _progress_text(
                     completed,
                     len(indices),
-                    batch_indices[-1],
                     batch_detection_count,
                     total_detections,
-                    len(point_rows),
                     time.monotonic() - progress_started_at,
                 ),
                 finished=completed == len(indices),
