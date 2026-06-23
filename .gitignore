@@ -11,6 +11,7 @@ image_records_*/
 *_sample/
 ui_debug_sample/
 alignment_meta_sample/
+depthai_refactored/test_output/
 
 # Temporary/debug artifacts
 .DS_Store
