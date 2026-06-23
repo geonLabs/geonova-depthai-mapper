@@ -161,6 +161,7 @@ def run_dataset(
     max_frames: int = 100,
     stride: int = 1,
     confidence: float = 0.25,
+    batch_size: int = 4,
     image_size: int = 1280,
     device: str | None = None,
     classes: list[int] | None = None,
@@ -179,8 +180,10 @@ def run_dataset(
         raise ValueError("start_frame must be at least 200 for post-warm-up comparison.")
     if start_frame >= dataset.frame_count:
         raise ValueError(f"start_frame {start_frame} exceeds {dataset.frame_count} frames.")
-    if max_frames <= 0 or stride <= 0:
-        raise ValueError("max_frames and stride must be positive.")
+    if max_frames <= 0 or stride <= 0 or batch_size <= 0:
+        raise ValueError("max_frames, stride, and batch_size must be positive.")
+    if not 0.0 <= confidence <= 1.0:
+        raise ValueError("confidence must be between 0.0 and 1.0.")
 
     model = YOLO(str(model_path))
     if model.task != "segment":
@@ -193,23 +196,41 @@ def run_dataset(
     world_count = 0
 
     stop = min(dataset.frame_count, start_frame + max_frames * stride)
-    indices = range(start_frame, stop, stride)
-    for frame_index in indices:
-        frame = dataset.frame(frame_index)
-        image = cv2.imread(str(frame["rgb_path"]), cv2.IMREAD_COLOR)
-        if image is None:
-            raise ValueError(f"Failed to read RGB image: {frame['rgb_path']}")
+    indices = list(range(start_frame, stop, stride))
+
+    def batched_predictions():
+        for offset in range(0, len(indices), batch_size):
+            batch_indices = indices[offset : offset + batch_size]
+            batch_items = []
+            for frame_index in batch_indices:
+                frame = dataset.frame(frame_index)
+                image = cv2.imread(str(frame["rgb_path"]), cv2.IMREAD_COLOR)
+                if image is None:
+                    raise ValueError(f"Failed to read RGB image: {frame['rgb_path']}")
+                batch_items.append((frame_index, frame, image))
+
+            predict_args = {
+                "source": [item[2] for item in batch_items],
+                "batch": len(batch_items),
+                "conf": confidence,
+                "imgsz": image_size,
+                "classes": classes,
+                "verbose": False,
+            }
+            if device:
+                predict_args["device"] = device
+            results = model.predict(**predict_args)
+            if len(results) != len(batch_items):
+                raise RuntimeError(
+                    f"YOLO returned {len(results)} results for a batch of {len(batch_items)} images."
+                )
+            yield from (
+                (frame_index, frame, image, result)
+                for (frame_index, frame, image), result in zip(batch_items, results)
+            )
+
+    for frame_index, frame, image, result in batched_predictions():
         depth = get_depth_frame(dataset, frame_index)
-        predict_args = {
-            "source": image,
-            "conf": confidence,
-            "imgsz": image_size,
-            "classes": classes,
-            "verbose": False,
-        }
-        if device:
-            predict_args["device"] = device
-        result = model.predict(**predict_args)[0]
         overlay = image.copy()
         frame_detections = []
 
@@ -347,6 +368,9 @@ def run_dataset(
         "start_frame": start_frame,
         "processed_frames": len(detection_rows),
         "stride": stride,
+        "confidence": confidence,
+        "batch_size": batch_size,
+        "image_size": image_size,
         "detections": sum(row["detection_count"] for row in detection_rows),
         "points": len(point_rows),
         "world_points": world_count,
@@ -372,7 +396,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-frame", type=int, default=200)
     parser.add_argument("--max-frames", type=int, default=100)
     parser.add_argument("--stride", type=int, default=1)
-    parser.add_argument("--confidence", type=float, default=0.25)
+    parser.add_argument("--confidence", "--conf", dest="confidence", type=float, default=0.25)
+    parser.add_argument("--batch-size", "--batch", dest="batch_size", type=int, default=4)
     parser.add_argument("--image-size", type=int, default=1280)
     parser.add_argument("--device")
     parser.add_argument("--classes", type=int, nargs="+")
@@ -396,6 +421,7 @@ def main() -> None:
         max_frames=args.max_frames,
         stride=args.stride,
         confidence=args.confidence,
+        batch_size=args.batch_size,
         image_size=args.image_size,
         device=args.device,
         classes=args.classes,

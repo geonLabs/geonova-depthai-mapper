@@ -109,8 +109,14 @@ RGB-D 테스트 결과는 기본적으로 `test_output/rgbd/`에 저장됩니다
   --dataset image_records/2026-06-23_14-20-20_raw \
   --model best.pt \
   --start-frame 200 \
-  --max-frames 100
+  --max-frames 100 \
+  --batch 4 \
+  --conf 0.25
 ```
+
+`--batch-size`(축약 `--batch`)는 한 번의 YOLO 추론에 묶을 이미지 수이며 기본값은
+4입니다. GPU/메모리에 여유가 있으면 높이고 메모리 부족이 발생하면 낮춥니다.
+`--confidence`(축약 `--conf`)는 검출 confidence 임계값이며 기본값은 0.25입니다.
 
 기본 출력은 데이터셋의 `yolo_seg/`에 생성됩니다.
 
