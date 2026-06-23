@@ -227,8 +227,12 @@ def run_dataset(
     dataset_root = dataset_root.expanduser().resolve()
     model_path = model_path.expanduser().resolve()
     output_dir = (output_dir or dataset_root / "yolo_seg").expanduser().resolve()
-    overlays_dir = output_dir / "overlays"
-    overlays_dir.mkdir(parents=True, exist_ok=True)
+    detected_rgb_dir = output_dir / "detected_rgb"
+    shutil.rmtree(detected_rgb_dir, ignore_errors=True)
+    detected_rgb_dir.mkdir(parents=True, exist_ok=True)
+    # Remove overlays produced by older versions; current output keeps the
+    # original RGB only for frames where a detection exists.
+    shutil.rmtree(output_dir / "overlays", ignore_errors=True)
 
     print("[YOLO] Loading dataset and model...", flush=True)
     dataset = Dataset(dataset_root)
@@ -312,8 +316,9 @@ def run_dataset(
             )
 
     for frame_index, frame, image, result in batched_predictions():
+        if result.masks is None or result.boxes is None or len(result.boxes) == 0:
+            continue
         depth = get_depth_frame(dataset, frame_index)
-        overlay = image.copy()
         frame_detections = []
 
         for detection_id, mask in _binary_masks(result, image.shape[:2]):
@@ -324,12 +329,6 @@ def run_dataset(
             class_name = str(model.names.get(class_id, class_id))
             det_confidence = float(box.conf.item())
             axis_points = mask_axis_points(mask)
-
-            color_layer = np.zeros_like(image)
-            color_layer[mask] = (40, 180, 255)
-            overlay = cv2.addWeighted(overlay, 1.0, color_layer, 0.28, 0.0)
-            contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(overlay, contours, -1, (0, 220, 255), 2)
 
             serialized_points = []
             for order, axis_point in enumerate(axis_points):
@@ -382,26 +381,6 @@ def run_dataset(
                     _record(world_writer, point)
                     world_count += 1
 
-                point_color = ((80, 255, 80), (255, 220, 0), (60, 80, 255))[order]
-                cv2.circle(overlay, (axis_point.x, axis_point.y), 7, point_color, -1, cv2.LINE_AA)
-                cv2.putText(
-                    overlay,
-                    ("A", "M", "B")[order],
-                    (axis_point.x + 9, axis_point.y - 7),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    point_color,
-                    2,
-                    cv2.LINE_AA,
-                )
-            cv2.line(
-                overlay,
-                (axis_points[0].x, axis_points[0].y),
-                (axis_points[2].x, axis_points[2].y),
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
             frame_detections.append({
                 "detection_id": detection_id,
                 "class_id": class_id,
@@ -410,16 +389,18 @@ def run_dataset(
                 "points": serialized_points,
             })
 
-        overlay_path = overlays_dir / f"{frame_index:010d}.jpg"
-        cv2.imwrite(str(overlay_path), overlay)
+        if not frame_detections:
+            continue
+        detected_rgb_path = detected_rgb_dir / f"{frame_index:010d}_{frame['rgb_path'].name}"
+        shutil.copy2(frame["rgb_path"], detected_rgb_path)
         try:
-            overlay_file = overlay_path.relative_to(dataset_root).as_posix()
+            detected_rgb_file = detected_rgb_path.relative_to(dataset_root).as_posix()
         except ValueError:
-            overlay_file = str(overlay_path)
+            detected_rgb_file = str(detected_rgb_path)
         detection_rows.append({
             "frame_index": frame_index,
             "rgb_file": frame["row"].get("rgb_file"),
-            "overlay_file": overlay_file,
+            "detected_rgb_file": detected_rgb_file,
             "detection_count": len(frame_detections),
             "detections": frame_detections,
         })
@@ -448,7 +429,8 @@ def run_dataset(
         "model_task": model.task,
         "model_classes": model.names,
         "start_frame": start_frame,
-        "processed_frames": len(detection_rows),
+        "processed_frames": len(indices),
+        "detected_frames": len(detection_rows),
         "stride": stride,
         "confidence": confidence,
         "batch_size": batch_size,
@@ -466,7 +448,8 @@ def run_dataset(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     print(
-        f"[YOLO] Done | frames={summary['processed_frames']} "
+        f"[YOLO] Done | frames={summary['processed_frames']}, "
+        f"detected_frames={summary['detected_frames']}, "
         f"detections={summary['detections']}, points={summary['points']}, "
         f"world_points={summary['world_points']}",
         flush=True,

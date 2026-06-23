@@ -1124,7 +1124,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .topbar {
       display: grid;
-      grid-template-columns: minmax(280px, 1fr) auto auto auto auto auto auto auto;
+      grid-template-columns: minmax(280px, 1fr) auto auto auto auto auto auto;
       gap: 8px;
       align-items: center;
       padding: 10px 12px;
@@ -1414,7 +1414,6 @@ INDEX_HTML = r"""<!doctype html>
       <input id="pathInput" class="pathInput" placeholder="dataset folder path, e.g. image_records/2026-06-17_11-27-13" />
       <button id="latestBtn" title="Open latest dataset under this path">Latest</button>
       <button id="openBtn" title="Open dataset">Open</button>
-      <button id="yoloBtn" title="Toggle saved YOLO segmentation overlay">YOLO: off</button>
       <select id="depthMaxSelect" title="Depth color range">
         <option value="3000">3m</option>
         <option value="5000">5m</option>
@@ -1563,7 +1562,6 @@ INDEX_HTML = r"""<!doctype html>
       depthMaxMm: 8000,
       sampleRadius: 4,
       orientationSource: "compare",
-      showYolo: false,
       hoverRequest: null,
       lastHover: null,
       lastClick: null,
@@ -1601,7 +1599,6 @@ INDEX_HTML = r"""<!doctype html>
     function mediaUrl(kind, index = state.index) {
       let path = "/media/depth_preview";
       if (kind === "rgb") path = "/media/rgb";
-      if (kind === "yolo") path = "/media/yolo_overlay";
       return `${path}?${qs({ path: state.datasetPath, index, max_mm: state.depthMaxMm, t: Date.now() })}`;
     }
 
@@ -1646,9 +1643,7 @@ INDEX_HTML = r"""<!doctype html>
       try {
         const frame = await api("/api/frame", { path: state.datasetPath, index });
         state.frame = frame;
-        const hasYolo = Boolean(frame.yolo?.overlay_file);
-        rgbImage.src = mediaUrl(state.showYolo && hasYolo ? "yolo" : "rgb", index);
-        el("rgbPaneTitle").textContent = state.showYolo && hasYolo ? "YOLO-seg overlay" : "RGB";
+        rgbImage.src = mediaUrl("rgb", index);
         depthImage.src = mediaUrl("depth", index);
         renderFrame(frame);
         clearPoint(false);
@@ -2055,11 +2050,6 @@ INDEX_HTML = r"""<!doctype html>
 
     el("openBtn").addEventListener("click", () => openDataset(false));
     el("latestBtn").addEventListener("click", () => openDataset(true));
-    el("yoloBtn").addEventListener("click", () => {
-      state.showYolo = !state.showYolo;
-      el("yoloBtn").textContent = `YOLO: ${state.showYolo ? "on" : "off"}`;
-      if (state.frame) loadFrame(state.index);
-    });
     pathInput.addEventListener("keydown", event => {
       if (event.key === "Enter") openDataset(false);
     });
@@ -2328,17 +2318,6 @@ class Handler(BaseHTTPRequestHandler):
                 max_mm = safe_int(params.get("max_mm"), 8000)
                 depth = get_depth_frame(dataset, index)
                 self.send_bytes(make_depth_preview(depth, max_mm), "image/png")
-            elif parsed.path == "/media/yolo_overlay":
-                dataset = get_dataset(params.get("path"))
-                index = safe_int(params.get("index"), 0)
-                result = dataset.yolo_result(index)
-                if not result or not result.get("overlay_file"):
-                    raise ValueError(f"No YOLO overlay for frame {index}.")
-                overlay_path = (dataset.root / result["overlay_file"]).resolve()
-                if dataset.root not in overlay_path.parents or not overlay_path.is_file():
-                    raise ValueError("Invalid YOLO overlay path.")
-                content_type = mimetypes.guess_type(overlay_path.name)[0] or "image/jpeg"
-                self.send_bytes(overlay_path.read_bytes(), content_type)
             else:
                 self.send_error_text("Not found", 404)
         except BrokenPipeError:

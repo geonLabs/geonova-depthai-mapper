@@ -93,9 +93,8 @@ RGB-D 테스트 결과는 기본적으로 `test_output/rgbd/`에 저장됩니다
 ../.venv/bin/python debug_ui.py --host 127.0.0.1 --port 8088
 ```
 
-브라우저에서 `http://127.0.0.1:8088`을 열고 데이터셋을 선택합니다. YOLO 결과가
-있는 프레임에서는 `YOLO: on` 버튼으로 마스크와 3개 점 overlay를 전환할 수
-있으며, 오른쪽 패널에서 각 점의 픽셀·Depth·좌표 품질을 확인할 수 있습니다.
+브라우저에서 `http://127.0.0.1:8088`을 열고 데이터셋을 선택합니다. YOLO 검출
+프레임에서는 오른쪽 패널에서 각 점의 픽셀·Depth·좌표 품질을 확인할 수 있습니다.
 
 ## YOLO-seg 3점 및 SHP 테스트
 
@@ -122,13 +121,16 @@ RGB-D 테스트 결과는 기본적으로 `test_output/rgbd/`에 저장됩니다
 
 ```text
 yolo_seg/
-  overlays/                         마스크와 3점이 표시된 RGB
+  detected_rgb/                     검출된 프레임의 수정하지 않은 원본 RGB만 저장
   detections.jsonl                  Debug UI용 프레임별 결과
   points.csv                        모든 점과 Depth/좌표 상태
   yolo_seg_points_pixels.shp        항상 생성되는 픽셀 좌표 SHP
   yolo_seg_points_wgs84.shp         좌표 계산에 성공한 WGS84 POINTZ SHP
   summary.json
 ```
+
+검출이 없는 프레임은 결과 파일에 기록하거나 복사하지 않습니다. 검출 프레임도
+마스크·선·점을 그린 overlay는 만들지 않고 원본 RGB 파일을 그대로 복사합니다.
 
 WGS84 좌표의 기본 자세 소스는 `gps-course-level`입니다. GPS 진행방향을 yaw로
 사용하고 카메라가 수평이라고 가정하므로 테스트용 근사 좌표입니다. 정밀 SHP에는
