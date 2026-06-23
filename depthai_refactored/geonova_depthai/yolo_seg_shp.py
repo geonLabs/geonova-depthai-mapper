@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -28,6 +29,49 @@ from .debug_ui import (
 
 
 POINT_ROLES = ("endpoint_a", "midpoint", "endpoint_b")
+
+
+def _duration_text(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _progress_text(
+    completed: int,
+    total: int,
+    current_frame: int,
+    batch_detections: int,
+    total_detections: int,
+    total_points: int,
+    elapsed_s: float,
+) -> str:
+    ratio = completed / total if total else 1.0
+    progress_width = 28
+    filled = min(progress_width, int(ratio * progress_width))
+    progress_bar = "█" * filled + "·" * (progress_width - filled)
+
+    detection_width = 8
+    detection_level = min(detection_width, batch_detections)
+    detection_bar = "█" * detection_level + "·" * (detection_width - detection_level)
+    detection_suffix = "+" if batch_detections > detection_width else ""
+
+    fps = completed / elapsed_s if elapsed_s > 0 else 0.0
+    remaining = total - completed
+    eta_s = remaining / fps if fps > 0 else 0.0
+    return (
+        f"[{progress_bar}] {ratio * 100:6.2f}% | "
+        f"{completed}/{total} | frame {current_frame} | {fps:5.2f} fps | "
+        f"ETA {_duration_text(eta_s)} | "
+        f"detect [{detection_bar}]{detection_suffix} +{batch_detections} "
+        f"total={total_detections} | points={total_points}"
+    )
+
+
+def _draw_progress(line: str, finished: bool = False) -> None:
+    # Padding clears characters left from a previously longer status line.
+    print(f"\r{line:<180}", end="\n" if finished else "", flush=True)
 
 
 @dataclass(frozen=True)
@@ -175,10 +219,7 @@ def run_dataset(
     overlays_dir = output_dir / "overlays"
     overlays_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[YOLO] Dataset: {dataset_root}", flush=True)
-    print(f"[YOLO] Model: {model_path}", flush=True)
-    print(f"[YOLO] Output directory: {output_dir}", flush=True)
-    print("[YOLO] Loading dataset index...", flush=True)
+    print("[YOLO] Loading dataset and model...", flush=True)
     dataset = Dataset(dataset_root)
     if start_frame < 200:
         raise ValueError("start_frame must be at least 200 for post-warm-up comparison.")
@@ -189,7 +230,6 @@ def run_dataset(
     if not 0.0 <= confidence <= 1.0:
         raise ValueError("confidence must be between 0.0 and 1.0.")
 
-    print("[YOLO] Loading segmentation model...", flush=True)
     model = YOLO(str(model_path))
     if model.task != "segment":
         raise ValueError(f"Expected a YOLO segmentation model, got task={model.task!r}.")
@@ -202,22 +242,20 @@ def run_dataset(
 
     stop = min(dataset.frame_count, start_frame + max_frames * stride)
     indices = list(range(start_frame, stop, stride))
-    total_batches = (len(indices) + batch_size - 1) // batch_size
     print(
-        f"[YOLO] Processing {len(indices)} frames: {indices[0]}..{indices[-1]} "
-        f"(stride={stride}, batch={batch_size}, conf={confidence}, image_size={image_size})",
+        f"[YOLO] {len(indices)} frames ({indices[0]}..{indices[-1]}) | "
+        f"stride={stride} batch={batch_size} conf={confidence} size={image_size}",
         flush=True,
+    )
+    print(f"[YOLO] Save: {output_dir}", flush=True)
+    progress_started_at = time.monotonic()
+    _draw_progress(
+        _progress_text(0, len(indices), indices[0], 0, 0, 0, 0.0)
     )
 
     def batched_predictions():
         for offset in range(0, len(indices), batch_size):
             batch_indices = indices[offset : offset + batch_size]
-            batch_number = offset // batch_size + 1
-            print(
-                f"[YOLO] Batch {batch_number}/{total_batches}: "
-                f"frames {batch_indices[0]}..{batch_indices[-1]} - inferencing...",
-                flush=True,
-            )
             batch_items = []
             for frame_index in batch_indices:
                 frame = dataset.frame(frame_index)
@@ -245,18 +283,23 @@ def run_dataset(
                 len(result.boxes) if result.boxes is not None else 0
                 for result in results
             )
-            print(
-                f"[YOLO] Batch {batch_number}/{total_batches}: "
-                f"inference complete, detections={batch_detection_count}",
-                flush=True,
-            )
             yield from (
                 (frame_index, frame, image, result)
                 for (frame_index, frame, image), result in zip(batch_items, results)
             )
-            print(
-                f"[YOLO] Batch {batch_number}/{total_batches}: overlays and points saved",
-                flush=True,
+            completed = offset + len(batch_items)
+            total_detections = sum(row["detection_count"] for row in detection_rows)
+            _draw_progress(
+                _progress_text(
+                    completed,
+                    len(indices),
+                    batch_indices[-1],
+                    batch_detection_count,
+                    total_detections,
+                    len(point_rows),
+                    time.monotonic() - progress_started_at,
+                ),
+                finished=completed == len(indices),
             )
 
     for frame_index, frame, image, result in batched_predictions():
@@ -414,16 +457,12 @@ def run_dataset(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     print(
-        f"[YOLO] Complete: frames={summary['processed_frames']}, "
+        f"[YOLO] Done | frames={summary['processed_frames']} "
         f"detections={summary['detections']}, points={summary['points']}, "
         f"world_points={summary['world_points']}",
         flush=True,
     )
-    print(f"[YOLO] Overlays: {overlays_dir}", flush=True)
-    print(f"[YOLO] Pixel SHP: {output_dir / 'yolo_seg_points_pixels.shp'}", flush=True)
-    print(f"[YOLO] WGS84 SHP: {output_dir / 'yolo_seg_points_wgs84.shp'}", flush=True)
-    print(f"[YOLO] Points CSV: {output_dir / 'points.csv'}", flush=True)
-    print(f"[YOLO] Summary: {output_dir / 'summary.json'}", flush=True)
+    print(f"[YOLO] Saved: {output_dir}", flush=True)
     return summary
 
 
@@ -454,7 +493,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    summary = run_dataset(
+    run_dataset(
         dataset_root=args.dataset,
         model_path=args.model,
         output_dir=args.output_dir,
@@ -470,7 +509,6 @@ def main() -> None:
         max_depth_mm=args.max_depth_mm,
         orientation_source=args.orientation_source,
     )
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
