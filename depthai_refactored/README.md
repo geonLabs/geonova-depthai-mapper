@@ -84,6 +84,52 @@ RGB-D geometry: factory-undistorted RGB -> StereoDepth.inputAlignTo
 RGB-D 테스트 결과는 기본적으로 `test_output/rgbd/`에 저장됩니다. 원본 RGB,
 16-bit depth(mm), depth 컬러맵, RGB-depth overlay, JSON 판정 결과를 함께 봅니다.
 
+## Debug UI
+
+저장 데이터의 RGB·Depth·동기화·GPS·EBIMU와 YOLO-seg 결과를 한 화면에서
+확인할 수 있습니다.
+
+```bash
+../.venv/bin/python debug_ui.py --host 127.0.0.1 --port 8088
+```
+
+브라우저에서 `http://127.0.0.1:8088`을 열고 데이터셋을 선택합니다. YOLO 결과가
+있는 프레임에서는 `YOLO: on` 버튼으로 마스크와 3개 점 overlay를 전환할 수
+있으며, 오른쪽 패널에서 각 점의 픽셀·Depth·좌표 품질을 확인할 수 있습니다.
+
+## YOLO-seg 3점 및 SHP 테스트
+
+`best.pt`는 `guardrail` segmentation 모델입니다. 검출 마스크의 주축을 구한 뒤
+한쪽 끝점, 중앙점, 반대쪽 끝점의 3점을 마스크 내부에 찍습니다. 따라서 난간이
+비스듬하거나 휘어 보이는 경우에도 단순 사각형 중심보다 검출 형상을 잘 따릅니다.
+초기 불안정 데이터가 섞이지 않도록 `--start-frame`은 200 미만을 허용하지 않습니다.
+
+```bash
+../.venv/bin/python tests/test_yolo_seg_shp.py \
+  --dataset image_records/2026-06-23_14-20-20_raw \
+  --model best.pt \
+  --start-frame 200 \
+  --max-frames 100
+```
+
+기본 출력은 데이터셋의 `yolo_seg/`에 생성됩니다.
+
+```text
+yolo_seg/
+  overlays/                         마스크와 3점이 표시된 RGB
+  detections.jsonl                  Debug UI용 프레임별 결과
+  points.csv                        모든 점과 Depth/좌표 상태
+  yolo_seg_points_pixels.shp        항상 생성되는 픽셀 좌표 SHP
+  yolo_seg_points_wgs84.shp         좌표 계산에 성공한 WGS84 POINTZ SHP
+  summary.json
+```
+
+WGS84 좌표의 기본 자세 소스는 `gps-course-level`입니다. GPS 진행방향을 yaw로
+사용하고 카메라가 수평이라고 가정하므로 테스트용 근사 좌표입니다. 정밀 SHP에는
+RTK fixed 상태와 실제 카메라 장착각/레버암을 metadata에 넣고 `--orientation-source
+ebimu` 또는 보정된 자세를 사용해야 합니다. 유효 Depth가 없는 점은 픽셀 SHP와
+CSV에는 남지만 WGS84 SHP에서는 제외됩니다.
+
 ## 체커보드 카메라 캘리브레이션 테스트
 
 지정 보드는 가로 14칸 × 세로 10칸, 한 칸 30 mm입니다. OpenCV에 넘기는
@@ -174,5 +220,9 @@ build_synced_dataset.py
 geonova_depthai/capture/       수집 CLI, writer, defaults
 geonova_depthai/postprocess/   timestamp 동기화
 geonova_depthai/runtime.py          수집에 필요한 카메라/serial runtime
+geonova_depthai/debug_ui.py         저장 데이터 Debug UI 및 좌표 투영
+geonova_depthai/yolo_seg_shp.py     YOLO-seg 3점/Depth/WGS84/SHP 처리
+debug_ui.py                         Debug UI 실행 진입점
+tools/configure_ebimu.py            EBIMU 설정 도구
 tests/                         RGB-D, GPS/NTRIP, EBIMU, checkerboard 테스트
 ```

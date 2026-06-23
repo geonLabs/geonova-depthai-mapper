@@ -133,6 +133,31 @@ class Dataset:
         if not self.timestamps:
             raise ValueError(f"No frames listed in {timestamps_path}")
 
+        self.yolo_by_frame = {}
+        self.yolo_results_mtime_ns = None
+        self.reload_yolo_results()
+
+    def reload_yolo_results(self):
+        results_path = self.root / "yolo_seg" / "detections.jsonl"
+        mtime_ns = results_path.stat().st_mtime_ns if results_path.exists() else None
+        if mtime_ns == self.yolo_results_mtime_ns:
+            return
+        results = {}
+        if results_path.exists():
+            with results_path.open(encoding="utf-8") as file:
+                for line in file:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    row = json.loads(line)
+                    results[safe_int(row.get("frame_index"), -1)] = row
+        self.yolo_by_frame = results
+        self.yolo_results_mtime_ns = mtime_ns
+
+    def yolo_result(self, index):
+        self.reload_yolo_results()
+        return self.yolo_by_frame.get(index)
+
     @property
     def frame_count(self):
         return len(self.timestamps)
@@ -556,8 +581,11 @@ def unproject_saved_pixel(dataset, x, y, depth_m):
     original_intrinsics = camera_model.get("intrinsics_original")
     saved_intrinsics = camera_model.get("intrinsics")
     distortion = camera_model.get("distortion_coefficients") or []
+    stream_is_undistorted = safe_bool(camera_model.get("image_stream_undistorted"), False)
 
-    if original_intrinsics:
+    # New refactored captures already save factory-undistorted RGB. Applying
+    # undistortPoints again would bend the ray twice and shift WGS84 output.
+    if original_intrinsics and not stream_is_undistorted:
         original_x, original_y = transformed_pixel_to_original_pixel(x, y, dataset.metadata)
         camera_matrix = np.array(original_intrinsics, dtype=np.float64)
         dist_coeffs = np.array(distortion, dtype=np.float64) if distortion else None
@@ -585,7 +613,7 @@ def unproject_saved_pixel(dataset, x, y, depth_m):
         (x - cx) * depth_m / fx,
         (y - cy) * depth_m / fy,
         depth_m,
-    ], dtype=float), "pinhole"
+    ], dtype=float), "pinhole_undistorted" if stream_is_undistorted else "pinhole"
 
 
 def compute_world_coordinate(dataset, frame, x, y, depth_mm):
@@ -1096,7 +1124,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .topbar {
       display: grid;
-      grid-template-columns: minmax(280px, 1fr) auto auto auto auto auto auto;
+      grid-template-columns: minmax(280px, 1fr) auto auto auto auto auto auto auto;
       gap: 8px;
       align-items: center;
       padding: 10px 12px;
@@ -1386,6 +1414,7 @@ INDEX_HTML = r"""<!doctype html>
       <input id="pathInput" class="pathInput" placeholder="dataset folder path, e.g. image_records/2026-06-17_11-27-13" />
       <button id="latestBtn" title="Open latest dataset under this path">Latest</button>
       <button id="openBtn" title="Open dataset">Open</button>
+      <button id="yoloBtn" title="Toggle saved YOLO segmentation overlay">YOLO: off</button>
       <select id="depthMaxSelect" title="Depth color range">
         <option value="3000">3m</option>
         <option value="5000">5m</option>
@@ -1410,7 +1439,7 @@ INDEX_HTML = r"""<!doctype html>
       <section class="viewer">
         <div class="panes">
           <div class="pane" id="rgbPane">
-            <div class="paneTitle">RGB</div>
+            <div class="paneTitle" id="rgbPaneTitle">RGB</div>
             <div class="imageWrap"><img id="rgbImage" class="debugImage" alt="RGB frame" /></div>
             <div id="rgbCrosshair" class="crosshair"></div>
           </div>
@@ -1445,6 +1474,10 @@ INDEX_HTML = r"""<!doctype html>
         <div class="section">
           <h2 class="sectionTitle">Frame</h2>
           <div id="frameInfo" class="mono">No dataset loaded.</div>
+        </div>
+        <div class="section">
+          <h2 class="sectionTitle">YOLO Segmentation</h2>
+          <div id="yoloInfo" class="mono">Run tests/test_yolo_seg_shp.py to create results.</div>
         </div>
         <div class="section">
           <h2 class="sectionTitle">Dataset</h2>
@@ -1530,6 +1563,7 @@ INDEX_HTML = r"""<!doctype html>
       depthMaxMm: 8000,
       sampleRadius: 4,
       orientationSource: "compare",
+      showYolo: false,
       hoverRequest: null,
       lastHover: null,
       lastClick: null,
@@ -1565,7 +1599,9 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function mediaUrl(kind, index = state.index) {
-      const path = kind === "rgb" ? "/media/rgb" : "/media/depth_preview";
+      let path = "/media/depth_preview";
+      if (kind === "rgb") path = "/media/rgb";
+      if (kind === "yolo") path = "/media/yolo_overlay";
       return `${path}?${qs({ path: state.datasetPath, index, max_mm: state.depthMaxMm, t: Date.now() })}`;
     }
 
@@ -1610,7 +1646,9 @@ INDEX_HTML = r"""<!doctype html>
       try {
         const frame = await api("/api/frame", { path: state.datasetPath, index });
         state.frame = frame;
-        rgbImage.src = mediaUrl("rgb", index);
+        const hasYolo = Boolean(frame.yolo?.overlay_file);
+        rgbImage.src = mediaUrl(state.showYolo && hasYolo ? "yolo" : "rgb", index);
+        el("rgbPaneTitle").textContent = state.showYolo && hasYolo ? "YOLO-seg overlay" : "RGB";
         depthImage.src = mediaUrl("depth", index);
         renderFrame(frame);
         clearPoint(false);
@@ -1735,6 +1773,21 @@ INDEX_HTML = r"""<!doctype html>
         `sequence rgb/depth: ${row.rgb_sequence || "-"} / ${row.depth_sequence || "-"}\n` +
         `valid depth pixels: ${frame.valid_depth_pixels ?? "-"}\n` +
         `estimated fps: ${formatNumber(frame.estimated_fps, 2)}`;
+
+      const yolo = frame.yolo;
+      const yoloDetections = yolo?.detections || [];
+      const yoloPoints = yoloDetections.flatMap(item => item.points || []);
+      const worldPoints = yoloPoints.filter(point => point.world_status === "ok").length;
+      el("yoloInfo").textContent = yolo ? (
+        `detections: ${yolo.detection_count ?? yoloDetections.length}\n` +
+        `points: ${yoloPoints.length} (world: ${worldPoints})\n` +
+        yoloDetections.map(item =>
+          `#${item.detection_id} ${item.class_name} conf=${formatNumber(item.confidence, 3)}\n` +
+          (item.points || []).map(point =>
+            `  ${point.role}: (${point.pixel_x}, ${point.pixel_y}) ${point.depth_mm}mm ${point.coordinate_quality}`
+          ).join("\n")
+        ).join("\n")
+      ) : "No YOLO result for this frame.";
 
       const transport = metadata.host_transport || {};
       const confidenceMeta = metadata.confidence_map || {};
@@ -2002,6 +2055,11 @@ INDEX_HTML = r"""<!doctype html>
 
     el("openBtn").addEventListener("click", () => openDataset(false));
     el("latestBtn").addEventListener("click", () => openDataset(true));
+    el("yoloBtn").addEventListener("click", () => {
+      state.showYolo = !state.showYolo;
+      el("yoloBtn").textContent = `YOLO: ${state.showYolo ? "on" : "off"}`;
+      if (state.frame) loadFrame(state.index);
+    });
     pathInput.addEventListener("keydown", event => {
       if (event.key === "Enter") openDataset(false);
     });
@@ -2133,6 +2191,7 @@ class Handler(BaseHTTPRequestHandler):
                     "external_imu_summary": summarize_external_imu(frame.get("external_imu")),
                     "estimated_fps": estimate_sequence_fps(dataset, frame["index"]),
                     "valid_depth_pixels": int((depth > 0).sum()),
+                    "yolo": dataset.yolo_result(frame["index"]),
                     "metadata": dataset.metadata,
                 })
             elif parsed.path == "/api/first_valid_depth":
@@ -2269,6 +2328,17 @@ class Handler(BaseHTTPRequestHandler):
                 max_mm = safe_int(params.get("max_mm"), 8000)
                 depth = get_depth_frame(dataset, index)
                 self.send_bytes(make_depth_preview(depth, max_mm), "image/png")
+            elif parsed.path == "/media/yolo_overlay":
+                dataset = get_dataset(params.get("path"))
+                index = safe_int(params.get("index"), 0)
+                result = dataset.yolo_result(index)
+                if not result or not result.get("overlay_file"):
+                    raise ValueError(f"No YOLO overlay for frame {index}.")
+                overlay_path = (dataset.root / result["overlay_file"]).resolve()
+                if dataset.root not in overlay_path.parents or not overlay_path.is_file():
+                    raise ValueError("Invalid YOLO overlay path.")
+                content_type = mimetypes.guess_type(overlay_path.name)[0] or "image/jpeg"
+                self.send_bytes(overlay_path.read_bytes(), content_type)
             else:
                 self.send_error_text("Not found", 404)
         except BrokenPipeError:
