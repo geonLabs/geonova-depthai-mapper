@@ -1,0 +1,8 @@
+# OAK RGB와 정렬 Depth의 기본 상태를 검사하는 하드웨어 테스트 설정입니다.
+warmup_frames: 200             # 측정 전에 버릴 카메라 초기 안정화 프레임 수
+sample_frames: 30              # 품질 지표 계산에 사용할 안정화 이후 프레임 수
+fps: 15.0                     # 테스트 중 요청 카메라 프레임률(Hz)
+output_dir: test_output/rgbd   # 진단 이미지와 JSON 보고서 저장 폴더
+min_valid_depth_ratio: 0.10   # 프레임에서 필요한 최소 nonzero Depth 픽셀 비율
+max_saturated_rgb_ratio: 0.50 # 허용할 최대 과노출(거의 흰색) RGB 픽셀 비율
+max_sync_delta_ms: 20.0       # RGB와 Depth의 최대 device timestamp 차이(ms)

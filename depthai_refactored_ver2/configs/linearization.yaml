@@ -1,0 +1,25 @@
+# 기존 points.csv로 점 보정과 선형화만 재실행하는 설정입니다.
+points: image_records/<timestamp>_raw/yolo_seg/points.csv         # 필수: YOLO 관측점 CSV
+trajectory: image_records/<timestamp>_raw/timestamps.csv         # GPS 궤적 포함 동기 CSV
+output_dir: image_records/<timestamp>_raw/yolo_seg/linearized    # 단계별 CSV/SHP 출력 폴더
+
+# 관측점 유효성
+depth_sample_min: 20              # 관측점 하나에 필요한 최소 유효 Depth 픽셀 수
+max_observation_depth_mm: 8000    # 지도 선형에 사용할 최대 관측 거리(mm)
+
+# GPS 궤적 기준 측방 offset 보정
+side_vote_window: 11              # 거리 이웃 부족 시 부호 투표에 쓸 검출 개수
+side_window_m: 20.0               # 로컬 Huber 모델의 chainage 반경(m)
+side_frame_window: 100            # 다른 주행 회차 혼입을 막는 최대 프레임 차이
+huber_delta_m: 0.75               # 큰 잔차를 완화하기 시작하는 Huber 거리(m)
+max_correction_m: 3.0             # 더 큰 이동이 필요하면 보정하지 않고 이상치 제외
+
+# 점 연결과 segment 분리
+max_gap_m: 10.0                    # 같은 선으로 연결할 대표점 간 최대 거리(m)
+max_frame_gap: 60                 # 연결 가능한 두 검출의 최대 프레임 간격
+max_heading_deg: 35.0             # 연결 방향과 GPS 접선의 최대 각도 차이(도)
+min_line_support: 5               # 선 하나를 내보낼 최소 대표점 개수
+
+# 최종 smoothing spline
+line_sample_spacing_m: 0.5        # 최종 POLYLINEZ vertex 간격(m)
+spline_smoothing: 0.15            # 평활 강도. 크면 부드럽지만 급곡선이 뭉개질 수 있음

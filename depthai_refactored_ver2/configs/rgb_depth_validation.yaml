@@ -1,0 +1,29 @@
+# 체커보드로 RGB와 정렬 Depth의 거리·평면·경계 일치를 검증하는 설정입니다.
+calibration: test_output/checkerboard/calibration.json # RGB 내부표정 calibration JSON
+captures: null                       # 기존 캡처 폴더. null이면 연결된 OAK로 새로 촬영
+factory_calibration: test_output/rgb_depth_checkerboard/factory_calibration.json # OAK factory 값 캐시
+captures_are_undistorted: false      # 기존 captures의 RGB가 이미 undistort됐는지 여부
+output_dir: test_output/rgb_depth_checkerboard # 캡처·overlay·검증 보고서 출력 폴더
+warmup_frames: 200                   # 측정 전에 버릴 초기 동기 프레임 수
+samples: 8                           # 목표로 수집할 서로 다른 체커보드 자세 개수
+min_samples: 5                       # 최종 판정에 필요한 최소 유효 자세 수
+fps: 15.0                            # 라이브 카메라 프레임률(Hz)
+auto_capture: false                  # true이면 안정적인 서로 다른 자세를 자동 저장
+auto_interval_s: 1.0                 # 자동 저장 사이 최소 시간(초)
+detection_hold_s: 1.5                # 최근 성공 코너 검출을 유지할 시간(초)
+live_detection_scale: 0.75           # 라이브 코너 검출 축소 배율
+no_rotate_180: false                 # true이면 라이브 RGB/Depth를 180도 회전하지 않음
+
+# Depth 평면 품질 기준
+depth_radius_px: 4                   # 각 검사점 주변 Depth median 반경(px)
+min_valid_ratio: 0.50                # 보드 내부에서 필요한 최소 유효 Depth 비율
+max_median_error_mm: 80.0            # RGB 예상 거리 대비 Depth median 오차 상한(mm)
+max_p95_error_mm: 250.0              # Depth 절대오차 p95 상한(mm)
+max_normal_angle_deg: 5.0            # RGB 평면과 Depth 평면 법선의 최대 각도 차이(도)
+max_plane_rmse_mm: 30.0              # Depth 포인트의 평면 적합 RMSE 상한(mm)
+
+# RGB 외곽선과 Depth 불연속 경계 정렬 기준
+edge_search_px: 35                   # 예상 보드 외곽에서 Depth 경계를 찾을 반경(px)
+min_edge_views: 3                    # 경계 지표 판정에 필요한 최소 유효 view 수
+max_edge_median_px: 12.0             # RGB–Depth 경계 이동 median 상한(px)
+max_edge_p95_px: 30.0                # RGB–Depth 경계 이동 p95 상한(px)

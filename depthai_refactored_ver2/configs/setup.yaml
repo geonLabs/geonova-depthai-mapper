@@ -1,0 +1,6 @@
+# 가상환경/패키지 설치 설정입니다. 생략한 키는 setup_env.py 기본값을 사용합니다.
+venv: .venv          # 가상환경 경로. Windows/Linux 모두 프로젝트 내부 .venv 권장
+python: "3.11"       # uv가 설치하고 가상환경에 사용할 Python 버전
+cuda: auto           # auto=nvcc로 자동 선택, 또는 cpu/cu118/cu126/cu128 직접 지정
+recreate: false      # true이면 기존 가상환경을 삭제하고 다시 생성하므로 주의
+dev: false           # true이면 실행 패키지와 pytest를 함께 설치

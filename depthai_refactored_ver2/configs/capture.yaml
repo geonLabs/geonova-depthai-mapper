@@ -1,0 +1,12 @@
+# RGB-D/GPS/IMU 원시 이벤트 수집 설정입니다.
+# 없는 장치 포트와 NTRIP 값은 코드 기본값 또는 NTRIP_* 환경변수를 사용합니다.
+output_dir: image_records       # 타임스탬프별 *_raw 폴더가 만들어질 상위 경로
+fps: 15.0                      # 요청 RGB-D 프레임률(Hz). USB 대역폭/저장 속도를 고려
+max_runtime_s: 0               # 최대 수집 시간(초). 0이면 Ctrl-C까지 계속 수집
+depth_alignment_mode: auto     # auto 권장: RVC2/3=StereoDepth, RVC4=ImageAlign
+lr_check: true                 # 좌우 disparity 검사로 가림 경계의 잘못된 Depth 감소
+subpixel: true                 # subpixel disparity로 원거리 Depth 정밀도 향상
+save_confidence_map: false     # Depth confidence PNG 저장. fragment 품질 게이트에 사용
+rotate_180: true               # 장착 방향에 맞춰 RGB/Depth를 함께 180도 회전
+enable_gps: true               # GPS/NMEA 및 NTRIP 보정 데이터 수집 여부
+enable_external_imu: true      # 외부 EBIMU 자세 데이터 수집 여부

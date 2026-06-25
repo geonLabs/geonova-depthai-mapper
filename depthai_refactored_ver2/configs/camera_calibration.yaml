@@ -1,0 +1,21 @@
+# RGB 카메라 내부표정을 체커보드로 계산하는 설정입니다.
+images: null                   # 기존 JPG/PNG 폴더. null이면 연결된 OAK 카메라 사용
+camera: true                   # true이면 라이브 카메라 캡처 모드
+square_cols: 14                # 체커보드 가로 사각형 수(내부 코너 수가 아님)
+square_rows: 10                # 체커보드 세로 사각형 수
+square_size_mm: 30.0           # 실제로 측정한 정사각형 한 변 길이(mm)
+samples: 20                    # 목표로 수집할 서로 다른 체커보드 자세 개수
+min_samples: 12                # 캘리브레이션 실행에 필요한 최소 유효 자세 수
+fps: 15.0                     # 라이브 카메라 프레임률(Hz)
+width: 1280                   # 캘리브레이션 RGB 이미지 너비(px)
+height: 720                   # 캘리브레이션 RGB 이미지 높이(px)
+output_dir: test_output/checkerboard # 캡처 이미지와 calibration.json 출력 폴더
+max_rms_px: 1.0               # 허용할 최대 reprojection RMS(px)
+auto_capture: false           # true이면 안정적이고 새로운 자세를 자동 저장
+auto_interval_s: 0.8          # 자동 저장 사이 최소 시간(초)
+detection_hold_s: 1.5         # 최근 성공 코너 검출을 유지할 시간(초)
+live_detection_scale: 0.75    # 라이브 코너 검출 축소 배율. 최종 계산은 원본 해상도
+no_preview: false             # true이면 OpenCV 미리보기 창을 표시하지 않음
+no_rotate_180: false          # true이면 라이브 영상을 180도 회전하지 않음
+images_rotated_180: false     # images 폴더 입력이 이미 180도 회전된 이미지인지 여부
+skip_factory_comparison: false # true이면 OAK factory 초점거리와 비교하지 않음
