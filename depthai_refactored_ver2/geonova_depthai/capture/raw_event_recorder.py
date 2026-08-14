@@ -5,6 +5,7 @@ import threading
 import depthai as dai
 
 from geonova_depthai import runtime
+from geonova_depthai.controller_bridge import ControllerBridge
 from .cli import parse_args
 from .raw_writer import ImageWritePool, RawEventDataset
 
@@ -46,8 +47,10 @@ def record_raw_events(args):
     # Enforce the same pixel geometry before camera metadata is read.
     args.rgb_undistort = True
     args.rgb_undistort_effective = True
+    controller_bridge = ControllerBridge(args)
     serial_readers = runtime.create_serial_readers(args)
     runtime.start_serial_readers(serial_readers)
+    controller_bridge.publish(serial_readers, force=True)
 
     dataset = None
     image_pool = None
@@ -59,14 +62,20 @@ def record_raw_events(args):
         # Keep the context alive for the entire recording loop so output queues remain valid.
         with dai.Pipeline(device) as pipeline:
             device = pipeline.getDefaultDevice()
+            controller_bridge.mark_device_connected()
             runtime.resolve_transport_options(args, device)
 
+            outputs = runtime.configure_pipeline(pipeline, args)
             camera_model = runtime.read_camera_model_metadata(device, args)
             camera_model["image_stream_undistorted"] = True
+            stereo_depth_model = runtime.read_stereo_depth_metadata(device, args)
 
-            outputs = runtime.configure_pipeline(pipeline, args)
-
-            dataset = RawEventDataset(args.output_dir, args, camera_model=camera_model)
+            dataset = RawEventDataset(
+                args.output_dir,
+                args,
+                camera_model=camera_model,
+                stereo_depth_model=stereo_depth_model,
+            )
             image_pool = ImageWritePool(dataset, worker_count=args.writer_threads)
             mapper = ThreadSafeClockMapper()
 
@@ -85,6 +94,8 @@ def record_raw_events(args):
             print("Press Ctrl-C to stop. Run build_synced_dataset.py on this folder afterwards.")
 
             def submit_image(stream, msg):
+                if stream == "rgb":
+                    controller_bridge.offer_rgb(msg)
                 stamp = mapper.stamp(runtime.get_device_ts_ns(msg))
                 event_index = dataset.next_index(stream)
                 image_pool.submit({
@@ -98,18 +109,20 @@ def record_raw_events(args):
                 drained = 0
                 drained += _drain_device_queue(rgb_q, lambda msg: submit_image("rgb", msg))
                 drained += _drain_device_queue(depth_q, lambda msg: submit_image("depth", msg))
-                drained += _drain_device_queue(
-                    imu_q,
-                    lambda msg: dataset.write_imu_message(
+                def write_imu(msg):
+                    controller_bridge.observe_imu()
+                    dataset.write_imu_message(
                         msg,
                         mapper.stamp(runtime.get_device_ts_ns(msg)),
-                    ),
-                )
+                    )
+
+                drained += _drain_device_queue(imu_q, write_imu)
                 if confidence_q is not None:
                     drained += _drain_device_queue(confidence_q, lambda msg: submit_image("confidence", msg))
 
                 for name, reader in serial_readers.items():
                     dataset.write_serial_samples(name, reader.drain())
+                controller_bridge.publish(serial_readers)
 
                 now = time.monotonic()
                 if args.max_runtime_s and now - started >= args.max_runtime_s:
@@ -125,7 +138,11 @@ def record_raw_events(args):
                     last_status = now
                 if drained == 0:
                     time.sleep(0.002)
+    except Exception as error:
+        controller_bridge.close(serial_readers, error=error)
+        raise
     finally:
+        controller_bridge.close(serial_readers)
         runtime.stop_serial_readers(serial_readers)
         if image_pool is not None:
             print("Finishing pending image writes...")

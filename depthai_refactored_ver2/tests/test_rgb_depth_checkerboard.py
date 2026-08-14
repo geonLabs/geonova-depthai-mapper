@@ -106,22 +106,32 @@ def board_parameters(calibration: dict):
     return pattern, square_size_mm
 
 
-def load_factory_calibration(path: Path) -> dict:
+def load_factory_calibration(path: Path, image_size: tuple[int, int], socket_name: str) -> dict:
     if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
+        cached = json.loads(path.read_text(encoding="utf-8"))
+        cached_size = tuple(int(value) for value in cached.get("image_size", []))
+        if cached_size == tuple(image_size) and cached.get("socket", "CAM_A") == socket_name:
+            return cached
+        print(
+            "Cached factory RGB calibration uses "
+            f"{cached.get('socket', 'CAM_A')} {cached.get('image_size')}, "
+            f"refreshing for {socket_name} {list(image_size)}..."
+        )
     print("Reading factory RGB calibration from the OAK device...")
     with dai.Device() as device:
         calibration = device.readCalibration()
+        width, height = (int(value) for value in image_size)
+        socket = getattr(dai.CameraBoardSocket, socket_name, dai.CameraBoardSocket.CAM_A)
         intrinsics = calibration.getCameraIntrinsics(
-            dai.CameraBoardSocket.CAM_A, 1280, 720
+            socket, width, height
         )
         distortion = calibration.getDistortionCoefficients(
-            dai.CameraBoardSocket.CAM_A
+            socket
         )
         result = {
             "device": device.getDeviceName(),
-            "socket": "CAM_A",
-            "image_size": [1280, 720],
+            "socket": socket_name,
+            "image_size": [width, height],
             "camera_matrix": [[float(value) for value in row] for row in intrinsics],
             "distortion_coefficients": [float(value) for value in distortion],
         }
@@ -631,9 +641,13 @@ def aggregate_results(args, view_results):
 def main() -> None:
     args = parse_args()
     calibration = load_calibration(args.calibration)
-    factory = load_factory_calibration(args.factory_calibration)
     pattern, square_size_mm = board_parameters(calibration)
     expected_size = tuple(int(value) for value in calibration["image_size"])
+    factory = load_factory_calibration(
+        args.factory_calibration,
+        expected_size,
+        calibration.get("socket", "CAM_A"),
+    )
     rotate_180 = bool(calibration.get("saved_image_rotated_180", True))
     if args.no_rotate_180:
         rotate_180 = False
@@ -682,7 +696,7 @@ def main() -> None:
                     "rgb_undistorted": True,
                     "rotate_180": rotate_180,
                     "source": str(args.captures),
-                    "method": "cv2.undistort with OAK factory CAM_A calibration",
+                    "method": f"cv2.undistort with OAK factory {factory.get('socket', 'CAM_A')} calibration",
                 },
                 indent=2,
             ),

@@ -56,8 +56,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--samples", type=int, default=20, help="Target accepted checkerboard views")
     parser.add_argument("--min-samples", type=int, default=12, help="Minimum views required to calibrate")
     parser.add_argument("--fps", type=float, default=15.0, help="Live camera frame rate")
-    parser.add_argument("--width", type=int, default=1280, help="Calibration image width")
-    parser.add_argument("--height", type=int, default=720, help="Calibration image height")
+    parser.add_argument("--width", type=int, default=0, help="Calibration image width; 0 selects automatically from the connected color sensor")
+    parser.add_argument("--height", type=int, default=0, help="Calibration image height; 0 selects automatically from the connected color sensor")
     parser.add_argument("--output-dir", type=Path, default=Path("test_output/checkerboard"), help="Capture and calibration output directory")
     parser.add_argument("--max-rms-px", type=float, default=1.0, help="Maximum accepted calibration reprojection RMS in pixels")
     parser.add_argument("--auto-capture", action="store_true", help="Accept stable, sufficiently different views automatically")
@@ -144,7 +144,16 @@ def capture_live(args: argparse.Namespace, pattern: tuple[int, int]):
 
     with dai.Pipeline() as pipeline:
         device = pipeline.getDefaultDevice()
-        camera = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
+        if args.width > 0 and args.height > 0:
+            args.rgb_width = args.width
+            args.rgb_height = args.height
+        else:
+            args.rgb_width = 0
+            args.rgb_height = 0
+        args.width, args.height = runtime.resolve_rgb_output_size(device, args)
+        camera = pipeline.create(dai.node.Camera).build(
+            getattr(args, "rgb_socket", dai.CameraBoardSocket.CAM_A)
+        )
         # Calibration must see the distorted source image. Enabling device-side
         # undistortion here would calibrate an already corrected image.
         output = runtime.request_camera_output(
@@ -298,6 +307,13 @@ def calibrate(args: argparse.Namespace, images, corners_list) -> dict:
         "max_allowed_rms_px": float(args.max_rms_px),
         "per_view_error_px": per_view_errors,
         "image_size": list(image_size),
+        "socket": getattr(args, "rgb_socket_name", "CAM_A"),
+        "sensor_name": getattr(args, "rgb_sensor_name", ""),
+        "sensor_size": [
+            int(getattr(args, "rgb_sensor_width", 0) or 0),
+            int(getattr(args, "rgb_sensor_height", 0) or 0),
+        ],
+        "resolution_source": getattr(args, "rgb_resolution_source", "unknown"),
         "usable_views": len(images),
         "board": {
             "squares_horizontal": args.square_cols,
@@ -321,11 +337,13 @@ def compare_with_factory_intrinsics(args: argparse.Namespace, result: dict) -> N
     if args.skip_factory_comparison:
         return
     try:
+        socket_name = result.get("socket", "CAM_A")
+        socket = getattr(dai.CameraBoardSocket, socket_name, dai.CameraBoardSocket.CAM_A)
         with dai.Device() as device:
             calibration = device.readCalibration()
             factory = np.asarray(
                 calibration.getCameraIntrinsics(
-                    dai.CameraBoardSocket.CAM_A,
+                    socket,
                     int(result["image_size"][0]),
                     int(result["image_size"][1]),
                 ),

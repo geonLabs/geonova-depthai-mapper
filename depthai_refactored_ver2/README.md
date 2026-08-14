@@ -53,8 +53,23 @@ chmod +x scripts/setup_env.sh
 . .venv/bin/activate
 ```
 
-`configs/setup.yaml`에서 `dev: true`로 바꾸면 `pytest`도 설치합니다. 자동 선택
-대신 빌드를 지정하려면 YAML의 `cuda`를 바꾸거나 CLI로 한 값만 덮어씁니다.
+`configs/setup.yaml`에서 `dev: true`로 바꾸면 `pytest`도 설치합니다. 기존
+`.venv`를 그대로 쓰는데 테스트 패키지만 빠져 있다면 아래처럼 보충합니다.
+
+```bash
+python -m pip install pytest
+```
+
+Python 3.11 환경은 `requirements.txt`의 고정 버전을 그대로 따릅니다. 오래된
+Python 3.8 `.venv`에서 회귀 테스트만 돌릴 때 `pyproj==3.7.2` wheel이 없으면
+3.8 호환 버전인 `pyproj==3.5.0`을 사용할 수 있습니다.
+
+```bash
+python -m pip install pyproj==3.5.0
+```
+
+자동 선택 대신 PyTorch 빌드를 지정하려면 YAML의 `cuda`를 바꾸거나 CLI로 한
+값만 덮어씁니다.
 
 ```bash
 python setup_env.py --config configs/setup.yaml --cuda cu118
@@ -81,6 +96,50 @@ python tests/test_rgb_depth_checkerboard.py --config configs/rgb_depth_validatio
 ```
 
 각 도구의 판정 임계값과 입력 방식은 해당 명령의 `--help`에 설명되어 있습니다.
+순수 회귀 테스트는 하드웨어 수집을 시작하지 않고 다음처럼 실행합니다.
+
+```bash
+python -m pytest -q tests
+```
+
+### Depth가 실측과 크게 다를 때
+
+Luxonis 문서 기준 OAK-D W wide FOV 800P/75 mm baseline은 3.5~6.5 m 구간에서
+대략 몇 % 수준의 depth error가 정상 범위입니다. 4 m 대상이 7 m로 보이는 정도는
+post-processing 튜닝이나 임의 scale 보정으로 처리할 문제가 아니라 stereo
+calibration/구성 문제로 봅니다.
+
+1. 같은 위치에서 OAK Viewer의 depth도 같은 오차인지 확인합니다.
+2. `metadata.json`의 `stereo_depth_model`에서 CAM_B/C sensor, baseline,
+   left/right socket, input size가 실제 장치와 맞는지 확인합니다.
+3. 좌우 카메라가 바뀌었거나 board config/HFOV/baseline이 틀렸다면 Luxonis
+   manual calibration으로 CAM_B/C intrinsics/extrinsics를 다시 만들어 EEPROM에
+   플래시합니다.
+
+Luxonis 절차 요약:
+
+```bash
+git clone https://github.com/luxonis/depthai.git --branch main
+cd depthai
+git submodule update --init --recursive
+python3 install_requirements.py
+python3 calibrate.py --help
+```
+
+Charuco board는 화면 전체에 띄우고 실제 square size를 cm 단위로 재서 `-s`에
+넣습니다. OAK-D-LR처럼 지원 board가 있는 compact device는 해당 board 이름을
+사용하고, 렌즈/모듈 구성이 바뀐 장치는 `resources/depthai_boards/boards/`에
+맞는 board config를 준비해 `-brd <board>.json`으로 실행합니다. 촬영은 정면,
+가까운 거리의 상하좌우/기울임, 중간 거리, 먼 거리와 코너까지 FOV 전체를 덮도록
+진행합니다. 처리 단계에서 epipolar line을 확인한 뒤 성공한 calibration을 EEPROM에
+플래시하고, 다시 OAK Viewer와 `tests/test_depthai_rgbd.py`로 거리 스케일을 확인합니다.
+
+참고 문서:
+
+- Luxonis depth accuracy: <https://docs.luxonis.com/hardware/platform/depth/depth-accuracy/>
+- Luxonis manual calibration: <https://docs.luxonis.com/hardware/platform/depth/manual-calibration/>
+- Luxonis stereo depth 설정: <https://docs.luxonis.com/hardware/platform/depth/configuring-stereo-depth/>
+- OAK-D-LR 제품 정보: <https://shop.luxonis.com/products/oak-d-lr>
 
 ## 2. 원시 이벤트 수집
 
@@ -88,15 +147,96 @@ python tests/test_rgb_depth_checkerboard.py --config configs/rgb_depth_validatio
 python synced_image_recorder.py --config configs/capture.yaml
 ```
 
+### Jetson Controller 앱 연동
+
+수집 프로세스는 기본적으로 `/var/lib/jetson-sensors`에 앱 연동용 최신 상태를
+게시합니다.
+
+- `status.json`: 카메라·GNSS·IMU heartbeat, GNSS fix quality, NTRIP 상태와 위치
+- `camera-preview.jpg`: 최대 4 Hz, 1280 px 폭의 최신 RGB 프리뷰
+
+파일은 같은 디렉터리에서 원자적으로 교체되므로 Jetson Control API가 기록 중인
+파일을 읽지 않습니다. `controller_sensor_stale_after_s` 동안 새 샘플이 없으면 해당
+센서는 비활성으로 표시됩니다. 프리뷰 인코딩은 별도 스레드에서 동작하며 수집 큐를
+막지 않습니다. 경로, 상태 주기, 프리뷰 FPS·폭·JPEG 품질은 `configs/capture.yaml`의
+`controller_*` 값으로 조정할 수 있고 `controller_bridge_enabled: false`로 끌 수
+있습니다.
+
+systemd로 실행할 때 파이프라인 사용자에게 `/var/lib/jetson-sensors` 쓰기 권한과
+`ReadWritePaths`를 함께 부여해야 합니다. JetsonControllerApp의
+`install-depthai-pipeline.sh`가 이 설정을 자동으로 추가합니다.
+
 Windows PowerShell에서는 `\` 대신 백틱을 사용하거나 한 줄로 실행합니다.
 
 기본 RGB-D 정렬은 `--depth-alignment-mode auto`입니다.
 
+- RGB 해상도: `rgb_width: 0`, `rgb_height: 0`이면 연결된 컬러 센서의
+  `getConnectedCameraFeatures()` 결과를 보고 자동 선택
+  (`1920x1200` → `1920x1080` → `1280x720` 후보)
+- Stereo 입력: EEPROM의 `getStereoLeftCameraId()`/`getStereoRightCameraId()`를
+  우선 사용하고, 연결된 좌우 센서 크기에 맞춰 자동 선택합니다. RVC2에서는 stereo
+  matching 폭 한계 때문에 1920x1200 AR0234 계열도 기본적으로 1280x800 입력을
+  사용해 전체 FOV를 유지합니다.
+- FPS: `fps`는 RGB 출력과 RGB 기준 저장 cadence를 정합니다.
+  `depth_fps: 0`이면 기존처럼 depth도 같은 fps를 쓰고, 양수이면 좌우
+  mono/stereo depth 입력만 별도 fps로 요청합니다. 예: RGB는 15 Hz로 두고
+  depth만 30 Hz로 올리려면 `--fps 15 --depth-fps 30`.
 - RVC2/RVC3: 실제 RGB 출력을 `StereoDepth.inputAlignTo`에 연결
 - RVC4: `ImageAlign`으로 Depth를 RGB에 정렬
 - 저장 RGB: 장치 factory calibration으로 undistort
 - Depth: `uint16` millimeter PNG
 - confidence map: 마스크 fragment의 soft quality gate에 사용하므로 가능하면 저장
+
+예를 들어 OAK-D-W의 `CAM_A IMX378 4056x3040 COLOR` 센서는 자동으로
+`1920x1200` RGB 출력을 선택하고, RVC2에서는 같은 크기의 depth를
+`StereoDepth.inputAlignTo`로 맞춥니다. RGB와 depth 크기는 `metadata.json`의
+`image_size`, `rgb_sensor`, `depth_alignment`에 기록됩니다. 특정 크기로 강제할
+때는 `--rgb-width 1920 --rgb-height 1080`처럼 두 값을 함께 지정합니다.
+렌즈/왜곡 보정은 첫 RGB 프레임의 `ImgFrame.getTransformation()`에서 실제 저장
+출력 intrinsics를 읽어 `camera_model.intrinsics`에 기록합니다. OAK-D-W처럼
+wide lens인 경우 factory intrinsics와 undistorted 출력 intrinsics가 다르므로,
+세계좌표 계산은 `factory_distortion_coefficients`가 아니라 저장 픽셀 기준
+`camera_model.intrinsics`를 사용합니다. Depth PNG의 mm 값은 DepthAI stereo
+calibration으로 이미 계산된 값이고, 앱에서 바뀌는 식은 픽셀+depth를 3D ray로
+푸는 unprojection입니다.
+
+OAK-D-LR은 triple AR0234 2.3 MP global-shutter color sensor와 5/10/15 cm
+baseline을 가진 RVC2 장치입니다. 코드가 연결된 camera feature와 EEPROM stereo
+pair를 읽어 RGB/Depth socket과 입력 크기를 자동 선택하므로 별도 카메라명
+하드코딩 없이 사용할 수 있습니다. 선택된 socket, sensor, stereo 입력 크기는
+`metadata.json`의 `camera_sockets`, `rgb_sensor`, `stereo_sensors`,
+`stereo_depth_model`에 기록됩니다.
+
+OAK-D-LR에서 저장되는 RGB와 depth 출력은 `1920x1200` RGB geometry에 맞춰집니다.
+다만 RVC2의 StereoDepth matching 입력은 1920 폭을 직접 받을 수 없어서 AR0234
+1920x1200 stereo frame을 full-FOV `1280x800`으로 내려 계산한 뒤, RGB 출력에
+align된 depth를 `1920x1200`으로 저장합니다. 따라서 LR 데이터셋 metadata에는
+`depth_alignment.depth_output_size=1920x1200`과
+`stereo_sensors.stereo_matching_input_size=1280x800`이 함께 기록됩니다.
+
+이전 코드로 찍은 데이터셋이 `metadata.json`에 frame transformation intrinsics를
+갖고 있지 않다면, 같은 카메라를 연결한 상태에서 다음처럼 갱신할 수 있습니다.
+
+```bash
+python refresh_camera_metadata.py --dataset image_records/2026-06-25_14-30-59_raw
+```
+
+Depth fps를 RGB보다 높이면 후처리 동기화가 RGB timestamp에 가장 가까운 depth
+이벤트를 고르므로 시간 오차를 줄일 수 있지만, USB 대역폭과 저장량은 늘어납니다.
+현재 저장 depth는 RGB 좌표계에 정렬된 출력입니다. RVC2의
+`StereoDepth.inputAlignTo` 경로에서는 `depth_fps`를 더 높게 요청해도 실제
+aligned depth 저장 cadence가 RGB fps에 가까워질 수 있으므로, 저장 프레임률까지
+올려야 할 때는 `fps`도 함께 올립니다.
+
+DepthAI raw depth는 stereo pair의 calibration으로 계산된 millimeter 값입니다.
+OAK-D W wide FOV 800P/75 mm baseline 기준으로 4 m 부근에서 4 m가 7 m로 보이는
+수준은 정상 정확도 범위를 벗어납니다. 이 경우 임의 scale 보정보다는
+CAM_B/C 렌즈가 EEPROM calibration과 일치하는지, 좌우 카메라가 바뀌지 않았는지,
+board config/HFOV/baseline이 맞는지 확인하고 Luxonis manual calibration 절차로
+stereo intrinsics/extrinsics를 다시 플래시해야 합니다.
+정확도 확인용 RVC2 수집 설정은 `depth_preset: FAST_ACCURACY`, `lr_check: true`,
+`subpixel: true`, `subpixel_fractional_bits: 5`, `stereo_median_filter: off`로
+두어 post-processing 영향을 줄이고 stereo calibration 상태를 먼저 봅니다.
 
 수집 폴더에는 스트림별 이벤트 CSV와 `rgb/`, `depth_mm/` 이미지가 생성됩니다.
 GPS/NTRIP/EBIMU 장치 및 보정 서버 설정은 다음으로 확인합니다.
@@ -107,6 +247,11 @@ python synced_image_recorder.py --help
 
 NTRIP 값은 CLI 또는 `NTRIP_HOST`, `NTRIP_PORT`, `NTRIP_MOUNTPOINT`,
 `NTRIP_USERNAME`, `NTRIP_PASSWORD` 환경변수로 지정할 수 있습니다.
+기본값은 `www.gnssdata.or.kr:2101` source table에서 `RTCM31` mountpoint를
+읽어 GPS 초기 위치와 가장 가까운 기준국부터 연결합니다. source table을 받지
+못하거나 GPS 위치가 아직 없으면 서울/경기권 fallback 후보
+`GANS-RTCM31,GUMC-RTCM31,DBON-RTCM31,PAJU-RTCM31,...` 순서로 시도하며,
+연결 또는 RTCM 데이터 수신 timeout이 나면 다음 기준국으로 넘어갑니다.
 
 ## 3. 데이터 동기화
 
@@ -115,6 +260,10 @@ NTRIP 값은 CLI 또는 `NTRIP_HOST`, `NTRIP_PORT`, `NTRIP_MOUNTPOINT`,
 ```bash
 python build_synced_dataset.py --config configs/sync.yaml
 ```
+
+RGB와 aligned depth는 `rgb_depth_threshold_ms`로 따로 제한합니다. 기본값 `10ms`는
+30 FPS에서 이전/다음 depth 프레임이 잘못 붙는 `±33ms` 매칭을 버리기 위한 값입니다.
+IMU 매칭은 기존 `sync_threshold_ms`를 사용합니다.
 
 별도 폴더를 만들려면 `--output-dir`을 지정합니다. 같은 파일시스템에서는 이미지
 symlink를 사용하며, 실제 파일 복사가 필요하면 `--copy-images`를 추가합니다.
@@ -301,6 +450,7 @@ configs/                             운영 단계별 YAML 예제
 synced_image_recorder.py             센서 수집 진입점
 build_synced_dataset.py              후처리 동기화 진입점
 geonova_depthai/capture/             수집 CLI와 raw writer
+geonova_depthai/controller_bridge.py 앱용 센서 상태와 카메라 프리뷰 게시
 geonova_depthai/postprocess/         이벤트 동기화
 geonova_depthai/runtime.py           DepthAI·GPS·NTRIP·EBIMU runtime
 geonova_depthai/debug_ui.py          데이터셋 확인과 좌표 변환

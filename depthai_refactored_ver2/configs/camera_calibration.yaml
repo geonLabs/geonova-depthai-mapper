@@ -7,8 +7,8 @@ square_size_mm: 30.0           # 실제로 측정한 정사각형 한 변 길이
 samples: 20                    # 목표로 수집할 서로 다른 체커보드 자세 개수
 min_samples: 12                # 캘리브레이션 실행에 필요한 최소 유효 자세 수
 fps: 15.0                     # 라이브 카메라 프레임률(Hz)
-width: 1280                   # 캘리브레이션 RGB 이미지 너비(px)
-height: 720                   # 캘리브레이션 RGB 이미지 높이(px)
+width: 0                      # 0이면 연결된 컬러 센서를 보고 자동 선택
+height: 0                     # 0이면 연결된 컬러 센서를 보고 자동 선택
 output_dir: test_output/checkerboard # 캡처 이미지와 calibration.json 출력 폴더
 max_rms_px: 1.0               # 허용할 최대 reprojection RMS(px)
 auto_capture: false           # true이면 안정적이고 새로운 자세를 자동 저장
