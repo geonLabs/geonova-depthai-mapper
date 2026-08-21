@@ -1,0 +1,16 @@
+points: ../data/2026-06-26/yolo_seg/points.csv
+trajectory: ../data/2026-06-26/yolo_seg/timestamps.csv
+output_dir: ../data/2026-06-26/yolo_seg/output_shp_ver2
+depth_sample_min: 20
+max_observation_depth_mm: 8000
+side_vote_window: 20
+side_window_m: 20.0
+side_frame_window: 100
+huber_delta_m: 0.75
+max_correction_m: 3.0
+max_gap_m: 15.0
+max_frame_gap: 60
+max_heading_deg: 35.0
+min_line_support: 5
+line_sample_spacing_m: 0.5
+spline_smoothing: 0.15

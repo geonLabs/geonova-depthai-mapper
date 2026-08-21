@@ -1428,7 +1428,7 @@ INDEX_HTML = r"""<!doctype html>
 <body>
   <div class="app">
     <header class="topbar">
-      <input id="pathInput" class="pathInput" placeholder="dataset folder path, e.g. image_records/2026-06-17_11-27-13" />
+      <input id="pathInput" class="pathInput" placeholder="dataset folder path, e.g. ../data/2026-06-17_11-27-13_raw" />
       <button id="latestBtn" title="Open latest dataset under this path">Latest</button>
       <button id="openBtn" title="Open dataset">Open</button>
       <select id="depthMaxSelect" title="Depth color range">
@@ -2149,7 +2149,7 @@ INDEX_HTML = r"""<!doctype html>
     bindPointerSurface(el("depthPane"), depthImage);
 
     const initialParams = new URLSearchParams(location.search);
-    pathInput.value = initialParams.get("path") || "image_records";
+    pathInput.value = initialParams.get("path") || "../data";
     window.addEventListener("load", () => {
       if (initialParams.get("path")) {
         openDataset(false);

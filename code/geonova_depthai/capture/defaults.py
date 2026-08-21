@@ -3,7 +3,7 @@
 The defaults intentionally match the user's latest field command where possible:
 
     python synced_image_recorder.py \
-      --output-dir image_records --rgb-format jpg --rotate-180 \
+      --output-dir ../data --rgb-format jpg --rotate-180 \
       --sync-threshold-ms 50 --fps 15 --gps-max-hz 120 --external-imu-max-hz 120
 
 The new recorder stores unsynchronised per-stream event manifests first, then a
@@ -15,7 +15,7 @@ WIDTH = 1280
 HEIGHT = 720
 
 DEFAULTS = {
-    "output_dir": "image_records",
+    "output_dir": "../data",
     "fps": 15.0,
     "depth_fps": 0.0,
     "rgb_width": 0,
@@ -69,8 +69,8 @@ DEFAULTS = {
     "external_imu_format": "ebimu",
     "external_imu_max_hz": 120.0,
     "serial_max_hz": 120.0,
-    # Field defaults copied from the original recorder as requested. Environment
-    # variables and CLI arguments in cli.py can still override every value.
+    # Public connection defaults. Credentials must come from environment
+    # variables or an ignored *.local.yaml file.
     "rtk_ntrip_host": "www.gnssdata.or.kr",
     "rtk_ntrip_port": 2101,
     "rtk_ntrip_mountpoint": "YANJ-RTCM31",
@@ -82,8 +82,8 @@ DEFAULTS = {
         "PJMS-RTCM31,YANJ-RTCM31,DOND-RTCM31,NAMY-RTCM31,GANH-RTCM31,"
         "SWGS-RTCM31,SUWN-RTCM31,POCN-RTCM31,YANP-RTCM31,YEOJ-RTCM31"
     ),
-    "rtk_ntrip_username": "pjmsm0319@gmail.com",
-    "rtk_ntrip_password": "gnss",
+    "rtk_ntrip_username": "",
+    "rtk_ntrip_password": "",
     "rtk_ntrip_gga": "",
     "rtk_ntrip_gga_interval": 10.0,
     "rtk_ntrip_reconnect_delay": 5.0,

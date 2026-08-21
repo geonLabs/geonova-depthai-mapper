@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 $RepositoryRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$ProjectRoot = Join-Path $RepositoryRoot "depthai_refactored"
+$ProjectRoot = Join-Path $RepositoryRoot "code"
 $Installer = Join-Path $ProjectRoot "scripts/setup_env.ps1"
 $Config = Join-Path $ProjectRoot "configs/setup.yaml"
 

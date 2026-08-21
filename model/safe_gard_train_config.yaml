@@ -1,0 +1,13 @@
+data: "data.yaml"
+model: "yolo26n-seg.pt"
+epochs: 200
+imgsz: 1280
+batch: 24
+device: "0"
+workers: 4
+patience: 20
+project: "runs/segment"
+name: "guardrail_yolo26n_seg"
+seed: 42
+cache: true
+exist_ok: false

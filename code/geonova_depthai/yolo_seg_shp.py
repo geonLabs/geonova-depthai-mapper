@@ -33,6 +33,25 @@ from .fence_linearization import LinearizationConfig, linearize_fence_points
 from .config_cli import parse_args_with_yaml
 
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+
+
+def default_model_path(repository_root: Path = REPOSITORY_ROOT) -> Path:
+    candidates = (
+        repository_root / "model" / "x_model" / "best.pt",
+        repository_root / "model" / "n_model" / "best.pt",
+        repository_root / "code" / "best.pt",
+        Path("best.pt"),
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[1]
+
+
+DEFAULT_MODEL = default_model_path()
+
+
 POINT_ROLES = ("endpoint_a", "midpoint", "endpoint_b")
 
 
@@ -637,7 +656,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--dataset", type=Path, required=True, help="Synchronized dataset directory containing timestamps.csv and images")
-    parser.add_argument("--model", type=Path, default=Path("best.pt"), help="Ultralytics YOLO segmentation model")
+    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL, help="Ultralytics YOLO segmentation model")
     parser.add_argument("--output-dir", type=Path, help="Output directory; defaults to <dataset>/yolo_seg")
     parser.add_argument("--start-frame", type=int, default=200, help="First dataset frame; values below 200 are rejected")
     parser.add_argument("--max-frames", type=int, default=100, help="Maximum number of frames selected after stride")

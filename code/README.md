@@ -5,6 +5,10 @@ segmentation 결과를 지도 좌표의 방호울타리 선형으로 만드는 �
 파이프라인입니다. 최종 공간 연산과 길이 계산은 미터 단위 `EPSG:5179`에서
 수행합니다.
 
+명령은 저장소의 `code/`에서 실행합니다. 기본 데이터 경로는 `../data`, 기본
+소형 모델은 `../model/n_model/best.pt`입니다. 기존 2026-06-26 현장값은
+`configs/profiles/local_2026_06_26/`에 상대경로로 보존되어 있습니다.
+
 ## 처리 파이프라인
 
 ```text
@@ -222,7 +226,7 @@ align된 depth를 `1920x1200`으로 저장합니다. 따라서 LR 데이터셋 m
 갖고 있지 않다면, 같은 카메라를 연결한 상태에서 다음처럼 갱신할 수 있습니다.
 
 ```bash
-python refresh_camera_metadata.py --dataset image_records/2026-06-25_14-30-59_raw
+python refresh_camera_metadata.py --dataset ../data/2026-06-25_14-30-59_raw
 ```
 
 Depth fps를 RGB보다 높이면 후처리 동기화가 RGB timestamp에 가장 가까운 depth
@@ -460,7 +464,7 @@ geonova_depthai/runtime.py           DepthAI·GPS·NTRIP·EBIMU runtime
 geonova_depthai/debug_ui.py          데이터셋 확인과 좌표 변환
 geonova_depthai/yolo_seg_shp.py      YOLO·Depth fragment·WGS84 관측점
 geonova_depthai/fence_linearization.py EPSG:5179 보정·spline·SHP·QA
-best.pt                             기본 guardrail segmentation 모델
+../model/n_model/best.pt            기본 guardrail segmentation 모델
 tools/configure_ebimu.py            EBIMU 출력 설정·보정 도구
 tests/                               센서/캘리브레이션/회귀 검증
 ```

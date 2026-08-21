@@ -1,7 +1,7 @@
 # 기존 points.csv로 점 보정과 선형화만 재실행하는 설정입니다.
-points: image_records/<timestamp>_raw/yolo_seg/points.csv         # 필수: YOLO 관측점 CSV
-trajectory: image_records/<timestamp>_raw/timestamps.csv         # GPS 궤적 포함 동기 CSV
-output_dir: image_records/<timestamp>_raw/yolo_seg/linearized    # 단계별 CSV/SHP 출력 폴더
+points: ../data/<timestamp>_raw/yolo_seg/points.csv         # 필수: YOLO 관측점 CSV
+trajectory: ../data/<timestamp>_raw/timestamps.csv          # GPS 궤적 포함 동기 CSV
+output_dir: ../data/<timestamp>_raw/yolo_seg/linearized     # 단계별 CSV/SHP 출력 폴더
 
 # 관측점 유효성
 depth_sample_min: 20              # 관측점 하나에 필요한 최소 유효 Depth 픽셀 수

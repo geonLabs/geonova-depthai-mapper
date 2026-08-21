@@ -2,7 +2,7 @@
 set -eu
 
 REPOSITORY_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-PROJECT_ROOT="$REPOSITORY_ROOT/depthai_refactored"
+PROJECT_ROOT="$REPOSITORY_ROOT/code"
 
 if [ ! -f "$PROJECT_ROOT/setup_env.py" ]; then
     echo "Installer not found: $PROJECT_ROOT/setup_env.py" >&2
