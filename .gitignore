@@ -1,18 +1,42 @@
-.venv/
-__pycache__/
-.pytest_cache/
+# Python environments and caches
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
 *.py[cod]
 *.egg-info/
 
-# Recording outputs
+# Local credentials and machine-specific overrides
+.env
+.env.*
+**/*.local.yaml
+**/*.local.yml
+
+# Field data stays on the workstation. Keep only its documentation.
+data/*
+!data/README.md
+
+# Recording, inference, and debug outputs
 records/
 records_*/
 image_records/
 image_records_*/
+code/image_records/
+code/image_records_*/
+code/yolo_seg_x/
+code/inference/raw_images/
+code/inference/runs/
+code/test_output/
 *_sample/
 ui_debug_sample/
 alignment_meta_sample/
 test_output/
+
+# Training artifacts. The existing small field checkpoint is tracked under
+# model/n_model; downloaded seed models, 100 MiB+ X model, and runs stay local.
+model/runs/
+model/x_model/*.pt
+model/yolo*.pt
+model/*.log
 
 # Temporary/debug artifacts
 .DS_Store

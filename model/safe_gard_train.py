@@ -1,7 +1,9 @@
-import os
-os.environ['NCCL_P2P_DISABLE'] = '1'
 import argparse
+import os
 from pathlib import Path
+
+
+os.environ.setdefault("NCCL_P2P_DISABLE", "1")
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -84,6 +86,8 @@ def coerce_config_types(config, config_path):
             coerced[key] = int(value)
         elif key in BOOL_KEYS:
             coerced[key] = to_bool(value, key)
+        elif key == "device" and isinstance(value, list):
+            coerced[key] = ",".join(str(item) for item in value)
         else:
             coerced[key] = str(value)
     return coerced

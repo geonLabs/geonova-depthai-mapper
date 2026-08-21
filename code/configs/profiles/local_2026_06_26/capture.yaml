@@ -1,0 +1,6 @@
+output_dir: ../data
+fps: 15.0
+depth_fps: 15.0
+rotate_180: true
+enable_gps: true
+enable_external_imu: true

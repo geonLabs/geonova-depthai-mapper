@@ -1,6 +1,6 @@
 # YOLO segmentation, Depth 대표점 생성, 자동 선형화 설정입니다.
-dataset: image_records/<timestamp>_raw  # 필수: timestamps.csv가 있는 동기 데이터셋
-model: best.pt                         # Ultralytics segmentation 모델(.pt) 경로
+dataset: ../data/<timestamp>_raw        # 필수: timestamps.csv가 있는 동기 데이터셋
+model: ../model/n_model/best.pt         # Git에 포함된 guardrail segmentation 모델
 output_dir: null                       # null이면 <dataset>/yolo_seg에 저장
 start_frame: 200                       # 카메라 안정화 이후 시작 프레임. 200 이상 필수
 max_frames: 999999                     # stride 적용 후 최대 처리 프레임 수. 큰 값=끝까지

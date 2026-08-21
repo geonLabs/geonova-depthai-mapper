@@ -1,8 +1,8 @@
 # RGB-D/GPS/IMU 원시 이벤트 수집 설정입니다.
 # 없는 장치 포트와 NTRIP 값은 코드 기본값 또는 NTRIP_* 환경변수를 사용합니다.
-output_dir: image_records       # 타임스탬프별 *_raw 폴더가 만들어질 상위 경로
+output_dir: ../data            # 타임스탬프별 *_raw 폴더가 만들어질 저장소 루트 데이터 폴더
 fps: 30.0                      # 요청 RGB-D 프레임률(Hz). USB 대역폭/저장 속도를 고려
-depth_fps: 30                   # 0이면 RGB fps와 동일. RGB 정렬 Depth 저장 cadence는 RGB fps에 제한될 수 있음
+depth_fps: 30                  # 0이면 RGB fps와 동일. RGB 정렬 Depth 저장 cadence는 RGB fps에 제한될 수 있음
 rgb_width: 0                   # 0이면 컬러 센서를 보고 1920x1200/1920x1080/1280x720 중 자동 선택
 rgb_height: 0                  # 0이면 컬러 센서를 보고 자동 선택
 max_runtime_s: 0               # 최대 수집 시간(초). 0이면 Ctrl-C까지 계속 수집

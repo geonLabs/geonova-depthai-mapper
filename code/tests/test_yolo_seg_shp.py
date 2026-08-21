@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from geonova_depthai.yolo_seg_shp import (  # noqa: E402
+    default_model_path,
     main,
     mask_axis_points,
     mask_depth_observation,
@@ -26,6 +27,18 @@ from geonova_depthai.fence_linearization import (  # noqa: E402
     LinearizationConfig,
     linearize_fence_points,
 )
+
+
+def test_default_model_path_prefers_newest_local_model(tmp_path: Path) -> None:
+    nano_model = tmp_path / "model" / "n_model" / "best.pt"
+    nano_model.parent.mkdir(parents=True)
+    nano_model.touch()
+    assert default_model_path(tmp_path) == nano_model
+
+    field_model = tmp_path / "model" / "x_model" / "best.pt"
+    field_model.parent.mkdir(parents=True)
+    field_model.touch()
+    assert default_model_path(tmp_path) == field_model
 
 
 def test_mask_axis_points() -> None:
