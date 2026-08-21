@@ -5,5 +5,9 @@ __pycache__/
 test_output/
 sample_data/
 image_records/
+datasets/
+shp/
+train/runs/
+train/*.pt
 *.zip
 *.pdf
