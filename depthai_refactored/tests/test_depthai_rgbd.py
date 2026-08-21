@@ -24,20 +24,22 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from geonova_depthai import runtime  # noqa: E402
 from geonova_depthai.capture.defaults import DEFAULTS  # noqa: E402
+from geonova_depthai.config_cli import parse_args_with_yaml  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Validate synchronized RGB-D output after camera warm-up."
+        description="Validate synchronized RGB-D output after camera warm-up.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--warmup-frames", type=int, default=200)
-    parser.add_argument("--sample-frames", type=int, default=30)
-    parser.add_argument("--fps", type=float, default=15.0)
-    parser.add_argument("--output-dir", type=Path, default=Path("test_output/rgbd"))
-    parser.add_argument("--min-valid-depth-ratio", type=float, default=0.10)
-    parser.add_argument("--max-saturated-rgb-ratio", type=float, default=0.50)
-    parser.add_argument("--max-sync-delta-ms", type=float, default=20.0)
-    return parser.parse_args()
+    parser.add_argument("--warmup-frames", type=int, default=200, help="Frames discarded before measurement")
+    parser.add_argument("--sample-frames", type=int, default=30, help="Post-warm-up frames used for health metrics")
+    parser.add_argument("--fps", type=float, default=15.0, help="Requested camera frame rate")
+    parser.add_argument("--output-dir", type=Path, default=Path("test_output/rgbd"), help="Diagnostic image and report directory")
+    parser.add_argument("--min-valid-depth-ratio", type=float, default=0.10, help="Minimum nonzero Depth-pixel ratio required to pass")
+    parser.add_argument("--max-saturated-rgb-ratio", type=float, default=0.50, help="Maximum near-white RGB-pixel ratio allowed")
+    parser.add_argument("--max-sync-delta-ms", type=float, default=20.0, help="Maximum RGB-to-Depth device timestamp difference")
+    return parse_args_with_yaml(parser)
 
 
 def recorder_args(args: argparse.Namespace) -> SimpleNamespace:

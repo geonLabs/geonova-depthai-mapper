@@ -1,6 +1,7 @@
 import csv
 import json
 import queue
+import sys
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -9,7 +10,6 @@ from typing import Any, Dict, Optional
 import cv2
 import numpy as np
 
-from geonova_depthai.capture.defaults import HEIGHT, WIDTH
 from geonova_depthai import runtime
 
 
@@ -53,14 +53,19 @@ SERIAL_FIELDS = [
 ]
 
 
-def _ensure_size(frame, interpolation):
-    if frame.shape[:2] != (HEIGHT, WIDTH):
-        return cv2.resize(frame, (WIDTH, HEIGHT), interpolation=interpolation)
+def _target_size(args):
+    return runtime.rgb_size_from_args(args)
+
+
+def _ensure_size(frame, args, interpolation):
+    width, height = _target_size(args)
+    if frame.shape[:2] != (height, width):
+        return cv2.resize(frame, (width, height), interpolation=interpolation)
     return frame
 
 
 def _apply_saved_image_transform(frame, args, interpolation):
-    frame = _ensure_size(frame, interpolation)
+    frame = _ensure_size(frame, args, interpolation)
     if getattr(args, "flip", False):
         frame = cv2.flip(frame, 0)
     if getattr(args, "rotate_180", False):
@@ -130,7 +135,13 @@ class RawEventDataset:
     The post-processor can later create timestamps.csv and synced imu.csv in the same root.
     """
 
-    def __init__(self, output_dir, args, camera_model: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        output_dir,
+        args,
+        camera_model: Optional[Dict[str, Any]] = None,
+        stereo_depth_model: Optional[Dict[str, Any]] = None,
+    ):
         self.args = args
         self.started_wall = datetime.now()
         self.root = Path(output_dir) / self.started_wall.strftime("%Y-%m-%d_%H-%M-%S_raw")
@@ -152,7 +163,9 @@ class RawEventDataset:
 
         self.counters = {"rgb": 0, "depth": 0, "confidence": 0, "imu": 0, "gps": 0, "external_imu": 0}
         self.counter_lock = threading.Lock()
-        self.metadata = self._build_metadata(camera_model or {})
+        self.metadata_lock = threading.Lock()
+        self.camera_model_updated_from_rgb = False
+        self.metadata = self._build_metadata(camera_model or {}, stereo_depth_model or {})
         self.write_metadata(self.metadata)
 
     def next_index(self, stream):
@@ -161,9 +174,11 @@ class RawEventDataset:
             self.counters[stream] += 1
             return value
 
-    def _build_metadata(self, camera_model):
+    def _build_metadata(self, camera_model, stereo_depth_model):
         args = self.args
+        width, height = _target_size(args)
         camera_model = dict(camera_model)
+        stereo_depth_model = dict(stereo_depth_model)
         camera_model["image_stream_undistorted"] = True
         if camera_model.get("image_stream_undistorted"):
             camera_model["coordinate_unprojection"] = "pinhole on already-undistorted saved RGB/depth pixels"
@@ -172,8 +187,46 @@ class RawEventDataset:
             "format_version": "raw_events_v1",
             "created_wall_time": self.started_wall.isoformat(timespec="milliseconds"),
             "capture_mode": "per_stream_fast_events_then_postprocess_sync",
+            "software_versions": {
+                "python": sys.version.split()[0],
+                "depthai": getattr(runtime.dai, "__version__", ""),
+                "opencv": getattr(cv2, "__version__", ""),
+                "numpy": getattr(np, "__version__", ""),
+            },
+            "depthai_device": {
+                "name": getattr(args, "depthai_device_name", ""),
+                "id": getattr(args, "depthai_device_id", ""),
+                "platform": getattr(args, "depthai_platform", "unknown"),
+            },
             "camera_model": camera_model,
-            "image_size": {"width": WIDTH, "height": HEIGHT},
+            "stereo_depth_model": stereo_depth_model,
+            "image_size": {"width": width, "height": height},
+            "camera_sockets": {
+                "rgb": getattr(args, "rgb_socket_name", "CAM_A"),
+                "stereo_left": getattr(args, "left_socket_name", "CAM_B"),
+                "stereo_right": getattr(args, "right_socket_name", "CAM_C"),
+            },
+            "rgb_sensor": {
+                "name": getattr(args, "rgb_sensor_name", ""),
+                "width": int(getattr(args, "rgb_sensor_width", 0) or 0),
+                "height": int(getattr(args, "rgb_sensor_height", 0) or 0),
+                "types": list(getattr(args, "rgb_sensor_types", []) or []),
+                "resolution_source": getattr(args, "rgb_resolution_source", "unknown"),
+            },
+            "stereo_sensors": {
+                "left": dict(getattr(args, "left_sensor", {}) or {}),
+                "right": dict(getattr(args, "right_sensor", {}) or {}),
+                "stereo_matching_input_size": {
+                    "width": int(getattr(args, "depth_input_width", 0) or 0),
+                    "height": int(getattr(args, "depth_input_height", 0) or 0),
+                },
+                "aligned_depth_output_size": {"width": width, "height": height},
+                "input_size": {
+                    "width": int(getattr(args, "depth_input_width", 0) or 0),
+                    "height": int(getattr(args, "depth_input_height", 0) or 0),
+                },
+                "resolution_source": getattr(args, "depth_input_resolution_source", "unknown"),
+            },
             "image_transform": {
                 "flip_vertical": bool(getattr(args, "flip", False)),
                 "rotate_180": bool(getattr(args, "rotate_180", False)),
@@ -181,14 +234,45 @@ class RawEventDataset:
             },
             "rgb_format": args.rgb_format,
             "rgb_jpeg_quality": args.rgb_jpeg_quality if args.rgb_format == "jpg" else None,
+            "requested_fps": float(args.fps),
+            "requested_depth_fps": float(getattr(args, "depth_fps", 0.0) or 0.0),
+            "depth_fps_effective": float(getattr(args, "depth_fps_effective", args.fps)),
+            "host_transport": {
+                "usb_speed": getattr(args, "usb_speed", "UNKNOWN"),
+                "rgb_transport": getattr(args, "rgb_transport_effective", getattr(args, "rgb_transport", "")),
+                "confidence_transport": getattr(
+                    args,
+                    "confidence_transport_effective",
+                    getattr(args, "confidence_transport", ""),
+                ),
+                "queue_size": int(getattr(args, "queue_size", 0) or 0),
+                "writer_threads": int(getattr(args, "writer_threads", 0) or 0),
+            },
             "depth_format": "uint16_png_mm",
             "confidence_map": {"saved": bool(args.save_confidence_map), "directory": "confidence" if args.save_confidence_map else ""},
+            "stereo_config": {
+                "depth_preset": getattr(args, "depth_preset", ""),
+                "lr_check": bool(getattr(args, "lr_check", False)),
+                "subpixel": bool(getattr(args, "subpixel", False)),
+                "subpixel_fractional_bits": int(getattr(args, "subpixel_fractional_bits", 0) or 0),
+                "median_filter": getattr(args, "stereo_median_filter_effective", getattr(args, "stereo_median_filter", "")),
+                "extended_disparity": False,
+            },
             "depth_alignment": {
+                "enabled": True,
                 "mode": getattr(args, "depth_alignment_effective", args.depth_alignment_mode),
                 "requested_mode": args.depth_alignment_mode,
                 "platform": getattr(args, "depthai_platform", "unknown"),
+                "aligned_to": "RGB",
+                "aligned_to_socket": getattr(args, "rgb_socket_name", "CAM_A"),
+                "method": getattr(args, "depth_alignment_effective", args.depth_alignment_mode),
+                "depth_output_size": {"width": width, "height": height},
+                "stereo_matching_input_size": {
+                    "width": int(getattr(args, "depth_input_width", 0) or 0),
+                    "height": int(getattr(args, "depth_input_height", 0) or 0),
+                },
                 "rgb_undistort": True,
-                "rgb_geometry": "OAK factory-undistorted CAM_A output",
+                "rgb_geometry": f"OAK factory-undistorted {getattr(args, 'rgb_socket_name', 'CAM_A')} output",
                 "depth_pixel_coordinates_match_rgb": True,
                 "notes": (
                     "Production capture requires factory-undistorted RGB. "
@@ -208,6 +292,21 @@ class RawEventDataset:
         with open(self.root / "metadata.json", "w") as file:
             json.dump(metadata, file, indent=2, ensure_ascii=False)
 
+    def update_camera_model_from_rgb_frame(self, msg):
+        if self.camera_model_updated_from_rgb:
+            return
+        frame_model = runtime.imgframe_camera_model_metadata(msg, self.args)
+        if not frame_model:
+            return
+        with self.metadata_lock:
+            if self.camera_model_updated_from_rgb:
+                return
+            camera_model = dict(self.metadata.get("camera_model") or {})
+            camera_model.update(frame_model)
+            self.metadata["camera_model"] = camera_model
+            self.camera_model_updated_from_rgb = True
+            self.write_metadata(self.metadata)
+
     def write_image_event(self, job):
         stream = job["stream"]
         msg = job["message"]
@@ -220,6 +319,7 @@ class RawEventDataset:
         stem = f"{capture_dt.strftime('%Y-%m-%d-%H-%M-%S')}-{stream}{index:07d}"
 
         if stream == "rgb":
+            self.update_camera_model_from_rgb_frame(msg)
             frame = runtime.get_color_cv_frame(msg)
             frame = _apply_saved_image_transform(frame, self.args, cv2.INTER_AREA)
             if frame.dtype != np.uint8:
@@ -265,6 +365,7 @@ class RawEventDataset:
             return
 
     def _image_row(self, index, stem, filename, msg, stamp, frame, stream):
+        width, height = _target_size(self.args)
         return {
             "event_index": index,
             "stem": stem,
@@ -277,8 +378,8 @@ class RawEventDataset:
             "dequeue_wall_time": stamp.get("dequeue_wall_time", ""),
             "dequeue_monotonic_ns": stamp.get("dequeue_monotonic_ns", ""),
             "queue_lag_ms": stamp.get("queue_lag_ms", ""),
-            "width": frame.shape[1] if hasattr(frame, "shape") else WIDTH,
-            "height": frame.shape[0] if hasattr(frame, "shape") else HEIGHT,
+            "width": frame.shape[1] if hasattr(frame, "shape") else width,
+            "height": frame.shape[0] if hasattr(frame, "shape") else height,
         }
 
     def write_imu_message(self, msg, stamp):

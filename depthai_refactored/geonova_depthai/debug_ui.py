@@ -16,6 +16,8 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from .config_cli import parse_args_with_yaml
+
 import cv2
 import numpy as np
 
@@ -82,6 +84,19 @@ def clamp(value, low, high):
     return max(low, min(high, value))
 
 
+def metadata_image_size(metadata):
+    size = (metadata or {}).get("image_size") or {}
+    if isinstance(size, dict):
+        width = safe_int(size.get("width"), WIDTH)
+        height = safe_int(size.get("height"), HEIGHT)
+    elif isinstance(size, (list, tuple)) and len(size) >= 2:
+        width = safe_int(size[0], WIDTH)
+        height = safe_int(size[1], HEIGHT)
+    else:
+        width, height = WIDTH, HEIGHT
+    return max(1, width), max(1, height)
+
+
 class Dataset:
     def __init__(self, root):
         self.root = root
@@ -129,6 +144,7 @@ class Dataset:
         if metadata_path.exists():
             with open(metadata_path) as file:
                 self.metadata = json.load(file)
+        self.image_width, self.image_height = metadata_image_size(self.metadata)
 
         if not self.timestamps:
             raise ValueError(f"No frames listed in {timestamps_path}")
@@ -549,15 +565,16 @@ def enu_dict(vector):
 
 def transformed_pixel_to_original_pixel(x, y, metadata):
     transform = metadata.get("image_transform") or {}
+    width, height = metadata_image_size(metadata)
     original_x = float(x)
     original_y = float(y)
 
     # Inverse of raw -> flip_vertical -> rotate_180.
     if transform.get("rotate_180"):
-        original_x = (WIDTH - 1) - original_x
-        original_y = (HEIGHT - 1) - original_y
+        original_x = (width - 1) - original_x
+        original_y = (height - 1) - original_y
     if transform.get("flip_vertical"):
-        original_y = (HEIGHT - 1) - original_y
+        original_y = (height - 1) - original_y
 
     return original_x, original_y
 
@@ -1552,13 +1569,12 @@ INDEX_HTML = r"""<!doctype html>
     </main>
   </div>
   <script>
-    const WIDTH = 1280;
-    const HEIGHT = 720;
-
     const state = {
       datasetPath: "",
       frameCount: 0,
       index: 0,
+      imageWidth: 1280,
+      imageHeight: 720,
       depthMaxMm: 8000,
       sampleRadius: 4,
       orientationSource: "compare",
@@ -1614,6 +1630,7 @@ INDEX_HTML = r"""<!doctype html>
         const data = await api("/api/dataset", { path });
         state.datasetPath = data.path;
         state.frameCount = data.frame_count;
+        setImageSize(data.image_size);
         state.index = 0;
         frameRange.max = Math.max(0, state.frameCount - 1);
         frameRange.value = 0;
@@ -1643,6 +1660,7 @@ INDEX_HTML = r"""<!doctype html>
       try {
         const frame = await api("/api/frame", { path: state.datasetPath, index });
         state.frame = frame;
+        setImageSize(frame.metadata?.image_size);
         rgbImage.src = mediaUrl("rgb", index);
         depthImage.src = mediaUrl("depth", index);
         renderFrame(frame);
@@ -1662,6 +1680,16 @@ INDEX_HTML = r"""<!doctype html>
     function formatNumber(value, digits=4) {
       if (value === null || value === undefined || Number.isNaN(value)) return "-";
       return Number(value).toFixed(digits);
+    }
+
+    function setImageSize(size) {
+      if (!size || typeof size !== "object") return;
+      const width = Number(size.width || size[0] || 0);
+      const height = Number(size.height || size[1] || 0);
+      if (width > 0 && height > 0) {
+        state.imageWidth = width;
+        state.imageHeight = height;
+      }
     }
 
     function vectorText(values, digits=2) {
@@ -1904,18 +1932,20 @@ INDEX_HTML = r"""<!doctype html>
         rect = surface.getBoundingClientRect();
       }
       if (rect.width <= 0 || rect.height <= 0) return null;
-      const rawX = (event.clientX - rect.left) * WIDTH / rect.width;
-      const rawY = (event.clientY - rect.top) * HEIGHT / rect.height;
-      const x = Math.max(0, Math.min(WIDTH - 1, Math.floor(rawX)));
-      const y = Math.max(0, Math.min(HEIGHT - 1, Math.floor(rawY)));
-      return { x, y, inside: rawX >= 0 && rawX < WIDTH && rawY >= 0 && rawY < HEIGHT };
+      const width = state.imageWidth;
+      const height = state.imageHeight;
+      const rawX = (event.clientX - rect.left) * width / rect.width;
+      const rawY = (event.clientY - rect.top) * height / rect.height;
+      const x = Math.max(0, Math.min(width - 1, Math.floor(rawX)));
+      const y = Math.max(0, Math.min(height - 1, Math.floor(rawY)));
+      return { x, y, inside: rawX >= 0 && rawX < width && rawY >= 0 && rawY < height };
     }
 
     function setCrosshair(point) {
       for (const [image, crosshair] of [[rgbImage, rgbCrosshair], [depthImage, depthCrosshair]]) {
         const rect = image.getBoundingClientRect();
-        const x = rect.left + point.x * rect.width / WIDTH;
-        const y = rect.top + point.y * rect.height / HEIGHT;
+        const x = rect.left + point.x * rect.width / state.imageWidth;
+        const y = rect.top + point.y * rect.height / state.imageHeight;
         const parentRect = crosshair.parentElement.getBoundingClientRect();
         crosshair.style.left = `${x - parentRect.left}px`;
         crosshair.style.top = `${y - parentRect.top}px`;
@@ -2165,6 +2195,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({
                     "path": str(dataset.root),
                     "frame_count": dataset.frame_count,
+                    "image_size": {"width": dataset.image_width, "height": dataset.image_height},
                     "metadata": dataset.metadata,
                 })
             elif parsed.path == "/api/frame":
@@ -2186,7 +2217,11 @@ class Handler(BaseHTTPRequestHandler):
                 })
             elif parsed.path == "/api/first_valid_depth":
                 dataset = get_dataset(params.get("path"))
-                min_valid_pixels = clamp(safe_int(params.get("min_valid_pixels"), 1000), 1, WIDTH * HEIGHT)
+                min_valid_pixels = clamp(
+                    safe_int(params.get("min_valid_pixels"), 1000),
+                    1,
+                    dataset.image_width * dataset.image_height,
+                )
                 found = None
                 for index in range(dataset.frame_count):
                     depth = get_depth_frame(dataset, index)
@@ -2200,8 +2235,8 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/depth_value":
                 dataset = get_dataset(params.get("path"))
                 index = safe_int(params.get("index"), 0)
-                x = clamp(safe_int(params.get("x"), 0), 0, WIDTH - 1)
-                y = clamp(safe_int(params.get("y"), 0), 0, HEIGHT - 1)
+                x = clamp(safe_int(params.get("x"), 0), 0, dataset.image_width - 1)
+                y = clamp(safe_int(params.get("y"), 0), 0, dataset.image_height - 1)
                 radius = clamp(safe_int(params.get("radius"), 4), 0, 20)
                 orientation_source = params.get("orientation_source", "compare")
                 if orientation_source not in ("compare", "ebimu", "gps-course", "gps-course-level"):
@@ -2260,8 +2295,8 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/solve_mount_calibration":
                 dataset = get_dataset(params.get("path"))
                 index = safe_int(params.get("index"), 0)
-                x = clamp(safe_int(params.get("x"), 0), 0, WIDTH - 1)
-                y = clamp(safe_int(params.get("y"), 0), 0, HEIGHT - 1)
+                x = clamp(safe_int(params.get("x"), 0), 0, dataset.image_width - 1)
+                y = clamp(safe_int(params.get("y"), 0), 0, dataset.image_height - 1)
                 radius = clamp(safe_int(params.get("radius"), 4), 0, 20)
                 actual_lat = safe_float(params.get("latitude_deg"))
                 actual_lon = safe_float(params.get("longitude_deg"))
@@ -2330,10 +2365,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Launch the DepthAI dataset debug UI.")
+    parser = argparse.ArgumentParser(
+        description="Launch the DepthAI dataset debug UI.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument("--host", default=HOST, help="Bind address. Use 127.0.0.1 for local-only access.")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
-    return parser.parse_args()
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="HTTP server TCP port")
+    return parse_args_with_yaml(parser)
 
 
 def discover_ipv4_addresses():

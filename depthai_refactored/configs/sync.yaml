@@ -1,5 +1,5 @@
 # 원시 스트림 이벤트를 RGB 프레임 기준으로 동기화하는 설정입니다.
-dataset: image_records/2026-06-26_09-51-36_raw  # 필수: 실제 원시 수집 폴더로 변경
+dataset: /data/collections/image_records/2026-08-19_10-16-33_raw  # 필수: 실제 원시 수집 폴더로 변경
 output_dir: ""                         # 빈 값=원본 폴더, 값 지정=별도 동기 폴더
 sync_threshold_ms: 50.0                # IMU를 짝지을 최대 device 시간차(ms)
 rgb_depth_threshold_ms: 10.0           # RGB/Depth는 한 프레임 밀림 방지를 위해 더 엄격하게 짝지음

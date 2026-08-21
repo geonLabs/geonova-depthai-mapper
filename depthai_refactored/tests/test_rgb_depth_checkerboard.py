@@ -25,6 +25,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from geonova_depthai import runtime  # noqa: E402
 from geonova_depthai.capture.defaults import DEFAULTS  # noqa: E402
+from geonova_depthai.config_cli import parse_args_with_yaml  # noqa: E402
 from tests.test_checkerboard_calibration import (  # noqa: E402
     detect_corners,
     ensure_opencv_qt_fonts,
@@ -33,7 +34,9 @@ from tests.test_checkerboard_calibration import (  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
     parser.add_argument(
         "--calibration",
         type=Path,
@@ -56,27 +59,27 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not factory-undistort RGB files supplied with --captures",
     )
-    parser.add_argument("--output-dir", type=Path, default=Path("test_output/rgb_depth_checkerboard"))
-    parser.add_argument("--warmup-frames", type=int, default=200)
-    parser.add_argument("--samples", type=int, default=8)
-    parser.add_argument("--min-samples", type=int, default=5)
-    parser.add_argument("--fps", type=float, default=15.0)
-    parser.add_argument("--auto-capture", action="store_true")
-    parser.add_argument("--auto-interval-s", type=float, default=1.0)
-    parser.add_argument("--detection-hold-s", type=float, default=1.5)
-    parser.add_argument("--live-detection-scale", type=float, default=0.75)
-    parser.add_argument("--no-rotate-180", action="store_true")
-    parser.add_argument("--depth-radius-px", type=int, default=4)
-    parser.add_argument("--min-valid-ratio", type=float, default=0.50)
-    parser.add_argument("--max-median-error-mm", type=float, default=80.0)
-    parser.add_argument("--max-p95-error-mm", type=float, default=250.0)
-    parser.add_argument("--max-normal-angle-deg", type=float, default=5.0)
-    parser.add_argument("--max-plane-rmse-mm", type=float, default=30.0)
-    parser.add_argument("--edge-search-px", type=int, default=35)
-    parser.add_argument("--min-edge-views", type=int, default=3)
-    parser.add_argument("--max-edge-median-px", type=float, default=12.0)
-    parser.add_argument("--max-edge-p95-px", type=float, default=30.0)
-    return parser.parse_args()
+    parser.add_argument("--output-dir", type=Path, default=Path("test_output/rgb_depth_checkerboard"), help="Capture overlays and report directory")
+    parser.add_argument("--warmup-frames", type=int, default=200, help="Synchronized frames discarded before capture")
+    parser.add_argument("--samples", type=int, default=8, help="Target accepted RGB-Depth views")
+    parser.add_argument("--min-samples", type=int, default=5, help="Minimum valid views required for evaluation")
+    parser.add_argument("--fps", type=float, default=15.0, help="Live camera frame rate")
+    parser.add_argument("--auto-capture", action="store_true", help="Automatically accept stable checkerboard views")
+    parser.add_argument("--auto-interval-s", type=float, default=1.0, help="Minimum seconds between automatic captures")
+    parser.add_argument("--detection-hold-s", type=float, default=1.5, help="Seconds to retain the latest successful detection")
+    parser.add_argument("--live-detection-scale", type=float, default=0.75, help="Live corner-detection image scale")
+    parser.add_argument("--no-rotate-180", action="store_true", help="Keep native camera orientation")
+    parser.add_argument("--depth-radius-px", type=int, default=4, help="Depth sampling radius around checkerboard cells")
+    parser.add_argument("--min-valid-ratio", type=float, default=0.50, help="Minimum valid Depth ratio inside the board")
+    parser.add_argument("--max-median-error-mm", type=float, default=80.0, help="Maximum median RGB-predicted versus measured Depth error")
+    parser.add_argument("--max-p95-error-mm", type=float, default=250.0, help="Maximum per-view p95 Depth error")
+    parser.add_argument("--max-normal-angle-deg", type=float, default=5.0, help="Maximum RGB-to-Depth plane-normal angle")
+    parser.add_argument("--max-plane-rmse-mm", type=float, default=30.0, help="Maximum fitted Depth-plane RMSE")
+    parser.add_argument("--edge-search-px", type=int, default=35, help="Search radius for measured Depth discontinuities")
+    parser.add_argument("--min-edge-views", type=int, default=3, help="Minimum views containing usable board/background edges")
+    parser.add_argument("--max-edge-median-px", type=float, default=12.0, help="Maximum median RGB-to-Depth edge displacement")
+    parser.add_argument("--max-edge-p95-px", type=float, default=30.0, help="Maximum p95 RGB-to-Depth edge displacement")
+    return parse_args_with_yaml(parser)
 
 
 def load_calibration(path: Path) -> dict:
@@ -103,22 +106,32 @@ def board_parameters(calibration: dict):
     return pattern, square_size_mm
 
 
-def load_factory_calibration(path: Path) -> dict:
+def load_factory_calibration(path: Path, image_size: tuple[int, int], socket_name: str) -> dict:
     if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
+        cached = json.loads(path.read_text(encoding="utf-8"))
+        cached_size = tuple(int(value) for value in cached.get("image_size", []))
+        if cached_size == tuple(image_size) and cached.get("socket", "CAM_A") == socket_name:
+            return cached
+        print(
+            "Cached factory RGB calibration uses "
+            f"{cached.get('socket', 'CAM_A')} {cached.get('image_size')}, "
+            f"refreshing for {socket_name} {list(image_size)}..."
+        )
     print("Reading factory RGB calibration from the OAK device...")
     with dai.Device() as device:
         calibration = device.readCalibration()
+        width, height = (int(value) for value in image_size)
+        socket = getattr(dai.CameraBoardSocket, socket_name, dai.CameraBoardSocket.CAM_A)
         intrinsics = calibration.getCameraIntrinsics(
-            dai.CameraBoardSocket.CAM_A, 1280, 720
+            socket, width, height
         )
         distortion = calibration.getDistortionCoefficients(
-            dai.CameraBoardSocket.CAM_A
+            socket
         )
         result = {
             "device": device.getDeviceName(),
-            "socket": "CAM_A",
-            "image_size": [1280, 720],
+            "socket": socket_name,
+            "image_size": [width, height],
             "camera_matrix": [[float(value) for value in row] for row in intrinsics],
             "distortion_coefficients": [float(value) for value in distortion],
         }
@@ -628,9 +641,13 @@ def aggregate_results(args, view_results):
 def main() -> None:
     args = parse_args()
     calibration = load_calibration(args.calibration)
-    factory = load_factory_calibration(args.factory_calibration)
     pattern, square_size_mm = board_parameters(calibration)
     expected_size = tuple(int(value) for value in calibration["image_size"])
+    factory = load_factory_calibration(
+        args.factory_calibration,
+        expected_size,
+        calibration.get("socket", "CAM_A"),
+    )
     rotate_180 = bool(calibration.get("saved_image_rotated_180", True))
     if args.no_rotate_180:
         rotate_180 = False
@@ -679,7 +696,7 @@ def main() -> None:
                     "rgb_undistorted": True,
                     "rotate_180": rotate_180,
                     "source": str(args.captures),
-                    "method": "cv2.undistort with OAK factory CAM_A calibration",
+                    "method": f"cv2.undistort with OAK factory {factory.get('socket', 'CAM_A')} calibration",
                 },
                 indent=2,
             ),

@@ -1,236 +1,466 @@
-# DepthAI RGB-D 센서 수집/검증 코드
+# DepthAI RGB-D·RTK 방호울타리 선형화
 
-이 디렉터리는 OAK-D-PRO-W의 RGB·Depth·내장 IMU와 외부 GPS/NTRIP·EBIMU를
-수집하고, 각 센서를 독립적으로 검증하는 코드만 남긴 버전입니다.
+OAK RGB-D 카메라, GPS/RTK, 내장 IMU와 외부 EBIMU를 동기 수집하고 YOLO
+segmentation 결과를 지도 좌표의 방호울타리 선형으로 만드는 오프라인
+파이프라인입니다. 최종 공간 연산과 길이 계산은 미터 단위 `EPSG:5179`에서
+수행합니다.
 
-## 기존 코드와 달라진 점
-
-| 항목 | 기존 `synced_image_recorder.py` | 리팩터 |
-|---|---|---|
-| 저장 | 수집 루프에서 동기 프레임을 즉시 저장 | 스트림별 이벤트를 먼저 저장하고 후처리에서 동기화 |
-| 동기화 | RGB 기준 host nearest matching | 동일한 device timestamp 기반 후처리, 재실행 가능 |
-| RGB-D 정렬 | `StereoDepth.setDepthAlign(CAM_A)` | 플랫폼 자동 분기 |
-| RVC2/RVC3 | target 출력 geometry가 명확하지 않음 | 실제 RGB 출력을 `StereoDepth.inputAlignTo`에 연결 |
-| RVC4 | 별도 보장 없음 | `ImageAlign(depth, RGB)` 사용 |
-| RGB 왜곡 | 왜곡된 RGB 저장 | `requestOutput(..., enableUndistortion=True)` 강제 |
-| confidence | 기본 저장 | 센서 진단 시에만 선택 저장 |
-| NTRIP | 기존 코드에 기본값 존재 | 동일 기본값을 복원하고 환경변수/CLI override 지원 |
-
-DepthAI v3 공식 예제와 동일하게 RVC2/RVC3는 `StereoDepth.inputAlignTo`,
-RVC4는 `ImageAlign`을 사용합니다.
-
-- [Depth Align 공식 예제](https://docs.luxonis.com/software-v3/depthai/examples/image_align/depth_align)
-- [ImageAlign API](https://docs.luxonis.com/software-v3/depthai/depthai-components/nodes/image_align/)
-- [StereoDepth API](https://docs.luxonis.com/software-v3/depthai/depthai-components/nodes/stereo_depth)
-- [Sync API](https://docs.luxonis.com/software-v3/depthai/depthai-components/nodes/sync/)
-- [Camera undistort 예제](https://docs.luxonis.com/software-v3/depthai/examples/camera/camera_undistort)
-
-## 확인된 기존 데이터 상태
-
-가장 최근 장시간 수집 데이터 `2026-06-22_14-44-18`에서 초기 200프레임을
-제외하고 검사했습니다.
-
-- 총 11,654개 RGB-D 행
-- RGB-depth device timestamp 차이: median 5.443 ms, p95 5.444 ms
-- 표본 프레임 200/500/2000/5000/10002/11655의 유효 depth: 약 59~78%
-- RGB와 depth는 동일 장면이지만, 기존 저장 RGB는 왜곡이 남아 있고
-  `setDepthAlign(CAM_A)`만 사용해 127° 광각 영상 가장자리의 동일 픽셀 좌표를
-  보장하기 어려운 구성
-
-수정된 RVC2 경로는 실제 OAK-D-PRO-W에서 200프레임 warm-up 후 검사했으며,
-10개 평가 프레임의 median 유효 depth 84.1%, 최대 RGB-depth 차이 7.404 ms로
-통과했습니다.
-
-## 설치와 수집
-
-```bash
-cd depthai_refactored
-../.venv/bin/python synced_image_recorder.py
-```
-
-수집 결과는 `image_records/<timestamp>_raw`에 저장됩니다. 동기 데이터 인덱스는
-다음 명령으로 만듭니다.
-
-```bash
-../.venv/bin/python build_synced_dataset.py \
-  --dataset image_records/<timestamp>_raw
-```
-
-기본 RGB-D 정렬은 `--depth-alignment-mode auto`입니다. RVC2 장비에서
-`image-align`을 강제하면 잘못된 조합을 막기 위해 즉시 오류를 냅니다.
-본수집에서는 raw 왜곡 RGB가 Depth와 다른 geometry가 되는 것을 막기 위해
-factory RGB undistortion을 항상 사용하며 비활성화 옵션을 제공하지 않습니다.
-실행 로그에 다음 줄이 표시되어야 합니다.
+## 처리 파이프라인
 
 ```text
-RGB-D geometry: factory-undistorted RGB -> StereoDepth.inputAlignTo
+센서 수집
+  RGB + RGB 정렬 Depth + IMU + GPS/RTK + EBIMU
+        ↓
+후처리 동기화
+  RGB 프레임 기준 device timestamp nearest matching
+        ↓
+YOLO segmentation
+  마스크·박스 plot 저장
+        ↓
+관측점 생성
+  마스크 내부 8 m 이하 유효 Depth fragment → representative 1점
+  마스크 상·중·하 3점 → 형상 확인용 feature
+        ↓
+세계좌표 변환
+  카메라 내부표정 + 장착각/lever-arm + RTK/자세
+        ↓
+점 보정
+  EPSG:5179 → RTK 궤적 접선·법선 좌표 → Huber 측방 offset 보정
+        ↓
+선형화
+  잔차 필터 → 방향·거리·시간 제약 → chainage spline 재샘플링
+        ↓
+CSV + Point/Polyline SHP + QA
 ```
 
-## 센서 테스트
+## 설치
 
-테스트 코드는 모두 `tests/`에 있습니다.
+Python 3.11을 권장합니다. 설치기는 `uv`를 준비하고 `nvcc --version` 결과에
+따라 PyTorch 2.7.1의 CPU/CUDA 빌드를 자동 선택합니다.
+
+저장소 루트에서는 Linux/macOS의 `./install.sh`, Windows PowerShell의
+`.\install.ps1` 한 명령으로 아래 설치기를 실행할 수 있습니다. 부트스트랩에는
+Python 3.8 이상만 있으면 되고, 프로젝트용 Python 3.11은 `uv`가 준비합니다.
+
+### Windows PowerShell
+
+```powershell
+.\scripts\setup_env.ps1 --config configs\setup.yaml
+.\.venv\Scripts\Activate.ps1
+```
+
+### Linux
 
 ```bash
-# RGB-D: 200프레임 warm-up 후 30프레임 평가
-../.venv/bin/python tests/test_depthai_rgbd.py
-
-# GPS + NTRIP/RTCM
-../.venv/bin/python tests/test_gps_ntrip.py --duration-s 30
-
-# EBIMU 출력/주기
-../.venv/bin/python tests/test_ebimu.py --duration-s 10
+chmod +x scripts/setup_env.sh
+./scripts/setup_env.sh --config configs/setup.yaml
+. .venv/bin/activate
 ```
 
-RGB-D 테스트 결과는 기본적으로 `test_output/rgbd/`에 저장됩니다. 원본 RGB,
-16-bit depth(mm), depth 컬러맵, RGB-depth overlay, JSON 판정 결과를 함께 봅니다.
-
-## Debug UI
-
-저장 데이터의 RGB·Depth·동기화·GPS·EBIMU와 YOLO-seg 결과를 한 화면에서
-확인할 수 있습니다.
+`configs/setup.yaml`에서 `dev: true`로 바꾸면 `pytest`도 설치합니다. 기존
+`.venv`를 그대로 쓰는데 테스트 패키지만 빠져 있다면 아래처럼 보충합니다.
 
 ```bash
-../.venv/bin/python debug_ui.py --host 127.0.0.1 --port 8088
+python -m pip install pytest
 ```
 
-브라우저에서 `http://127.0.0.1:8088`을 열고 데이터셋을 선택합니다. YOLO 검출
-프레임에서는 오른쪽 패널에서 각 점의 픽셀·Depth·좌표 품질을 확인할 수 있습니다.
-
-## YOLO-seg 3점 및 SHP 테스트
-
-`best.pt`는 `guardrail` segmentation 모델입니다. 검출 마스크의 주축을 구한 뒤
-한쪽 끝점, 중앙점, 반대쪽 끝점의 3점을 마스크 내부에 찍습니다. 따라서 난간이
-비스듬하거나 휘어 보이는 경우에도 단순 사각형 중심보다 검출 형상을 잘 따릅니다.
-초기 불안정 데이터가 섞이지 않도록 `--start-frame`은 200 미만을 허용하지 않습니다.
+Python 3.11 환경은 `requirements.txt`의 고정 버전을 그대로 따릅니다. 오래된
+Python 3.8 `.venv`에서 회귀 테스트만 돌릴 때 `pyproj==3.7.2` wheel이 없으면
+3.8 호환 버전인 `pyproj==3.5.0`을 사용할 수 있습니다.
 
 ```bash
-../.venv/bin/python tests/test_yolo_seg_shp.py \
-  --dataset image_records/2026-06-23_14-20-20_raw \
-  --model best.pt \
-  --start-frame 200 \
-  --max-frames 100 \
-  --batch 4 \
-  --conf 0.25
+python -m pip install pyproj==3.5.0
 ```
 
-`--batch-size`(축약 `--batch`)는 한 번의 YOLO 추론에 묶을 이미지 수이며 기본값은
-4입니다. GPU/메모리에 여유가 있으면 높이고 메모리 부족이 발생하면 낮춥니다.
-`--confidence`(축약 `--conf`)는 검출 confidence 임계값이며 기본값은 0.25입니다.
+자동 선택 대신 PyTorch 빌드를 지정하려면 YAML의 `cuda`를 바꾸거나 CLI로 한
+값만 덮어씁니다.
 
-기본 출력은 데이터셋의 `yolo_seg/`에 생성됩니다.
+```bash
+python setup_env.py --config configs/setup.yaml --cuda cu118
+```
+
+YAML에 없는 값은 기존 코드 기본값을 그대로 사용하며, 명시한 CLI 옵션은 YAML보다
+우선합니다.
+
+## 1. 센서 연결 검증
+
+본수집 전에 사용하는 장치만 개별 확인합니다.
+
+```bash
+python tests/test_depthai_rgbd.py --config configs/rgbd_test.yaml
+python tests/test_gps_ntrip.py --config configs/gps_ntrip_test.yaml
+python tests/test_ebimu.py --config configs/ebimu_test.yaml
+```
+
+카메라 내부표정과 RGB–Depth 정렬을 확인해야 할 때는 체커보드 도구를 사용합니다.
+
+```bash
+python tests/test_checkerboard_calibration.py --config configs/camera_calibration.yaml
+python tests/test_rgb_depth_checkerboard.py --config configs/rgb_depth_validation.yaml
+```
+
+각 도구의 판정 임계값과 입력 방식은 해당 명령의 `--help`에 설명되어 있습니다.
+순수 회귀 테스트는 하드웨어 수집을 시작하지 않고 다음처럼 실행합니다.
+
+```bash
+python -m pytest -q tests
+```
+
+### Depth가 실측과 크게 다를 때
+
+Luxonis 문서 기준 OAK-D W wide FOV 800P/75 mm baseline은 3.5~6.5 m 구간에서
+대략 몇 % 수준의 depth error가 정상 범위입니다. 4 m 대상이 7 m로 보이는 정도는
+post-processing 튜닝이나 임의 scale 보정으로 처리할 문제가 아니라 stereo
+calibration/구성 문제로 봅니다.
+
+1. 같은 위치에서 OAK Viewer의 depth도 같은 오차인지 확인합니다.
+2. `metadata.json`의 `stereo_depth_model`에서 CAM_B/C sensor, baseline,
+   left/right socket, input size가 실제 장치와 맞는지 확인합니다.
+3. 좌우 카메라가 바뀌었거나 board config/HFOV/baseline이 틀렸다면 Luxonis
+   manual calibration으로 CAM_B/C intrinsics/extrinsics를 다시 만들어 EEPROM에
+   플래시합니다.
+
+Luxonis 절차 요약:
+
+```bash
+git clone https://github.com/luxonis/depthai.git --branch main
+cd depthai
+git submodule update --init --recursive
+python3 install_requirements.py
+python3 calibrate.py --help
+```
+
+Charuco board는 화면 전체에 띄우고 실제 square size를 cm 단위로 재서 `-s`에
+넣습니다. OAK-D-LR처럼 지원 board가 있는 compact device는 해당 board 이름을
+사용하고, 렌즈/모듈 구성이 바뀐 장치는 `resources/depthai_boards/boards/`에
+맞는 board config를 준비해 `-brd <board>.json`으로 실행합니다. 촬영은 정면,
+가까운 거리의 상하좌우/기울임, 중간 거리, 먼 거리와 코너까지 FOV 전체를 덮도록
+진행합니다. 처리 단계에서 epipolar line을 확인한 뒤 성공한 calibration을 EEPROM에
+플래시하고, 다시 OAK Viewer와 `tests/test_depthai_rgbd.py`로 거리 스케일을 확인합니다.
+
+참고 문서:
+
+- Luxonis depth accuracy: <https://docs.luxonis.com/hardware/platform/depth/depth-accuracy/>
+- Luxonis manual calibration: <https://docs.luxonis.com/hardware/platform/depth/manual-calibration/>
+- Luxonis stereo depth 설정: <https://docs.luxonis.com/hardware/platform/depth/configuring-stereo-depth/>
+- OAK-D-LR 제품 정보: <https://shop.luxonis.com/products/oak-d-lr>
+
+## 2. 원시 이벤트 수집
+
+```bash
+python synced_image_recorder.py --config configs/capture.yaml
+```
+
+### Jetson Controller 앱 연동
+
+수집 프로세스는 기본적으로 `/var/lib/jetson-sensors`에 앱 연동용 최신 상태를
+게시합니다.
+
+- `status.json`: 카메라·GNSS·IMU heartbeat, GNSS fix quality, NTRIP 상태와 위치
+- `camera-preview.jpg`: 최대 4 Hz, 1280 px 폭의 최신 RGB 프리뷰
+
+파일은 같은 디렉터리에서 원자적으로 교체되므로 Jetson Control API가 기록 중인
+파일을 읽지 않습니다. `controller_sensor_stale_after_s` 동안 새 샘플이 없으면 해당
+센서는 비활성으로 표시됩니다. 프리뷰 인코딩은 별도 스레드에서 동작하며 수집 큐를
+막지 않습니다. 경로, 상태 주기, 프리뷰 FPS·폭·JPEG 품질은 `configs/capture.yaml`의
+`controller_*` 값으로 조정할 수 있고 `controller_bridge_enabled: false`로 끌 수
+있습니다.
+
+systemd로 실행할 때 파이프라인 사용자에게 `/var/lib/jetson-sensors` 쓰기 권한과
+`ReadWritePaths`를 함께 부여해야 합니다. JetsonControllerApp의
+`install-depthai-pipeline.sh`가 이 설정을 자동으로 추가합니다.
+
+Windows PowerShell에서는 `\` 대신 백틱을 사용하거나 한 줄로 실행합니다.
+
+기본 RGB-D 정렬은 `--depth-alignment-mode auto`입니다.
+
+- RGB 해상도: `rgb_width: 0`, `rgb_height: 0`이면 연결된 컬러 센서의
+  `getConnectedCameraFeatures()` 결과를 보고 자동 선택
+  (`1920x1200` → `1920x1080` → `1280x720` 후보)
+- Stereo 입력: EEPROM의 `getStereoLeftCameraId()`/`getStereoRightCameraId()`를
+  우선 사용하고, 연결된 좌우 센서 크기에 맞춰 자동 선택합니다. RVC2에서는 stereo
+  matching 폭 한계 때문에 1920x1200 AR0234 계열도 기본적으로 1280x800 입력을
+  사용해 전체 FOV를 유지합니다.
+- FPS: `fps`는 RGB 출력과 RGB 기준 저장 cadence를 정합니다.
+  `depth_fps: 0`이면 기존처럼 depth도 같은 fps를 쓰고, 양수이면 좌우
+  mono/stereo depth 입력만 별도 fps로 요청합니다. 예: RGB는 15 Hz로 두고
+  depth만 30 Hz로 올리려면 `--fps 15 --depth-fps 30`.
+- RVC2/RVC3: 실제 RGB 출력을 `StereoDepth.inputAlignTo`에 연결
+- RVC4: `ImageAlign`으로 Depth를 RGB에 정렬
+- 저장 RGB: 장치 factory calibration으로 undistort
+- Depth: `uint16` millimeter PNG
+- confidence map: 마스크 fragment의 soft quality gate에 사용하므로 가능하면 저장
+
+예를 들어 OAK-D-W의 `CAM_A IMX378 4056x3040 COLOR` 센서는 자동으로
+`1920x1200` RGB 출력을 선택하고, RVC2에서는 같은 크기의 depth를
+`StereoDepth.inputAlignTo`로 맞춥니다. RGB와 depth 크기는 `metadata.json`의
+`image_size`, `rgb_sensor`, `depth_alignment`에 기록됩니다. 특정 크기로 강제할
+때는 `--rgb-width 1920 --rgb-height 1080`처럼 두 값을 함께 지정합니다.
+렌즈/왜곡 보정은 첫 RGB 프레임의 `ImgFrame.getTransformation()`에서 실제 저장
+출력 intrinsics를 읽어 `camera_model.intrinsics`에 기록합니다. OAK-D-W처럼
+wide lens인 경우 factory intrinsics와 undistorted 출력 intrinsics가 다르므로,
+세계좌표 계산은 `factory_distortion_coefficients`가 아니라 저장 픽셀 기준
+`camera_model.intrinsics`를 사용합니다. Depth PNG의 mm 값은 DepthAI stereo
+calibration으로 이미 계산된 값이고, 앱에서 바뀌는 식은 픽셀+depth를 3D ray로
+푸는 unprojection입니다.
+
+OAK-D-LR은 triple AR0234 2.3 MP global-shutter color sensor와 5/10/15 cm
+baseline을 가진 RVC2 장치입니다. 코드가 연결된 camera feature와 EEPROM stereo
+pair를 읽어 RGB/Depth socket과 입력 크기를 자동 선택하므로 별도 카메라명
+하드코딩 없이 사용할 수 있습니다. 선택된 socket, sensor, stereo 입력 크기는
+`metadata.json`의 `camera_sockets`, `rgb_sensor`, `stereo_sensors`,
+`stereo_depth_model`에 기록됩니다.
+
+OAK-D-LR에서 저장되는 RGB와 depth 출력은 `1920x1200` RGB geometry에 맞춰집니다.
+다만 RVC2의 StereoDepth matching 입력은 1920 폭을 직접 받을 수 없어서 AR0234
+1920x1200 stereo frame을 full-FOV `1280x800`으로 내려 계산한 뒤, RGB 출력에
+align된 depth를 `1920x1200`으로 저장합니다. 따라서 LR 데이터셋 metadata에는
+`depth_alignment.depth_output_size=1920x1200`과
+`stereo_sensors.stereo_matching_input_size=1280x800`이 함께 기록됩니다.
+
+이전 코드로 찍은 데이터셋이 `metadata.json`에 frame transformation intrinsics를
+갖고 있지 않다면, 같은 카메라를 연결한 상태에서 다음처럼 갱신할 수 있습니다.
+
+```bash
+python refresh_camera_metadata.py --dataset image_records/2026-06-25_14-30-59_raw
+```
+
+Depth fps를 RGB보다 높이면 후처리 동기화가 RGB timestamp에 가장 가까운 depth
+이벤트를 고르므로 시간 오차를 줄일 수 있지만, USB 대역폭과 저장량은 늘어납니다.
+현재 저장 depth는 RGB 좌표계에 정렬된 출력입니다. RVC2의
+`StereoDepth.inputAlignTo` 경로에서는 `depth_fps`를 더 높게 요청해도 실제
+aligned depth 저장 cadence가 RGB fps에 가까워질 수 있으므로, 저장 프레임률까지
+올려야 할 때는 `fps`도 함께 올립니다.
+
+DepthAI raw depth는 stereo pair의 calibration으로 계산된 millimeter 값입니다.
+OAK-D W wide FOV 800P/75 mm baseline 기준으로 4 m 부근에서 4 m가 7 m로 보이는
+수준은 정상 정확도 범위를 벗어납니다. 이 경우 임의 scale 보정보다는
+CAM_B/C 렌즈가 EEPROM calibration과 일치하는지, 좌우 카메라가 바뀌지 않았는지,
+board config/HFOV/baseline이 맞는지 확인하고 Luxonis manual calibration 절차로
+stereo intrinsics/extrinsics를 다시 플래시해야 합니다.
+정확도 확인용 RVC2 수집 설정은 `depth_preset: FAST_ACCURACY`, `lr_check: true`,
+`subpixel: true`, `subpixel_fractional_bits: 5`, `stereo_median_filter: off`로
+두어 post-processing 영향을 줄이고 stereo calibration 상태를 먼저 봅니다.
+
+수집 폴더에는 스트림별 이벤트 CSV와 `rgb/`, `depth_mm/` 이미지가 생성됩니다.
+GPS/NTRIP/EBIMU 장치 및 보정 서버 설정은 다음으로 확인합니다.
+
+```bash
+python synced_image_recorder.py --help
+```
+
+NTRIP 값은 CLI 또는 `NTRIP_HOST`, `NTRIP_PORT`, `NTRIP_MOUNTPOINT`,
+`NTRIP_USERNAME`, `NTRIP_PASSWORD` 환경변수로 지정할 수 있습니다.
+기본값은 `www.gnssdata.or.kr:2101` source table에서 `RTCM31` mountpoint를
+읽어 GPS 초기 위치와 가장 가까운 기준국부터 연결합니다. source table을 받지
+못하거나 GPS 위치가 아직 없으면 서울/경기권 fallback 후보
+`GANS-RTCM31,GUMC-RTCM31,DBON-RTCM31,PAJU-RTCM31,...` 순서로 시도하며,
+연결 또는 RTCM 데이터 수신 timeout이 나면 다음 기준국으로 넘어갑니다.
+
+## 3. 데이터 동기화
+
+원본 폴더 안에 `timestamps.csv`, `imu.csv`와 품질 보고서를 생성합니다.
+
+```bash
+python build_synced_dataset.py --config configs/sync.yaml
+```
+
+RGB와 aligned depth는 `rgb_depth_threshold_ms`로 따로 제한합니다. 기본값 `10ms`는
+30 FPS에서 이전/다음 depth 프레임이 잘못 붙는 `±33ms` 매칭을 버리기 위한 값입니다.
+IMU 매칭은 기존 `sync_threshold_ms`를 사용합니다.
+
+별도 폴더를 만들려면 `--output-dir`을 지정합니다. 같은 파일시스템에서는 이미지
+symlink를 사용하며, 실제 파일 복사가 필요하면 `--copy-images`를 추가합니다.
+
+```bash
+python build_synced_dataset.py --config configs/sync.yaml --copy-images
+```
+
+동기 데이터셋은 최소한 다음 항목을 포함해야 합니다.
+
+```text
+timestamps.csv
+imu.csv
+gps.csv                  # GPS를 사용한 경우
+external_imu.csv         # EBIMU를 사용한 경우
+metadata.json
+rgb/
+depth_mm/
+```
+
+## 4. YOLO 검출과 선형화 일괄 실행
+
+동기화된 데이터셋과 segmentation 모델을 입력합니다. 초기 카메라 안정화 구간을
+제외하기 위해 `--start-frame`은 200 이상이어야 합니다.
+
+```bash
+python tests/test_yolo_seg_shp.py --config configs/yolo.yaml
+```
+
+`--orientation-source ebimu`는 보정된 EBIMU/외부표정을 사용하는 운영 모드입니다.
+`gps-course-level`은 GPS course를 yaw로 쓰고 카메라를 수평으로 가정하므로
+초기 확인용 근사 모드입니다. 정밀 산출 전 `metadata.json`의 카메라 장착각과
+GPS–카메라 lever-arm을 실제 측정값으로 설정해야 합니다.
+
+YOLO 실행이 끝나면 선형화가 자동 실행됩니다. YOLO 결과만 만들려면
+`--no-linearize`를 추가합니다.
+
+### YOLO 관측점 생성 알고리즘
+
+1. segmentation polygon을 원본 RGB 크기의 binary mask로 복원합니다.
+2. 마스크 경계를 erosion해 배경 Depth 혼입을 줄입니다.
+3. Depth 0, 최대거리 초과, confidence 기준 초과 픽셀을 제거합니다.
+4. Depth median/MAD로 fragment 내부 이상치를 제거합니다.
+5. 중심 위치·Depth 잔차가 안정적인 픽셀을 `representative`로 선택합니다.
+6. 마스크 PCA의 `endpoint_a/midpoint/endpoint_b`는 `feature`로만 저장합니다.
+7. 최종 지도 선형에는 `point_usage=mapping`인 representative만 사용합니다.
+
+검출된 프레임 이미지는 원본 복사본이 아니라 YOLO 마스크·박스·라벨이 표시된
+`result.plot()` 이미지로 `detected_plot/`에 저장됩니다.
+
+## 5. 방호 울타리 점 보정과 선형화만 재실행
+
+YOLO의 `points.csv`가 있으면 모델 추론 없이 보정 파라미터만 바꿔 빠르게
+재실행할 수 있습니다.
+
+```bash
+python -m geonova_depthai.fence_linearization --config configs/linearization.yaml
+```
+
+### 점 보정 알고리즘
+
+1. WGS84 관측점을 `always_xy=True`로 `EPSG:5179`에 한 번 투영합니다.
+2. RTK fixed/position/HDOP가 유효한 GPS epoch를 선택합니다.
+3. GPS 궤적을 이동 median과 Savitzky–Golay로 평활화합니다.
+4. 각 관측점을 가장 가까운 궤적 station의 접선·법선 좌표 `(s, lateral)`로
+   변환합니다.
+5. chainage·프레임 로컬 윈도우에서 품질 가중 Huber 회귀로 측방 offset을
+   추정합니다.
+6. 허용 이동량 안의 점은 `C(s) + b(s)n(s)` 방향으로 재투영합니다.
+7. `--max-correction-m`보다 크게 움직여야 하는 점은
+   `gross_lateral_outlier`로 표시하고 최종선에서 제외합니다.
+8. 로컬 TLS 직교 잔차와 MAD 임계값으로 남은 이상치를 필터링합니다.
+
+### 선 연결 알고리즘
+
+1. 대표점을 좌·우 side 및 chainage 순서로 정렬합니다.
+2. 프레임 순서, 최대 공간 gap, 최대 heading 차이, 측방 offset 변화를 동시에
+   검사합니다.
+3. 조건을 벗어나면 실제 단절로 간주해 새로운 segment를 시작합니다.
+4. 최소 지지 검출 수를 만족하는 segment만 선으로 만듭니다.
+5. segment를 chainage 기준 smoothing spline으로 적합합니다.
+6. `--line-sample-spacing-m` 간격으로 재샘플링해 GPS 진행방향을 따르는
+   `POLYLINEZ`를 생성합니다.
+7. 2D 길이는 EPSG:5179 XY, 3D 길이는 XYZ 차분으로 각각 계산합니다.
+
+### 주요 튜닝 옵션
+
+| 옵션 | 기본값 | 의미 | 조정 방향 |
+|---|---:|---|---|
+| `--max-observation-depth-mm` | 8000 | 지도점으로 사용할 최대 Depth | 장비 거리 검증 후에만 증가 |
+| `--side-window-m` | 20 | Huber offset의 chainage 윈도우 | 급곡선은 감소, 노이즈가 크면 증가 |
+| `--side-frame-window` | 100 | 같은 주행 구간으로 볼 프레임 범위 | 중복 주행 혼입 시 감소 |
+| `--huber-delta-m` | 0.75 | Huber loss 전환 잔차 | 관측 노이즈에 맞춰 조정 |
+| `--max-correction-m` | 3 | 강제로 이동할 수 있는 최대 거리 | 큰 값은 반대편 오연결 위험 |
+| `--max-gap-m` | 6 | 이웃 대표점 연결 최대 거리 | 과분절 시 소폭 증가 |
+| `--max-frame-gap` | 60 | 연결 가능한 최대 프레임 간격 | 큰 값은 다른 주행 혼입 위험 |
+| `--max-heading-deg` | 35 | GPS 접선 대비 연결 각도 | 곡선에서만 소폭 증가 |
+| `--min-line-support` | 5 | 선 하나의 최소 검출 수 | 짧은 시설물이 사라질 때 감소 |
+| `--line-sample-spacing-m` | 0.5 | 최종 spline vertex 간격 | 정밀도와 파일 크기 절충 |
+| `--spline-smoothing` | 0.15 | 선형 평활 강도 | 과평활 시 감소 |
+
+파라미터 비교 시 같은 출력 폴더를 덮어쓰지 말고 `linearized_baseline`,
+`linearized_gap8`처럼 별도 폴더를 사용합니다.
+
+## 산출물
 
 ```text
 yolo_seg/
-  detected_rgb/                     검출된 프레임의 수정하지 않은 원본 RGB만 저장
-  detections.jsonl                  Debug UI용 프레임별 결과
-  points.csv                        모든 점과 Depth/좌표 상태
-  yolo_seg_points_pixels.shp        항상 생성되는 픽셀 좌표 SHP
-  yolo_seg_points_wgs84.shp         좌표 계산에 성공한 WGS84 POINTZ SHP
+  detected_plot/                     YOLO plot 이미지
+  detections.jsonl                   프레임별 검출·관측점
+  points.csv                         feature/mapping 점과 센서 품질
+  yolo_seg_points_pixels.*           픽셀 POINT SHP
+  yolo_seg_points_wgs84.*            좌표화 성공 WGS84 POINTZ SHP
   summary.json
+  linearized/
+    debug_00_raw.csv/.shp            원본과 유효성 판정
+    debug_01_projected.csv/.shp      EPSG:5179 투영점
+    debug_02_local.csv/.shp          chainage/lateral 좌표
+    debug_03_side_corrected.csv/.shp Huber offset 보정 결과
+    debug_04_interpolated.csv/.shp   하위 호환 보간 단계
+    debug_05_filtered.csv/.shp       최종 채택점
+    points_corrected.csv/.shp        보정 이력·QA 전체점
+    fence_lines.csv/.shp             최종 POLYLINEZ
+    qa_metrics.csv                    완전성·잔차·방향·gap·길이
+    linearization_summary.json        설정과 실행 요약
 ```
 
-검출이 없는 프레임은 결과 파일에 기록하거나 복사하지 않습니다. 검출 프레임도
-마스크·선·점을 그린 overlay는 만들지 않고 원본 RGB 파일을 그대로 복사합니다.
+SHP는 DBF 필드명/타입 제한이 있으므로 상세 원인은 CSV를 기준으로 확인합니다.
+`qa_metrics.csv`에서는 특히 다음을 함께 봅니다.
 
-WGS84 좌표의 기본 자세 소스는 `gps-course-level`입니다. GPS 진행방향을 yaw로
-사용하고 카메라가 수평이라고 가정하므로 테스트용 근사 좌표입니다. 정밀 SHP에는
-RTK fixed 상태와 실제 카메라 장착각/레버암을 metadata에 넣고 `--orientation-source
-ebimu` 또는 보정된 자세를 사용해야 합니다. 유효 Depth가 없는 점은 픽셀 SHP와
-CSV에는 남지만 WGS84 SHP에서는 제외됩니다.
+- `completeness`
+- `accepted_residual_rmse_m`
+- `mean_heading_error_deg`, `p95_heading_error_deg`
+- `gross_lateral_outlier_count`
+- `line_count`, `line_gap_count`, `maximum_line_gap_m`
+- `total_length_m_2d`, `total_length_m_3d`
 
-## 체커보드 카메라 캘리브레이션 테스트
-
-지정 보드는 가로 14칸 × 세로 10칸, 한 칸 30 mm입니다. OpenCV에 넘기는
-내부 코너 수는 가로 13 × 세로 9입니다.
+## Debug UI
 
 ```bash
-../.venv/bin/python tests/test_checkerboard_calibration.py
+python -m geonova_depthai.debug_ui --config configs/debug_ui.yaml
 ```
 
-보드를 여러 거리·위치·각도로 움직이고 `LOCKED - press Space` 초록 표시가
-나오면 Space를 눌러 20장을 모읍니다. 검출은 1.5초간 고정되므로 한 프레임
-실패로 즉시 사라지지 않습니다. `Q`로 조기 종료할 수 있으며 최소 12장이
-필요합니다. 수락한 원본은 즉시 `test_output/checkerboard/captures/`에 저장됩니다.
-결과는 `test_output/checkerboard/calibration.json`에 저장됩니다. RMS reprojection
-error 1.0 px 이하뿐 아니라 추정 초점거리가 OAK factory calibration과 25% 안에서
-일치해야 합격합니다. 평면 보드가 화면 일부 위치에만 모이면 RMS가 낮아도
-초점거리와 거리 스케일을 잘못 추정할 수 있기 때문입니다.
+브라우저에서 `http://127.0.0.1:8088`을 열어 RGB, Depth, GPS/IMU 동기화,
+YOLO 관측점과 세계좌표 품질을 확인합니다.
 
-자동 수집 또는 기존 이미지 폴더도 사용할 수 있습니다.
+## CLI 도움말
+
+모든 실행 파일은 YAML을 지원합니다. `--config`에 없는 키는 기존 기본값을
+유지하고, 명시적인 CLI 옵션은 YAML 값을 덮어씁니다. 전체 기본 설정 파일은
+각 명령의 `--write-default-config`로 생성할 수 있습니다.
+
+YAML 키는 CLI의 `--max-gap-m`을 `max_gap_m`으로 적는 식으로 하이픈을
+밑줄로 바꿉니다. NTRIP username/password는 기본 YAML에 기록하지 않으므로
+환경변수나 별도 비공개 YAML로 제공합니다.
 
 ```bash
-../.venv/bin/python tests/test_checkerboard_calibration.py --auto-capture
-../.venv/bin/python tests/test_checkerboard_calibration.py --images ./checkerboard_images
+python synced_image_recorder.py --write-default-config capture.defaults.yaml
+python tests/test_yolo_seg_shp.py --write-default-config yolo.defaults.yaml
+python -m geonova_depthai.fence_linearization --write-default-config linearization.defaults.yaml
 ```
 
-### RGB–Depth 캘리브레이션 검증
-
-RGB 캘리브레이션이 끝난 다음 같은 체커보드로 RGB와 Depth 사이의 정렬·거리·
-평면 방향까지 검사합니다.
+옵션의 의미와 단위는 `--help`로 확인합니다.
 
 ```bash
-../.venv/bin/python tests/test_rgb_depth_checkerboard.py
+python setup_env.py --help
+python synced_image_recorder.py --help
+python build_synced_dataset.py --help
+python tests/test_yolo_seg_shp.py --help
+python -m geonova_depthai.fence_linearization --help
+python -m geonova_depthai.debug_ui --help
+python tests/test_depthai_rgbd.py --help
+python tests/test_gps_ntrip.py --help
+python tests/test_ebimu.py --help
+python tests/test_checkerboard_calibration.py --help
+python tests/test_rgb_depth_checkerboard.py --help
 ```
 
-이 테스트도 200개의 동기 프레임을 워밍업으로 버린 뒤 시작합니다. 체커보드를
-약 0.7~2 m 거리에서 화면의 중앙/가장자리와 서로 다른 기울기로 보여주고,
-`LOCKED - press Space`가 나오면 Space를 눌러 8개 자세를 저장합니다.
-RGB와 Depth의 외곽선 이동도 측정하므로 체커보드를 벽에 붙이지 말고 뒤쪽
-배경과 거리가 생기도록 들고 촬영해야 합니다.
-
-판정 항목은 다음과 같습니다.
-
-- 체커보드 내부의 유효 depth 비율
-- RGB 코너와 `solvePnP`로 예측한 체커보드 거리 대비 실제 depth 오차
-- RGB 체커보드 평면 법선과 depth 포인트로 피팅한 평면 법선의 각도
-- depth 체커보드 평면의 RMSE
-- RGB가 예측한 보드 외곽선과 실제 depth 경계의 픽셀 이동
-
-결과와 각 프레임 overlay는 `test_output/rgb_depth_checkerboard/`에 저장됩니다.
-기본 합격 기준은 유효률 50% 이상, median 거리 오차 80 mm 이하, 최악 view의
-p95 오차 250 mm 이하, 평면 법선 5° 이하, depth 평면 RMSE 30 mm 이하,
-외곽선 median 12 px/p95 30 px 이하입니다.
-저장된 캡처는 카메라 없이 다시 분석할 수 있습니다.
-
-```bash
-../.venv/bin/python tests/test_rgb_depth_checkerboard.py \
-  --captures test_output/rgb_depth_checkerboard/captures
-```
-
-이전 버전으로 저장해 RGB에는 광각 왜곡이 남고 Depth만 정렬 geometry인 경우,
-위 재분석 명령이 OAK factory CAM_A 값으로 RGB를 자동 undistort합니다. 원본은
-건드리지 않고 `test_output/rgb_depth_checkerboard/corrected_captures/`에 보정본을
-만듭니다. 향후 라이브 RGB–Depth 테스트는 처음부터 undistorted RGB를 수집합니다.
-
-주의: 14×30 mm = 420 mm, 10×30 mm = 300 mm이므로 정확한 30 mm 정사각형 보드는
-420×300 mm입니다. A3는 420×297 mm라 짧은 변이 3 mm 부족합니다. A3에 맞춤
-축소 인쇄하면 칸이 정확히 30×30 mm가 아니게 되므로, 100% 배율로 인쇄하고
-3 mm가 더 긴 용지/여백을 쓰거나 인쇄 후 실제 칸 크기를 재서
-`--square-size-mm`에 입력해야 합니다.
-
-## NTRIP 기본값
-
-리팩터의 비어 있던 값은 기존 코드와 동일하게 복원했습니다.
-
-- caster: `www.gnssdata.or.kr:2101`
-- mountpoint: `YANJ-RTCM31`
-- username/password: 기존 수집 코드 값
-- GGA interval: 10초, reconnect delay: 5초
-
-CLI 인자 또는 `NTRIP_HOST`, `NTRIP_PORT`, `NTRIP_MOUNTPOINT`,
-`NTRIP_USERNAME`, `NTRIP_PASSWORD` 환경변수로 덮어쓸 수 있습니다.
-
-## 남긴 코드
+## 코드 구성
 
 ```text
-synced_image_recorder.py
-build_synced_dataset.py
-geonova_depthai/capture/       수집 CLI, writer, defaults
-geonova_depthai/postprocess/   timestamp 동기화
-geonova_depthai/runtime.py          수집에 필요한 카메라/serial runtime
-geonova_depthai/debug_ui.py         저장 데이터 Debug UI 및 좌표 투영
-geonova_depthai/yolo_seg_shp.py     YOLO-seg 3점/Depth/WGS84/SHP 처리
-debug_ui.py                         Debug UI 실행 진입점
-tools/configure_ebimu.py            EBIMU 설정 도구
-tests/                         RGB-D, GPS/NTRIP, EBIMU, checkerboard 테스트
+setup_env.py                         uv/PyTorch/의존성 설치
+configs/                             운영 단계별 YAML 예제
+synced_image_recorder.py             센서 수집 진입점
+build_synced_dataset.py              후처리 동기화 진입점
+geonova_depthai/capture/             수집 CLI와 raw writer
+geonova_depthai/controller_bridge.py 앱용 센서 상태와 카메라 프리뷰 게시
+geonova_depthai/postprocess/         이벤트 동기화
+geonova_depthai/runtime.py           DepthAI·GPS·NTRIP·EBIMU runtime
+geonova_depthai/debug_ui.py          데이터셋 확인과 좌표 변환
+geonova_depthai/yolo_seg_shp.py      YOLO·Depth fragment·WGS84 관측점
+geonova_depthai/fence_linearization.py EPSG:5179 보정·spline·SHP·QA
+best.pt                             기본 guardrail segmentation 모델
+tools/configure_ebimu.py            EBIMU 출력 설정·보정 도구
+tests/                               센서/캘리브레이션/회귀 검증
 ```

@@ -17,16 +17,19 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from geonova_depthai import runtime  # noqa: E402
 from geonova_depthai.capture.defaults import DEFAULTS  # noqa: E402
+from geonova_depthai.config_cli import parse_args_with_yaml  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--device", default=DEFAULTS["external_imu_device"])
-    parser.add_argument("--baudrate", type=int, default=DEFAULTS["external_imu_baudrate"])
-    parser.add_argument("--duration-s", type=float, default=10.0)
-    parser.add_argument("--min-rate-hz", type=float, default=20.0)
-    parser.add_argument("--print-raw", action="store_true")
-    return parser.parse_args()
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument("--device", default=DEFAULTS["external_imu_device"], help="EBIMU serial path or Windows COM port")
+    parser.add_argument("--baudrate", type=int, default=DEFAULTS["external_imu_baudrate"], help="EBIMU serial baud rate")
+    parser.add_argument("--duration-s", type=float, default=10.0, help="Acquisition duration in seconds")
+    parser.add_argument("--min-rate-hz", type=float, default=20.0, help="Minimum parsed sample rate required to pass")
+    parser.add_argument("--print-raw", action="store_true", help="Print every received serial line")
+    return parse_args_with_yaml(parser)
 
 
 def main() -> None:

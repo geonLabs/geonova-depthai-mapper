@@ -1,5 +1,6 @@
 .venv/
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *.egg-info/
 
@@ -11,7 +12,7 @@ image_records_*/
 *_sample/
 ui_debug_sample/
 alignment_meta_sample/
-depthai_refactored/test_output/
+test_output/
 
 # Temporary/debug artifacts
 .DS_Store

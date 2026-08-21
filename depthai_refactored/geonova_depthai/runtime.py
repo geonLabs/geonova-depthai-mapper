@@ -3,6 +3,7 @@
 
 import argparse
 import base64
+import math
 import queue
 import socket
 import threading
@@ -19,6 +20,17 @@ import serial
 WIDTH = 1280
 HEIGHT = 720
 MIN_DEPTHAI_MAJOR = 3
+PREFERRED_RGB_SIZES = (
+    (1920, 1200),
+    (1920, 1080),
+    (WIDTH, HEIGHT),
+)
+MAX_RVC2_STEREO_WIDTH = 1280
+PREFERRED_STEREO_SIZES = (
+    (1280, 800),
+    (1280, 720),
+    (640, 400),
+)
 
 GPS_FIX_QUALITY_NAMES = {
     "0": "invalid",
@@ -31,6 +43,33 @@ GPS_FIX_QUALITY_NAMES = {
     "7": "manual",
     "8": "simulation",
 }
+
+DEFAULT_RTK_MOUNTPOINT_FORMAT = "RTCM31"
+FALLBACK_RTK_MOUNTPOINTS = (
+    ("GANS-RTCM31", 37.500000, 126.900000, "SMG"),
+    ("GUMC-RTCM31", 37.500000, 126.900000, "SMG"),
+    ("DBON-RTCM31", 37.600000, 127.000000, "SMG"),
+    ("PAJU-RTCM31", 37.750000, 126.740000, "Single Base"),
+    ("YONS-RTCM31", 37.500000, 127.000000, "SMG"),
+    ("SOUL-RTCM31", 37.620000, 127.100000, "Single Base"),
+    ("INCH-RTCM31", 37.420000, 126.690000, "Single Base"),
+    ("ICOR-RTCM31", 37.420000, 126.640000, "Single Base"),
+    ("SONP-RTCM31", 37.500000, 127.100000, "SMG"),
+    ("OJBU-RTCM31", 37.450000, 127.060000, "Single Base"),
+    ("PJMS-RTCM31", 37.886041, 126.766214, "Single Base"),
+    ("YANJ-RTCM31", 37.410000, 126.550000, "Single Base"),
+    ("DOND-RTCM31", 37.900000, 127.060000, "Single Base"),
+    ("NAMY-RTCM31", 37.430000, 127.180000, "Single Base"),
+    ("GANH-RTCM31", 37.720000, 126.390000, "Single Base"),
+    ("SWGS-RTCM31", 37.260000, 126.980000, "Single Base"),
+    ("SUWN-RTCM31", 37.280000, 127.050000, "Single Base"),
+    ("POCN-RTCM31", 38.018582, 127.190970, "Single Base"),
+    ("YANP-RTCM31", 37.450000, 127.510000, "Single Base"),
+    ("YEOJ-RTCM31", 37.280000, 127.580000, "Single Base"),
+    ("ANSG-RTCM31", 37.010000, 127.270000, "Single Base"),
+    ("DANJ-RTCM31", 36.890000, 126.820000, "Single Base"),
+    ("CHEN-RTCM31", 36.880000, 127.160000, "Single Base"),
+)
 
 
 def time_to_ns(value):
@@ -241,6 +280,231 @@ def enum_by_name(enum_cls, name):
         raise argparse.ArgumentTypeError(f"Invalid value '{name}'. Valid values: {valid_names}") from exc
 
 
+def enum_name(value):
+    return getattr(value, "name", str(value).split(".")[-1])
+
+
+def socket_matches(value, expected):
+    return value == expected or enum_name(value) == enum_name(expected)
+
+
+def camera_feature_size(feature):
+    try:
+        width = int(getattr(feature, "width", 0) or 0)
+        height = int(getattr(feature, "height", 0) or 0)
+    except (TypeError, ValueError):
+        return 0, 0
+    return width, height
+
+
+def camera_feature_type_names(feature):
+    return [enum_name(sensor_type) for sensor_type in (getattr(feature, "supportedTypes", []) or [])]
+
+
+def connected_camera_features(device):
+    try:
+        return list(device.getConnectedCameraFeatures())
+    except Exception:
+        return []
+
+
+def find_connected_camera_feature(device, board_socket):
+    for feature in connected_camera_features(device):
+        if socket_matches(getattr(feature, "socket", None), board_socket):
+            return feature
+    return None
+
+
+def camera_feature_to_metadata(feature):
+    width, height = camera_feature_size(feature) if feature is not None else (0, 0)
+    return {
+        "socket": enum_name(getattr(feature, "socket", "")) if feature is not None else "",
+        "name": getattr(feature, "sensorName", "") if feature is not None else "",
+        "width": width,
+        "height": height,
+        "types": camera_feature_type_names(feature) if feature is not None else [],
+    }
+
+
+def is_color_camera_feature(feature):
+    return "COLOR" in camera_feature_type_names(feature)
+
+
+def select_color_camera_feature(device, preferred_socket):
+    features = connected_camera_features(device)
+    preferred = None
+    for feature in features:
+        if socket_matches(getattr(feature, "socket", None), preferred_socket):
+            preferred = feature
+            if is_color_camera_feature(feature):
+                return feature
+    for feature in features:
+        if is_color_camera_feature(feature):
+            return feature
+    return preferred
+
+
+def rgb_size_from_args(args):
+    width = int(getattr(args, "rgb_width", 0) or WIDTH)
+    height = int(getattr(args, "rgb_height", 0) or HEIGHT)
+    return width, height
+
+
+def resolve_depth_fps(args):
+    depth_fps = float(getattr(args, "depth_fps", 0.0) or 0.0)
+    if depth_fps < 0:
+        raise ValueError("depth_fps must be >= 0")
+    effective = depth_fps if depth_fps > 0 else float(args.fps)
+    args.depth_fps_effective = effective
+    return effective
+
+
+def choose_rgb_output_size(sensor_width, sensor_height, candidates=PREFERRED_RGB_SIZES):
+    if sensor_width <= 0 or sensor_height <= 0:
+        return WIDTH, HEIGHT, "fallback_unknown_sensor"
+
+    fitting = [
+        (width, height)
+        for width, height in candidates
+        if width <= sensor_width and height <= sensor_height
+    ]
+    if not fitting:
+        return WIDTH, HEIGHT, "fallback_sensor_too_small"
+
+    sensor_aspect = sensor_width / sensor_height
+    width, height = min(
+        fitting,
+        key=lambda size: (abs((size[0] / size[1]) - sensor_aspect), -size[0] * size[1]),
+    )
+    return width, height, "sensor_aspect"
+
+
+def choose_stereo_input_size(sensor_width, sensor_height, platform, candidates=PREFERRED_STEREO_SIZES):
+    if sensor_width <= 0 or sensor_height <= 0:
+        return WIDTH, 800, "fallback_unknown_sensor"
+
+    max_width = MAX_RVC2_STEREO_WIDTH if platform == dai.Platform.RVC2 else sensor_width
+    fitting = [
+        (width, height)
+        for width, height in candidates
+        if width <= sensor_width and height <= sensor_height and width <= max_width
+    ]
+    if not fitting:
+        width = min(sensor_width, max_width)
+        height = max(1, int(round(width * sensor_height / sensor_width)))
+        return width, height, "scaled_to_platform_limit"
+
+    sensor_aspect = sensor_width / sensor_height
+    width, height = min(
+        fitting,
+        key=lambda size: (abs((size[0] / size[1]) - sensor_aspect), -size[0] * size[1]),
+    )
+    return width, height, "sensor_aspect_platform_limit"
+
+
+def resolve_stereo_sockets(device, preferred_left=None, preferred_right=None):
+    left_socket = preferred_left
+    right_socket = preferred_right
+    try:
+        calibration = device.readCalibration()
+        left_socket = left_socket or calibration.getStereoLeftCameraId()
+        right_socket = right_socket or calibration.getStereoRightCameraId()
+    except Exception:
+        pass
+    left_socket = left_socket or dai.CameraBoardSocket.CAM_B
+    right_socket = right_socket or dai.CameraBoardSocket.CAM_C
+    return left_socket, right_socket
+
+
+def resolve_stereo_input_size(device, args, platform, left_socket, right_socket):
+    left_feature = find_connected_camera_feature(device, left_socket)
+    right_feature = find_connected_camera_feature(device, right_socket)
+    left_width, left_height = camera_feature_size(left_feature)
+    right_width, right_height = camera_feature_size(right_feature)
+    sensor_width = min(value for value in (left_width, right_width) if value > 0) if left_width or right_width else 0
+    sensor_height = min(value for value in (left_height, right_height) if value > 0) if left_height or right_height else 0
+    width, height, source = choose_stereo_input_size(sensor_width, sensor_height, platform)
+
+    args.left_socket = left_socket
+    args.right_socket = right_socket
+    args.left_socket_name = enum_name(left_socket)
+    args.right_socket_name = enum_name(right_socket)
+    args.depth_input_width = width
+    args.depth_input_height = height
+    args.depth_input_resolution_source = source
+    args.left_sensor = camera_feature_to_metadata(left_feature)
+    args.right_sensor = camera_feature_to_metadata(right_feature)
+
+    print(
+        f"Stereo input size: {width}x{height} "
+        f"(source={source}, left={args.left_socket_name} "
+        f"{args.left_sensor.get('name') or 'unknown'} "
+        f"{args.left_sensor.get('width')}x{args.left_sensor.get('height')}, "
+        f"right={args.right_socket_name} "
+        f"{args.right_sensor.get('name') or 'unknown'} "
+        f"{args.right_sensor.get('width')}x{args.right_sensor.get('height')})"
+    )
+    return width, height
+
+
+def set_device_identity_metadata(device, args):
+    try:
+        args.depthai_device_name = device.getDeviceName()
+    except Exception:
+        args.depthai_device_name = ""
+    try:
+        args.depthai_device_id = device.getDeviceId()
+    except Exception:
+        try:
+            args.depthai_device_id = device.getMxId()
+        except Exception:
+            args.depthai_device_id = ""
+
+
+def resolve_rgb_output_size(device, args, color_socket=None):
+    color_socket = color_socket or dai.CameraBoardSocket.CAM_A
+    configured_width = int(getattr(args, "rgb_width", 0) or 0)
+    configured_height = int(getattr(args, "rgb_height", 0) or 0)
+    if configured_width < 0 or configured_height < 0:
+        raise ValueError("rgb_width/rgb_height must be >= 0")
+    if bool(configured_width) != bool(configured_height):
+        raise ValueError("Set both rgb_width and rgb_height, or set both to 0 for auto")
+    feature = select_color_camera_feature(device, color_socket)
+    actual_socket = getattr(feature, "socket", color_socket) if feature is not None else color_socket
+    sensor_width, sensor_height = camera_feature_size(feature) if feature is not None else (0, 0)
+    sensor_name = getattr(feature, "sensorName", "") if feature is not None else ""
+    sensor_types = camera_feature_type_names(feature) if feature is not None else []
+
+    if configured_width > 0 and configured_height > 0:
+        width, height = configured_width, configured_height
+        source = "configured"
+    else:
+        width, height, source = choose_rgb_output_size(sensor_width, sensor_height)
+
+    args.rgb_width = width
+    args.rgb_height = height
+    args.rgb_resolution_source = source
+    args.rgb_sensor_name = sensor_name
+    args.rgb_sensor_width = sensor_width
+    args.rgb_sensor_height = sensor_height
+    args.rgb_sensor_types = sensor_types
+    args.rgb_socket = actual_socket
+    args.rgb_socket_name = enum_name(actual_socket)
+
+    sensor_text = (
+        f"{sensor_name or 'unknown'} {sensor_width}x{sensor_height}"
+        if sensor_width and sensor_height
+        else sensor_name or "unknown"
+    )
+    print(
+        f"RGB output size: {width}x{height} "
+        f"(source={source}, socket={args.rgb_socket_name}, sensor={sensor_text})"
+    )
+    if sensor_types and "COLOR" not in sensor_types:
+        print(f"Warning: {args.rgb_socket_name} sensor types are {sensor_types}, not COLOR.")
+    return width, height
+
+
 def request_camera_output(camera, fps, size=(WIDTH, HEIGHT), frame_type=None, enable_undistortion=False):
     """Request a DepthAI v3 camera output with explicit undistortion control.
 
@@ -429,6 +693,208 @@ def build_gga_sentence(latitude_deg, longitude_deg, altitude_m=0.0):
     return f"${body}*{nmea_checksum(body)}\r\n"
 
 
+def _float_or_none(value):
+    if value in ("", None):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_ntrip_mountpoint_list(value):
+    if value in ("", None):
+        return []
+    if isinstance(value, str):
+        items = value.replace("\n", ",").replace(";", ",").split(",")
+    elif isinstance(value, (list, tuple, set)):
+        items = value
+    else:
+        items = [value]
+    mountpoints = []
+    seen = set()
+    for item in items:
+        mountpoint = str(item).strip()
+        if not mountpoint or mountpoint in seen:
+            continue
+        seen.add(mountpoint)
+        mountpoints.append(mountpoint)
+    return mountpoints
+
+
+def ntrip_mountpoint_matches_format(mountpoint, mountpoint_format):
+    if not mountpoint_format:
+        return True
+    normalized_mountpoint = str(mountpoint).replace(" ", "").upper()
+    normalized_format = str(mountpoint_format).replace(" ", "").upper()
+    return normalized_mountpoint.endswith(f"-{normalized_format}") or normalized_mountpoint.endswith(normalized_format)
+
+
+def fallback_rtk_mountpoint_entries(mountpoint_format=DEFAULT_RTK_MOUNTPOINT_FORMAT):
+    entries = []
+    for mountpoint, latitude, longitude, network in FALLBACK_RTK_MOUNTPOINTS:
+        if not ntrip_mountpoint_matches_format(mountpoint, mountpoint_format):
+            continue
+        entries.append({
+            "mountpoint": mountpoint,
+            "identifier": mountpoint,
+            "format": mountpoint_format,
+            "navigation_system": "GPS+GLONASS",
+            "network": network,
+            "country": "KOR",
+            "latitude": latitude,
+            "longitude": longitude,
+            "source": "fallback",
+        })
+    return entries
+
+
+def haversine_distance_m(latitude_a, longitude_a, latitude_b, longitude_b):
+    radius_m = 6_371_000.0
+    lat_a = math.radians(float(latitude_a))
+    lat_b = math.radians(float(latitude_b))
+    delta_lat = math.radians(float(latitude_b) - float(latitude_a))
+    delta_lon = math.radians(float(longitude_b) - float(longitude_a))
+    value = (
+        math.sin(delta_lat / 2.0) ** 2
+        + math.cos(lat_a) * math.cos(lat_b) * math.sin(delta_lon / 2.0) ** 2
+    )
+    return 2.0 * radius_m * math.atan2(math.sqrt(value), math.sqrt(1.0 - value))
+
+
+def parse_ntrip_source_table(text, mountpoint_format=DEFAULT_RTK_MOUNTPOINT_FORMAT):
+    if "\r\n\r\n" in text:
+        text = text.split("\r\n\r\n", 1)[1]
+    elif "\n\n" in text:
+        text = text.split("\n\n", 1)[1]
+
+    entries = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("STR;"):
+            continue
+        parts = line.split(";")
+        if len(parts) < 11:
+            continue
+        mountpoint = parts[1].strip()
+        if not ntrip_mountpoint_matches_format(mountpoint, mountpoint_format):
+            continue
+        latitude = _float_or_none(parts[9])
+        longitude = _float_or_none(parts[10])
+        if latitude is None or longitude is None:
+            continue
+        entries.append({
+            "mountpoint": mountpoint,
+            "identifier": parts[2].strip() if len(parts) > 2 else mountpoint,
+            "format": parts[3].strip() if len(parts) > 3 else "",
+            "format_details": parts[4].strip() if len(parts) > 4 else "",
+            "carrier": parts[5].strip() if len(parts) > 5 else "",
+            "navigation_system": parts[6].strip() if len(parts) > 6 else "",
+            "network": parts[7].strip() if len(parts) > 7 else "",
+            "country": parts[8].strip() if len(parts) > 8 else "",
+            "latitude": latitude,
+            "longitude": longitude,
+            "source": "sourcetable",
+        })
+    return unique_ntrip_mountpoint_entries(entries)
+
+
+def unique_ntrip_mountpoint_entries(entries):
+    unique = []
+    seen = set()
+    for entry in entries:
+        mountpoint = entry.get("mountpoint")
+        if not mountpoint or mountpoint in seen:
+            continue
+        seen.add(mountpoint)
+        unique.append(entry)
+    return unique
+
+
+def ntrip_entry_for_mountpoint(mountpoint, source="configured"):
+    for entry in fallback_rtk_mountpoint_entries():
+        if entry["mountpoint"] == mountpoint:
+            configured = dict(entry)
+            configured["source"] = source
+            return configured
+    return {"mountpoint": mountpoint, "source": source}
+
+
+def sort_ntrip_mountpoint_entries(entries, latitude_deg=None, longitude_deg=None, max_count=None, preferred_mountpoints=None):
+    unique = unique_ntrip_mountpoint_entries(entries)
+    preferred = {
+        mountpoint: index
+        for index, mountpoint in enumerate(parse_ntrip_mountpoint_list(preferred_mountpoints))
+    }
+    latitude = _float_or_none(latitude_deg)
+    longitude = _float_or_none(longitude_deg)
+    has_position = latitude is not None and longitude is not None
+
+    ranked = []
+    for order, entry in enumerate(unique):
+        entry = dict(entry)
+        entry_lat = _float_or_none(entry.get("latitude"))
+        entry_lon = _float_or_none(entry.get("longitude"))
+        distance = None
+        if has_position and entry_lat is not None and entry_lon is not None:
+            distance = haversine_distance_m(latitude, longitude, entry_lat, entry_lon)
+            entry["distance_m"] = distance
+        mountpoint = entry.get("mountpoint", "")
+        if distance is not None:
+            sort_key = (0, distance, preferred.get(mountpoint, len(preferred)), order)
+        elif mountpoint in preferred:
+            sort_key = (1, preferred[mountpoint], order)
+        else:
+            sort_key = (2, order)
+        ranked.append((sort_key, entry))
+
+    ranked.sort(key=lambda item: item[0])
+    result = [entry for _, entry in ranked]
+    if max_count and max_count > 0:
+        result = result[:int(max_count)]
+    return result
+
+
+def fetch_ntrip_source_table(config):
+    host = config["host"]
+    port = int(config["port"])
+    timeout = float(config.get("sourcetable_timeout", 5.0) or 5.0)
+    lines = [
+        "GET / HTTP/1.0",
+        f"Host: {host}",
+        "User-Agent: NTRIP synced-image-recorder",
+        "Ntrip-Version: Ntrip/2.0",
+        "Connection: close",
+    ]
+    username = config.get("username")
+    password = config.get("password")
+    if username or password:
+        token = base64.b64encode(f"{username or ''}:{password or ''}".encode("utf-8")).decode("ascii")
+        lines.append(f"Authorization: Basic {token}")
+    lines.extend(["", ""])
+
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        sock.sendall("\r\n".join(lines).encode("ascii"))
+        chunks = []
+        total = 0
+        while total < 1_000_000:
+            try:
+                data = sock.recv(65536)
+            except socket.timeout:
+                if chunks:
+                    break
+                raise
+            if not data:
+                break
+            chunks.append(data)
+            total += len(data)
+    text = b"".join(chunks).decode("utf-8", errors="replace")
+    if "STR;" not in text:
+        raise RuntimeError("NTRIP source table did not contain STR mountpoint entries")
+    return text
+
+
 class NtripCorrectionClient:
     def __init__(self, config, serial_write, stop_event, latest_nmea=None):
         self.config = config
@@ -439,6 +905,11 @@ class NtripCorrectionClient:
         self.bytes_received = 0
         self.error = None
         self.connected = False
+        self.current_mountpoint = None
+        self.mountpoint_sequence = []
+        self.source_table_entries = None
+        self.source_table_error = None
+        self.source_table_attempted = False
 
     def start(self):
         self.thread = threading.Thread(target=self._run, name="gps-ntrip", daemon=True)
@@ -464,8 +935,99 @@ class NtripCorrectionClient:
             return gga if gga.endswith("\r\n") else f"{gga}\r\n"
         return self._fallback_gga()
 
-    def _request(self):
-        mountpoint = self.config["mountpoint"].lstrip("/")
+    def _rover_position(self):
+        latitude = _float_or_none(self.latest_nmea.get("latitude_deg"))
+        longitude = _float_or_none(self.latest_nmea.get("longitude_deg"))
+        if latitude is not None and longitude is not None:
+            return latitude, longitude
+
+        gga = self.latest_nmea.get("gga")
+        if gga:
+            parsed = parse_nmea_line(gga)
+            latitude = _float_or_none(parsed.get("latitude_deg"))
+            longitude = _float_or_none(parsed.get("longitude_deg"))
+            if latitude is not None and longitude is not None:
+                return latitude, longitude
+
+        latitude = _float_or_none(self.config.get("latitude"))
+        longitude = _float_or_none(self.config.get("longitude"))
+        if latitude is not None and longitude is not None:
+            return latitude, longitude
+        return None
+
+    def _wait_for_rover_position(self):
+        position = self._rover_position()
+        if position is not None:
+            return position
+
+        wait_s = float(self.config.get("position_wait_s", 0.0) or 0.0)
+        deadline = time.monotonic() + wait_s
+        while wait_s > 0.0 and not self.stop_event.is_set():
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+            position = self._rover_position()
+            if position is not None:
+                return position
+        return None
+
+    def _load_source_table_entries(self):
+        if self.source_table_attempted:
+            return self.source_table_entries or []
+        self.source_table_attempted = True
+        try:
+            text = fetch_ntrip_source_table(self.config)
+            self.source_table_entries = parse_ntrip_source_table(
+                text,
+                self.config.get("mountpoint_format", DEFAULT_RTK_MOUNTPOINT_FORMAT),
+            )
+            if self.source_table_entries:
+                print(f"RTK NTRIP source table loaded: {len(self.source_table_entries)} mountpoints")
+        except Exception as exc:
+            self.source_table_error = str(exc)
+            self.source_table_entries = []
+            print(f"RTK NTRIP source table unavailable: {self.source_table_error}")
+        return self.source_table_entries or []
+
+    def _configured_mountpoints(self, auto_mountpoint):
+        primary = parse_ntrip_mountpoint_list(self.config.get("mountpoint"))
+        candidates = parse_ntrip_mountpoint_list(self.config.get("mountpoint_candidates"))
+        ordered = candidates + primary if auto_mountpoint else primary + candidates
+        return parse_ntrip_mountpoint_list(ordered)
+
+    def _mountpoint_candidates(self):
+        auto_mountpoint = bool(self.config.get("auto_mountpoint", True))
+        position = self._wait_for_rover_position() if auto_mountpoint else self._rover_position()
+        configured_mountpoints = self._configured_mountpoints(auto_mountpoint)
+
+        if auto_mountpoint:
+            entries = self._load_source_table_entries()
+            if not entries:
+                entries = fallback_rtk_mountpoint_entries(
+                    self.config.get("mountpoint_format", DEFAULT_RTK_MOUNTPOINT_FORMAT)
+                )
+            entries = list(entries)
+            entries.extend(ntrip_entry_for_mountpoint(mountpoint) for mountpoint in configured_mountpoints)
+        else:
+            entries = [ntrip_entry_for_mountpoint(mountpoint) for mountpoint in configured_mountpoints]
+
+        if not entries and self.config.get("mountpoint"):
+            entries.append(ntrip_entry_for_mountpoint(self.config["mountpoint"]))
+
+        latitude = position[0] if position else None
+        longitude = position[1] if position else None
+        ranked = sort_ntrip_mountpoint_entries(
+            entries,
+            latitude,
+            longitude,
+            max_count=int(self.config.get("max_mountpoints", 0) or 0),
+            preferred_mountpoints=configured_mountpoints,
+        )
+        self.mountpoint_sequence = ranked
+        return ranked
+
+    def _request(self, mountpoint):
+        mountpoint = mountpoint.lstrip("/")
         lines = [
             f"GET /{mountpoint} HTTP/1.0",
             f"Host: {self.config['host']}",
@@ -481,60 +1043,91 @@ class NtripCorrectionClient:
         lines.extend(["", ""])
         return "\r\n".join(lines).encode("ascii")
 
+    def _stream_mountpoint(self, entry):
+        mountpoint = entry["mountpoint"]
+        connect_timeout = float(self.config.get("connect_timeout", 10.0) or 10.0)
+        data_timeout = float(self.config.get("data_timeout", 15.0) or 0.0)
+        with socket.create_connection((self.config["host"], self.config["port"]), timeout=connect_timeout) as sock:
+            sock.settimeout(connect_timeout)
+            sock.sendall(self._request(mountpoint))
+            response = b""
+            while b"\r\n\r\n" not in response and len(response) < 4096:
+                chunk = sock.recv(1)
+                if not chunk:
+                    break
+                response += chunk
+            header, _, remainder = response.partition(b"\r\n\r\n")
+            first_line = header.splitlines()[0].decode("ascii", errors="replace") if header else ""
+            if "200" not in first_line and "ICY 200" not in first_line:
+                raise RuntimeError(f"NTRIP caster rejected request: {first_line}")
+
+            self.connected = True
+            self.current_mountpoint = mountpoint
+            self.error = None
+            distance = entry.get("distance_m")
+            distance_text = f", distance={distance / 1000.0:.1f}km" if distance is not None else ""
+            print(f"RTK NTRIP connected: {self.config['host']}:{self.config['port']}/{mountpoint}{distance_text}")
+
+            last_gga_time = 0.0
+            gga = self._current_gga()
+            if gga:
+                sock.sendall(gga.encode("ascii", errors="ignore"))
+                last_gga_time = time.monotonic()
+
+            last_data_time = time.monotonic()
+            sock.settimeout(1.0)
+            if remainder:
+                self.serial_write(remainder)
+                self.bytes_received += len(remainder)
+                last_data_time = time.monotonic()
+
+            while not self.stop_event.is_set():
+                now = time.monotonic()
+                if self.config.get("gga_interval", 10.0) > 0:
+                    if now - last_gga_time >= self.config.get("gga_interval", 10.0):
+                        gga = self._current_gga()
+                        if gga:
+                            sock.sendall(gga.encode("ascii", errors="ignore"))
+                            last_gga_time = now
+                if data_timeout > 0.0 and now - last_data_time >= data_timeout:
+                    raise TimeoutError(f"no RTCM data for {data_timeout:.1f}s")
+                try:
+                    data = sock.recv(4096)
+                except socket.timeout:
+                    continue
+                if not data:
+                    raise RuntimeError("NTRIP stream closed")
+                self.serial_write(data)
+                self.bytes_received += len(data)
+                last_data_time = time.monotonic()
+
     def _run(self):
-        reconnect_delay = self.config.get("reconnect_delay", 5.0)
+        reconnect_delay = float(self.config.get("reconnect_delay", 5.0) or 0.0)
         while not self.stop_event.is_set():
-            self.connected = False
-            try:
-                with socket.create_connection((self.config["host"], self.config["port"]), timeout=10.0) as sock:
-                    sock.settimeout(1.0)
-                    sock.sendall(self._request())
-                    response = b""
-                    while b"\r\n\r\n" not in response and len(response) < 4096:
-                        chunk = sock.recv(1)
-                        if not chunk:
-                            break
-                        response += chunk
-                    header, _, remainder = response.partition(b"\r\n\r\n")
-                    first_line = header.splitlines()[0].decode("ascii", errors="replace") if header else ""
-                    if "200" not in first_line and "ICY 200" not in first_line:
-                        raise RuntimeError(f"NTRIP caster rejected request: {first_line}")
-
-                    self.connected = True
-                    self.error = None
-
-                    last_gga_time = 0.0
-                    gga = self._current_gga()
-                    if gga:
-                        sock.sendall(gga.encode("ascii", errors="ignore"))
-                        last_gga_time = time.monotonic()
-
-                    if remainder:
-                        self.serial_write(remainder)
-                        self.bytes_received += len(remainder)
-
-                    while not self.stop_event.is_set():
-                        now = time.monotonic()
-                        if self.config.get("gga_interval", 10.0) > 0:
-                            if now - last_gga_time >= self.config.get("gga_interval", 10.0):
-                                gga = self._current_gga()
-                                if gga:
-                                    sock.sendall(gga.encode("ascii", errors="ignore"))
-                                    last_gga_time = now
-                        try:
-                            data = sock.recv(4096)
-                        except socket.timeout:
-                            continue
-                        if not data:
-                            break
-                        self.serial_write(data)
-                        self.bytes_received += len(data)
-            except Exception as exc:
+            candidates = self._mountpoint_candidates()
+            if not candidates:
                 self.connected = False
-                self.error = str(exc)
-                if not self.stop_event.is_set():
-                    print(f"RTK NTRIP reconnecting after error: {self.error}")
-                    self.stop_event.wait(reconnect_delay)
+                self.error = "no NTRIP mountpoints available"
+                print(f"RTK NTRIP reconnecting after error: {self.error}")
+                self.stop_event.wait(reconnect_delay)
+                continue
+
+            for entry in candidates:
+                if self.stop_event.is_set():
+                    break
+                self.connected = False
+                self.current_mountpoint = entry.get("mountpoint")
+                try:
+                    self._stream_mountpoint(entry)
+                except Exception as exc:
+                    self.connected = False
+                    self.error = f"{entry.get('mountpoint', '-')}: {exc}"
+                    if not self.stop_event.is_set():
+                        print(f"RTK NTRIP switching after error: {self.error}")
+                    continue
+
+            if not self.stop_event.is_set():
+                self.stop_event.wait(reconnect_delay)
 
 
 class NmeaParserState:
@@ -640,29 +1233,165 @@ def matrix_to_json(matrix):
     return [[float(value) for value in row] for row in matrix]
 
 
-def adjust_intrinsics_for_saved_transform(intrinsics, args):
+def fov_from_intrinsics(intrinsics, width, height):
+    fx = float(intrinsics[0][0])
+    fy = float(intrinsics[1][1])
+    width = float(width)
+    height = float(height)
+    diagonal = math.hypot(width, height)
+    focal_diagonal = math.sqrt(fx * fy)
+    return {
+        "horizontal_deg": math.degrees(2.0 * math.atan(width / (2.0 * fx))),
+        "vertical_deg": math.degrees(2.0 * math.atan(height / (2.0 * fy))),
+        "diagonal_deg": math.degrees(2.0 * math.atan(diagonal / (2.0 * focal_diagonal))),
+    }
+
+
+def adjust_intrinsics_for_saved_transform(intrinsics, args, width=None, height=None):
+    width = int(width or rgb_size_from_args(args)[0])
+    height = int(height or rgb_size_from_args(args)[1])
     adjusted = matrix_to_json(intrinsics)
-    if args.rotate_180:
-        adjusted[0][2] = (WIDTH - 1) - adjusted[0][2]
-        adjusted[1][2] = (HEIGHT - 1) - adjusted[1][2]
-    if args.flip:
-        adjusted[1][2] = (HEIGHT - 1) - adjusted[1][2]
+    if getattr(args, "rotate_180", False):
+        adjusted[0][2] = (width - 1) - adjusted[0][2]
+        adjusted[1][2] = (height - 1) - adjusted[1][2]
+    if getattr(args, "flip", False):
+        adjusted[1][2] = (height - 1) - adjusted[1][2]
     return adjusted
 
 
+def optional_call(obj, method_name, default=None):
+    try:
+        method = getattr(obj, method_name)
+    except AttributeError:
+        return default
+    try:
+        return method()
+    except Exception:
+        return default
+
+
+def rotated_rect_to_json(rect):
+    if rect is None:
+        return None
+    center = getattr(rect, "center", None)
+    size = getattr(rect, "size", None)
+    return {
+        "angle_deg": float(getattr(rect, "angle", 0.0) or 0.0),
+        "center": {
+            "x": float(getattr(center, "x", 0.0) or 0.0),
+            "y": float(getattr(center, "y", 0.0) or 0.0),
+        },
+        "size": {
+            "width": float(getattr(size, "width", 0.0) or 0.0),
+            "height": float(getattr(size, "height", 0.0) or 0.0),
+        },
+        "normalized": bool(optional_call(rect, "isNormalized", False)),
+    }
+
+
+def imgframe_camera_model_metadata(message, args):
+    """Extract the actual saved-image camera model from a DepthAI ImgFrame.
+
+    Camera.requestOutput(..., enableUndistortion=True) may crop/scale the sensor
+    before returning the frame. The ImgFrame transformation carries the resulting
+    output intrinsics; those are the values needed for pixel+depth unprojection.
+    """
+    transformation = optional_call(message, "getTransformation")
+    if transformation is None:
+        return {}
+
+    intrinsics = optional_call(transformation, "getIntrinsicMatrix")
+    if not intrinsics:
+        return {}
+
+    width, height = rgb_size_from_args(args)
+    source_intrinsics = optional_call(transformation, "getSourceIntrinsicMatrix")
+    transform_matrix = optional_call(transformation, "getMatrix")
+    source_size = optional_call(transformation, "getSourceSize")
+    distortion = optional_call(transformation, "getDistortionCoefficients", [])
+    distortion_model = optional_call(transformation, "getDistortionModel")
+    source_crops = optional_call(transformation, "getSrcCrops", [])
+
+    frame_transform = {
+        "intrinsics_before_saved_transform": matrix_to_json(intrinsics),
+        "intrinsics_after_saved_transform": adjust_intrinsics_for_saved_transform(
+            intrinsics, args, width, height
+        ),
+        "distortion_coefficients": [float(value) for value in (distortion or [])],
+        "distortion_model": enum_name(distortion_model) if distortion_model is not None else "",
+        "source_intrinsics": matrix_to_json(source_intrinsics) if source_intrinsics else None,
+        "source_size": {
+            "width": int(source_size[0]),
+            "height": int(source_size[1]),
+        } if source_size else None,
+        "matrix": matrix_to_json(transform_matrix) if transform_matrix else None,
+        "source_crops": [
+            crop for crop in (rotated_rect_to_json(rect) for rect in (source_crops or []))
+            if crop is not None
+        ],
+        "frame_lens_position": int(optional_call(message, "getLensPosition", -1)),
+        "frame_lens_position_raw": float(optional_call(message, "getLensPositionRaw", -1.0)),
+        "source_width": int(optional_call(message, "getSourceWidth", 0) or 0),
+        "source_height": int(optional_call(message, "getSourceHeight", 0) or 0),
+        "source_fov_deg": {
+            "horizontal": float(optional_call(message, "getSourceHFov", 0.0) or 0.0),
+            "vertical": float(optional_call(message, "getSourceVFov", 0.0) or 0.0),
+            "diagonal": float(optional_call(message, "getSourceDFov", 0.0) or 0.0),
+        },
+    }
+
+    return {
+        "intrinsics": frame_transform["intrinsics_after_saved_transform"],
+        "intrinsics_frame": frame_transform["intrinsics_before_saved_transform"],
+        "intrinsics_source": "DepthAI ImgFrame.getTransformation().getIntrinsicMatrix",
+        "image_stream_undistorted": True,
+        "distortion_coefficients": frame_transform["distortion_coefficients"],
+        "distortion_model": frame_transform["distortion_model"] or "DepthAI output",
+        "output_fov_deg": fov_from_intrinsics(intrinsics, width, height),
+        "lens_position": frame_transform["frame_lens_position"],
+        "lens_position_raw": frame_transform["frame_lens_position_raw"],
+        "depthai_frame_transformation": frame_transform,
+        "coordinate_unprojection": (
+            "pinhole projection using DepthAI ImgFrame transformation intrinsics "
+            "for the saved, already-undistorted RGB/depth pixels"
+        ),
+        "notes": (
+            "DepthAI reported the actual output intrinsics on the first saved RGB frame. "
+            "Factory lens distortion is kept in factory_distortion_coefficients for audit, "
+            "but saved pixels are already undistorted and should not be undistorted again."
+        ),
+    }
+
+
 def read_camera_model_metadata(device, args):
+    width, height = rgb_size_from_args(args)
+    rgb_socket = getattr(args, "rgb_socket", dai.CameraBoardSocket.CAM_A)
     try:
         calibration = device.readCalibration()
-        rgb_intrinsics = calibration.getCameraIntrinsics(dai.CameraBoardSocket.CAM_A, WIDTH, HEIGHT)
+        rgb_intrinsics = calibration.getCameraIntrinsics(rgb_socket, width, height)
         image_stream_undistorted = bool(getattr(args, "rgb_undistort", False))
         metadata = {
             "model": "pinhole",
             "source": "DepthAI device calibration",
-            "socket": "CAM_A",
-            "width": WIDTH,
-            "height": HEIGHT,
+            "socket": getattr(args, "rgb_socket_name", "CAM_A"),
+            "sensor_name": getattr(args, "rgb_sensor_name", ""),
+            "sensor_size": {
+                "width": int(getattr(args, "rgb_sensor_width", 0) or 0),
+                "height": int(getattr(args, "rgb_sensor_height", 0) or 0),
+            },
+            "sensor_types": list(getattr(args, "rgb_sensor_types", []) or []),
+            "resolution_source": getattr(args, "rgb_resolution_source", "unknown"),
+            "width": width,
+            "height": height,
             "intrinsics_original": matrix_to_json(rgb_intrinsics),
-            "intrinsics": adjust_intrinsics_for_saved_transform(rgb_intrinsics, args),
+            "intrinsics": adjust_intrinsics_for_saved_transform(rgb_intrinsics, args, width, height),
+            "intrinsics_source": (
+                "DepthAI calibration.getCameraIntrinsics fallback; first RGB frame "
+                "will replace this with ImgFrame transformation intrinsics"
+                if image_stream_undistorted
+                else "DepthAI calibration.getCameraIntrinsics"
+            ),
+            "factory_intrinsics": matrix_to_json(rgb_intrinsics),
             "image_stream_undistorted": image_stream_undistorted,
             "coordinate_unprojection": (
                 "pinhole projection with saved-image intrinsics; distortion was removed on-device"
@@ -678,34 +1407,94 @@ def read_camera_model_metadata(device, args):
             ),
         }
         try:
-            metadata["distortion_coefficients"] = [
+            factory_distortion = [
                 float(value)
-                for value in calibration.getDistortionCoefficients(dai.CameraBoardSocket.CAM_A)
+                for value in calibration.getDistortionCoefficients(rgb_socket)
             ]
+            metadata["distortion_coefficients"] = factory_distortion
+            metadata["factory_distortion_coefficients"] = factory_distortion
             metadata["distortion_model"] = (
                 "opencv_rational_thin_prism_tilt_14"
                 if len(metadata["distortion_coefficients"]) == 14
                 else "opencv"
             )
+            metadata["factory_distortion_model"] = metadata["distortion_model"]
         except Exception:
             metadata["distortion_coefficients"] = []
+            metadata["factory_distortion_coefficients"] = []
             metadata["distortion_model"] = "unavailable"
+            metadata["factory_distortion_model"] = "unavailable"
         try:
-            metadata["fov_deg"] = float(calibration.getFov(dai.CameraBoardSocket.CAM_A))
+            metadata["fov_deg"] = float(calibration.getFov(rgb_socket))
         except Exception:
             metadata["fov_deg"] = None
+        try:
+            metadata["factory_lens_position"] = int(calibration.getLensPosition(rgb_socket))
+        except Exception:
+            metadata["factory_lens_position"] = None
         return metadata
     except Exception as exc:
         print(f"Camera calibration metadata unavailable: {exc}")
         return {
             "model": "pinhole",
             "source": "unavailable",
-            "socket": "CAM_A",
-            "width": WIDTH,
-            "height": HEIGHT,
+            "socket": getattr(args, "rgb_socket_name", "CAM_A"),
+            "width": width,
+            "height": height,
             "intrinsics": None,
             "error": str(exc),
         }
+
+
+def read_stereo_depth_metadata(device, args):
+    left_socket = getattr(args, "left_socket", dai.CameraBoardSocket.CAM_B)
+    right_socket = getattr(args, "right_socket", dai.CameraBoardSocket.CAM_C)
+    width = int(getattr(args, "depth_input_width", WIDTH) or WIDTH)
+    height = int(getattr(args, "depth_input_height", HEIGHT) or HEIGHT)
+    output_width, output_height = rgb_size_from_args(args)
+    metadata = {
+        "source": "DepthAI device calibration",
+        "left_socket": enum_name(left_socket),
+        "right_socket": enum_name(right_socket),
+        "stereo_matching_input_size": {"width": width, "height": height},
+        "aligned_depth_output_size": {"width": output_width, "height": output_height},
+        "input_size": {"width": width, "height": height},
+        "input_resolution_source": getattr(args, "depth_input_resolution_source", "unknown"),
+        "left_sensor": dict(getattr(args, "left_sensor", {}) or {}),
+        "right_sensor": dict(getattr(args, "right_sensor", {}) or {}),
+        "units": "millimeters",
+        "notes": (
+            "DepthAI StereoDepth computes raw depth from the stereo pair calibration. "
+            "If physical stereo lenses differ from EEPROM calibration, recalibrate "
+            "and flash stereo intrinsics/extrinsics instead of applying a scale patch. "
+            "On RVC2 devices such as OAK-D-LR, stereo matching input width is limited "
+            "to 1280, but the aligned depth output is saved at the RGB output size."
+        ),
+    }
+    try:
+        calibration = device.readCalibration()
+        left_intrinsics = calibration.getCameraIntrinsics(left_socket, width, height)
+        right_intrinsics = calibration.getCameraIntrinsics(right_socket, width, height)
+        metadata.update({
+            "left_intrinsics": matrix_to_json(left_intrinsics),
+            "right_intrinsics": matrix_to_json(right_intrinsics),
+            "left_fov_deg": float(calibration.getFov(left_socket)),
+            "right_fov_deg": float(calibration.getFov(right_socket)),
+            "baseline_cm": float(calibration.getBaselineDistance(left_socket, right_socket)),
+            "left_to_right_extrinsics": matrix_to_json(
+                calibration.getCameraExtrinsics(left_socket, right_socket)
+            ),
+            "left_distortion_coefficients": [
+                float(value) for value in calibration.getDistortionCoefficients(left_socket)
+            ],
+            "right_distortion_coefficients": [
+                float(value) for value in calibration.getDistortionCoefficients(right_socket)
+            ],
+        })
+    except Exception as exc:
+        metadata["source"] = "unavailable"
+        metadata["error"] = str(exc)
+    return metadata
 
 
 class SerialRateLimitedReader:
@@ -757,9 +1546,14 @@ class SerialRateLimitedReader:
                         latest_nmea=self.latest_nmea,
                     )
                     self.rtk_client.start()
+                    mountpoint_text = (
+                        self.rtk_config.get("mountpoint")
+                        or self.rtk_config.get("mountpoint_candidates")
+                        or "auto"
+                    )
                     print(
                         f"RTK NTRIP enabled: {self.rtk_config['host']}:{self.rtk_config['port']}/"
-                        f"{self.rtk_config['mountpoint']}"
+                        f"{mountpoint_text}"
                     )
                 while not self.stop_event.is_set():
                     raw = port.readline()
@@ -768,8 +1562,14 @@ class SerialRateLimitedReader:
                     line = raw.decode("utf-8", errors="replace").strip()
                     if not line:
                         continue
-                    if self.rtk_config is not None and parse_nmea_line(line).get("nmea_type") == "GGA":
-                        self.latest_nmea["gga"] = line
+                    raw_nmea = parse_nmea_line(line) if self.rtk_config is not None else {}
+                    if self.rtk_config is not None:
+                        if raw_nmea.get("nmea_type") == "GGA":
+                            self.latest_nmea["gga"] = line
+                        for key in ("latitude_deg", "longitude_deg", "altitude_m"):
+                            value = raw_nmea.get(key)
+                            if value not in ("", None):
+                                self.latest_nmea[key] = value
                     parsed = self.parser(line) if self.parser is not None else {}
                     received_monotonic = time.monotonic()
                     # GGA carries the RTK solution state, correction age, and base ID.
@@ -856,7 +1656,8 @@ class SerialRateLimitedReader:
         text = f"gps_fix={quality or '-'}({details['fix_quality_name']})"
         if self.rtk_client is not None:
             state = "connected" if self.rtk_client.connected else "connecting"
-            text += f", ntrip={state}, rtcm_bytes={self.rtk_client.bytes_received}"
+            mountpoint = self.rtk_client.current_mountpoint or "-"
+            text += f", ntrip={state}({mountpoint}), rtcm_bytes={self.rtk_client.bytes_received}"
         return text
 
 
@@ -876,22 +1677,33 @@ def gps_status_text(serial_readers):
 
 
 def build_rtk_config(args):
-    if not args.rtk_ntrip_host:
+    host = getattr(args, "rtk_ntrip_host", "")
+    mountpoint = getattr(args, "rtk_ntrip_mountpoint", "")
+    if not host:
         return None
-    if not args.rtk_ntrip_mountpoint:
+    auto_mountpoint = bool(getattr(args, "rtk_ntrip_auto_mountpoint", True))
+    if not mountpoint and not auto_mountpoint:
         raise ValueError("--rtk-ntrip-mountpoint is required when --rtk-ntrip-host is set")
     return {
-        "host": args.rtk_ntrip_host,
-        "port": args.rtk_ntrip_port,
-        "mountpoint": args.rtk_ntrip_mountpoint,
-        "username": args.rtk_ntrip_username,
-        "password": args.rtk_ntrip_password,
-        "latitude": args.rtk_initial_latitude_deg,
-        "longitude": args.rtk_initial_longitude_deg,
-        "altitude": args.rtk_initial_altitude_m,
-        "gga": args.rtk_ntrip_gga,
-        "gga_interval": args.rtk_ntrip_gga_interval,
-        "reconnect_delay": args.rtk_ntrip_reconnect_delay,
+        "host": host,
+        "port": getattr(args, "rtk_ntrip_port", 2101),
+        "mountpoint": mountpoint,
+        "auto_mountpoint": auto_mountpoint,
+        "mountpoint_format": getattr(args, "rtk_ntrip_mountpoint_format", DEFAULT_RTK_MOUNTPOINT_FORMAT),
+        "mountpoint_candidates": getattr(args, "rtk_ntrip_mountpoint_candidates", ""),
+        "username": getattr(args, "rtk_ntrip_username", ""),
+        "password": getattr(args, "rtk_ntrip_password", ""),
+        "latitude": getattr(args, "rtk_initial_latitude_deg", None),
+        "longitude": getattr(args, "rtk_initial_longitude_deg", None),
+        "altitude": getattr(args, "rtk_initial_altitude_m", 0.0),
+        "gga": getattr(args, "rtk_ntrip_gga", ""),
+        "gga_interval": getattr(args, "rtk_ntrip_gga_interval", 10.0),
+        "reconnect_delay": getattr(args, "rtk_ntrip_reconnect_delay", 5.0),
+        "position_wait_s": getattr(args, "rtk_ntrip_position_wait_s", 10.0),
+        "connect_timeout": getattr(args, "rtk_ntrip_connect_timeout_s", 10.0),
+        "data_timeout": getattr(args, "rtk_ntrip_data_timeout_s", 15.0),
+        "sourcetable_timeout": getattr(args, "rtk_ntrip_sourcetable_timeout_s", 5.0),
+        "max_mountpoints": getattr(args, "rtk_ntrip_max_mountpoints", 12),
     }
 
 
@@ -956,7 +1768,7 @@ def connect_depthai_device(args):
             time.sleep(1.0)
 
     raise RuntimeError(
-        f"DepthAI negotiated {last_speed}, not USB 3.x. 1280x720 RGB/depth/confidence at "
+        f"DepthAI negotiated {last_speed}, not USB 3.x. RGB/depth/confidence at "
         f"{args.fps} FPS cannot be recorded reliably on this link. Connect the OAK camera "
         "directly to a USB 3.x port with a USB 3.x cable, then rerun. Use --allow-usb2 "
         "only for best-effort low-bandwidth testing."
@@ -1006,7 +1818,11 @@ def configure_pipeline(pipeline, args, sync_imu=True):
     args.rgb_undistort = True
     args.rgb_undistort_effective = True
 
-    platform = pipeline.getDefaultDevice().getPlatform()
+    device = pipeline.getDefaultDevice()
+    set_device_identity_metadata(device, args)
+    platform = device.getPlatform()
+    rgb_size = resolve_rgb_output_size(device, args)
+    depth_fps = resolve_depth_fps(args)
     requested_alignment = args.depth_alignment_mode
     if requested_alignment == "auto":
         effective_alignment = "image-align" if platform == dai.Platform.RVC4 else "stereo"
@@ -1027,10 +1843,20 @@ def configure_pipeline(pipeline, args, sync_imu=True):
             else "StereoDepth.inputAlignTo"
         )
     )
+    print(f"Camera FPS: rgb={float(args.fps):g}, depth={depth_fps:g}")
+    if depth_fps > float(args.fps):
+        print(
+            "Depth FPS is higher than RGB FPS; RGB-aligned depth output may still be "
+            "limited by the RGB alignment stream cadence."
+        )
 
-    color_socket = dai.CameraBoardSocket.CAM_A
-    left_socket = dai.CameraBoardSocket.CAM_B
-    right_socket = dai.CameraBoardSocket.CAM_C
+    color_socket = getattr(args, "rgb_socket", dai.CameraBoardSocket.CAM_A)
+    left_socket, right_socket = resolve_stereo_sockets(
+        device,
+        getattr(args, "left_socket", None),
+        getattr(args, "right_socket", None),
+    )
+    mono_size = resolve_stereo_input_size(device, args, platform, left_socket, right_socket)
 
     cam_rgb = pipeline.create(dai.node.Camera).build(color_socket)
     mono_left = pipeline.create(dai.node.Camera).build(left_socket)
@@ -1048,11 +1874,12 @@ def configure_pipeline(pipeline, args, sync_imu=True):
     rgb_output = request_camera_output(
         cam_rgb,
         args.fps,
+        size=rgb_size,
         frame_type=dai.ImgFrame.Type.NV12,
         enable_undistortion=True,
     )
-    left_output = request_camera_output(mono_left, args.fps, frame_type=dai.ImgFrame.Type.GRAY8)
-    right_output = request_camera_output(mono_right, args.fps, frame_type=dai.ImgFrame.Type.GRAY8)
+    left_output = request_camera_output(mono_left, depth_fps, size=mono_size, frame_type=dai.ImgFrame.Type.GRAY8)
+    right_output = request_camera_output(mono_right, depth_fps, size=mono_size, frame_type=dai.ImgFrame.Type.GRAY8)
 
     stereo.setDefaultProfilePreset(enum_by_name(dai.node.StereoDepth.PresetMode, args.depth_preset))
     stereo.setLeftRightCheck(args.lr_check)
@@ -1073,9 +1900,9 @@ def configure_pipeline(pipeline, args, sync_imu=True):
     args.stereo_median_filter_effective = median_filter_name
     stereo.setExtendedDisparity(False)
     if effective_alignment == "image-align":
-        image_align.setOutputSize(WIDTH, HEIGHT)
+        image_align.setOutputSize(*rgb_size)
         if confidence_align is not None:
-            confidence_align.setOutputSize(WIDTH, HEIGHT)
+            confidence_align.setOutputSize(*rgb_size)
 
     imu.enableIMUSensor([
         dai.IMUSensor.ACCELEROMETER_RAW,
@@ -1118,7 +1945,7 @@ def configure_pipeline(pipeline, args, sync_imu=True):
         )
     if confidence_output is not None and args.confidence_transport_effective == "mjpeg":
         confidence_output = create_mjpeg_output(
-            pipeline, confidence_output, args.fps, args.confidence_transport_quality
+            pipeline, confidence_output, depth_fps, args.confidence_transport_quality
         )
 
     if sync is not None:

@@ -10,6 +10,8 @@ from pathlib import Path
 from statistics import median
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from geonova_depthai.config_cli import parse_args_with_yaml
+
 
 TIMESTAMP_FIELDS = [
     "frame_index", "stem", "frame_host_wall_time", "frame_host_monotonic_ns",
@@ -32,6 +34,9 @@ SYNCED_IMU_FIELDS = [
     "gyro_x_rad_s", "gyro_y_rad_s", "gyro_z_rad_s",
     "message_index", "message_sequence", "message_capture_wall_time", "message_capture_monotonic_ns",
 ]
+
+DEFAULT_SYNC_THRESHOLD_MS = 50.0
+DEFAULT_RGB_DEPTH_THRESHOLD_MS = 10.0
 
 
 def safe_int(value, default=None):
@@ -57,6 +62,29 @@ def read_csv(path: Path) -> List[Dict[str, str]]:
         return []
     with open(path, newline="") as file:
         return list(csv.DictReader(file))
+
+
+def sorted_by_int(rows: List[Dict[str, str]], key: str) -> List[Dict[str, str]]:
+    return sorted(
+        rows,
+        key=lambda row: (
+            safe_int(row.get(key)) is None,
+            safe_int(row.get(key), 0),
+        ),
+    )
+
+
+def count_order_inversions(rows: List[Dict[str, str]], key: str) -> int:
+    previous = None
+    inversions = 0
+    for row in rows:
+        value = safe_int(row.get(key))
+        if value is None:
+            continue
+        if previous is not None and value < previous:
+            inversions += 1
+        previous = value
+    return inversions
 
 
 def write_csv(path: Path, fieldnames: List[str], rows: Iterable[Dict[str, object]]):
@@ -128,7 +156,13 @@ def stats(values):
     return {"count": len(values), "p50": values[len(values)//2], "p95": values[p95_index], "max": values[-1]}
 
 
-def build_synced_dataset(dataset: Path, threshold_ms: float = 50.0, output_dir: Optional[Path] = None, copy_images: bool = False):
+def build_synced_dataset(
+    dataset: Path,
+    threshold_ms: float = DEFAULT_SYNC_THRESHOLD_MS,
+    output_dir: Optional[Path] = None,
+    copy_images: bool = False,
+    rgb_depth_threshold_ms: float = DEFAULT_RGB_DEPTH_THRESHOLD_MS,
+):
     dataset = dataset.expanduser().resolve()
     if output_dir is None:
         output_dir = dataset
@@ -148,6 +182,7 @@ def build_synced_dataset(dataset: Path, threshold_ms: float = 50.0, output_dir: 
     if not depth_rows:
         raise ValueError(f"No depth_events.csv rows found in {dataset}")
 
+    rgb_rows_for_sync = sorted_by_int(rgb_rows, "device_ts_ns")
     depth_index = NearestIndex(depth_rows, "device_ts_ns")
     confidence_index = NearestIndex(confidence_rows, "device_ts_ns") if confidence_rows else None
 
@@ -169,13 +204,13 @@ def build_synced_dataset(dataset: Path, threshold_ms: float = 50.0, output_dir: 
     deltas = {"rgb_depth_ms": [], "rgb_imu_ms": [], "gps_frame_ms": [], "external_imu_frame_ms": [], "depth_confidence_ms": []}
 
     frame_index = 0
-    for rgb in rgb_rows:
+    for rgb in rgb_rows_for_sync:
         rgb_device_ns = safe_int(rgb.get("device_ts_ns"))
         rgb_capture_ns = safe_int(rgb.get("capture_monotonic_ns"))
         if rgb_device_ns is None:
             dropped["no_depth"] += 1
             continue
-        depth, rgb_depth_delta_ms = depth_index.nearest(rgb_device_ns, threshold_ms)
+        depth, rgb_depth_delta_ms = depth_index.nearest(rgb_device_ns, rgb_depth_threshold_ms)
         if depth is None:
             dropped["no_depth"] += 1
             continue
@@ -313,6 +348,7 @@ def build_synced_dataset(dataset: Path, threshold_ms: float = 50.0, output_dir: 
     metadata["sync"].update({
         "mode": "postprocess",
         "threshold_ms": threshold_ms,
+        "rgb_depth_threshold_ms": rgb_depth_threshold_ms,
         "source_dataset": str(dataset),
         "kept_frame_count": len(timestamp_rows),
         "dropped": dropped,
@@ -329,6 +365,10 @@ def build_synced_dataset(dataset: Path, threshold_ms: float = 50.0, output_dir: 
         },
         "kept_frame_count": len(timestamp_rows),
         "dropped": dropped,
+        "order_inversions": {
+            "rgb_device_ts": count_order_inversions(rgb_rows, "device_ts_ns"),
+            "depth_device_ts": count_order_inversions(depth_rows, "device_ts_ns"),
+        },
         "deltas_ms": {name: stats(values) for name, values in deltas.items()},
     }
     with open(metadata_path, "w") as file:
@@ -340,18 +380,28 @@ def build_synced_dataset(dataset: Path, threshold_ms: float = 50.0, output_dir: 
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Build synchronized dataset files from raw per-stream event manifests.")
+    parser = argparse.ArgumentParser(
+        description="Build synchronized dataset files from raw per-stream event manifests.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument("--dataset", required=True, help="Raw event dataset directory")
     parser.add_argument("--output-dir", default="", help="Default: build synced files in-place in the raw dataset directory")
-    parser.add_argument("--sync-threshold-ms", type=float, default=50.0)
+    parser.add_argument("--sync-threshold-ms", type=float, default=DEFAULT_SYNC_THRESHOLD_MS, help="Maximum absolute device-time difference used for IMU pairing, in milliseconds")
+    parser.add_argument("--rgb-depth-threshold-ms", type=float, default=DEFAULT_RGB_DEPTH_THRESHOLD_MS, help="Maximum absolute device-time difference used for RGB/depth pairing, in milliseconds")
     parser.add_argument("--copy-images", action="store_true", help="When output-dir is separate, copy images instead of symlinking")
     return parser
 
 
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    args = parse_args_with_yaml(build_parser(), argv)
     output_dir = Path(args.output_dir) if args.output_dir else None
-    out, report = build_synced_dataset(Path(args.dataset), args.sync_threshold_ms, output_dir, args.copy_images)
+    out, report = build_synced_dataset(
+        Path(args.dataset),
+        args.sync_threshold_ms,
+        output_dir,
+        args.copy_images,
+        args.rgb_depth_threshold_ms,
+    )
     print(f"Synced dataset ready: {out}")
     print(json.dumps(report, indent=2, ensure_ascii=False))
 
