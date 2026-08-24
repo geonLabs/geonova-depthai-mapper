@@ -40,10 +40,44 @@ def _drain_device_queue(q, handler, max_per_loop=256):
     return count
 
 
-def record_raw_events(args):
-    global _stop_requested
-    _stop_requested = False
+def _close_recording_resources(
+    controller_bridge,
+    serial_readers,
+    image_pool,
+    dataset,
+    device,
+    error=None,
+):
+    """Close every recorder resource even when an earlier cleanup step fails."""
+    try:
+        controller_bridge.close(serial_readers, error=error)
+    finally:
+        try:
+            runtime.stop_serial_readers(serial_readers)
+        finally:
+            try:
+                if image_pool is not None:
+                    print("Finishing pending image writes...")
+                    image_pool.close()
+            finally:
+                try:
+                    if dataset is not None:
+                        try:
+                            for name, reader in serial_readers.items():
+                                dataset.write_serial_samples(name, reader.drain())
+                        finally:
+                            dataset.close()
+                        print(f"Raw dataset closed: {dataset.root}")
+                        print(f"Next: python build_synced_dataset.py --dataset {dataset.root}")
+                finally:
+                    if device is not None:
+                        try:
+                            device.close()
+                        except Exception:
+                            pass
 
+
+def record_raw_events(args):
     # Enforce the same pixel geometry before camera metadata is read.
     args.rgb_undistort = True
     args.rgb_undistort_effective = True
@@ -55,6 +89,7 @@ def record_raw_events(args):
     dataset = None
     image_pool = None
     device = None
+    recording_error = None
     try:
         device = runtime.connect_depthai_device(args)
 
@@ -139,28 +174,22 @@ def record_raw_events(args):
                 if drained == 0:
                     time.sleep(0.002)
     except Exception as error:
-        controller_bridge.close(serial_readers, error=error)
+        recording_error = error
         raise
     finally:
-        controller_bridge.close(serial_readers)
-        runtime.stop_serial_readers(serial_readers)
-        if image_pool is not None:
-            print("Finishing pending image writes...")
-            image_pool.close()
-        if dataset is not None:
-            for name, reader in serial_readers.items():
-                dataset.write_serial_samples(name, reader.drain())
-            dataset.close()
-            print(f"Raw dataset closed: {dataset.root}")
-            print(f"Next: python build_synced_dataset.py --dataset {dataset.root}")
-        if device is not None:
-            try:
-                device.close()
-            except Exception:
-                pass
+        _close_recording_resources(
+            controller_bridge,
+            serial_readers,
+            image_pool,
+            dataset,
+            device,
+            error=recording_error,
+        )
 
 
 def main(argv=None):
+    global _stop_requested
+    _stop_requested = False
     signal.signal(signal.SIGINT, _request_stop)
     signal.signal(signal.SIGTERM, _request_stop)
     record_raw_events(parse_args(argv))

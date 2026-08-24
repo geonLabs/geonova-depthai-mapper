@@ -10,7 +10,7 @@ model/                        학습·라벨 변환 코드와 배포 가능한 �
   n_model/best.pt             Git에 포함된 guardrail YOLO26n-seg 모델
   x_model/                    대형 현장 모델을 로컬에 두는 위치
 data/                         원시/동기 데이터셋(README 외에는 Git 제외)
-install.sh, install.ps1       code/.venv 설치 진입점
+install.sh, install.ps1       루트 .venv 설치 진입점
 ```
 
 ## 설치
@@ -28,28 +28,45 @@ Windows PowerShell에서는 다음을 실행합니다.
 .\install.ps1 --dev
 ```
 
-설치기는 Python 3.11 가상환경을 `code/.venv`에 만들고 CUDA Toolkit을 감지해
+설치기는 Python 3.11 가상환경을 저장소 루트의 `.venv`에 만들고 CUDA Toolkit을 감지해
 PyTorch 빌드를 선택합니다.
 
 ## 수집과 매핑
 
 ```bash
 cd code
-.venv/bin/python synced_image_recorder.py --config configs/capture.yaml
-.venv/bin/python build_synced_dataset.py --config configs/sync.yaml
-.venv/bin/python tests/test_yolo_seg_shp.py --config configs/yolo.yaml
-.venv/bin/python -m geonova_depthai.debug_ui --config configs/debug_ui.yaml
+../.venv/bin/python synced_image_recorder.py --config configs/capture.yaml
+../.venv/bin/python build_synced_dataset.py --config configs/sync.yaml
+../.venv/bin/python tests/test_yolo_seg_shp.py --config configs/yolo.yaml
+../.venv/bin/python -m geonova_depthai.debug_ui --config configs/debug_ui.yaml
 ```
 
 기본 설정은 저장소 루트의 `data/`와 `model/n_model/best.pt`를 사용합니다.
 현장별 경로와 파라미터는 `configs/*.local.yaml`에 두면 Git에 포함되지 않습니다.
 전체 수집·검증·선형화 절차는 [`code/README.md`](code/README.md)를 참고하세요.
 
+## Jetson Controller 자동실행
+
+저장소 루트는 Controller의 폴더 작업 규칙을 따릅니다. `./install.sh`로 실제
+`.venv/bin/python`을 만든 뒤 앱에서 이 폴더를 등록하면 `main.py`와
+`config.yaml`이 고정 진입점으로 사용되고, 부팅 시 pipeline service가 자동
+활성화됩니다.
+
+```bash
+./.venv/bin/python main.py --config config.yaml
+```
+
+Controller 실행에서는 `JETSON_PIPELINE_RESULTS_DIR`가 YAML이나 기존 CLI 값보다
+우선하므로 읽기 전용 release에 기록하지 않습니다. 일반 폴더 등록의 센서 상태와
+프리뷰는 `results/controller-bridge/`에 저장합니다. Controller 앱의 공용 live
+preview까지 연결하는 장비 preset은 JetsonControllerApp의
+`install-depthai-pipeline.sh`를 사용합니다.
+
 ## 학습과 로컬 모델
 
 ```bash
-code/.venv/bin/python model/convert_label.py --help
-code/.venv/bin/python model/safe_gard_train.py \
+.venv/bin/python model/convert_label.py --help
+.venv/bin/python model/safe_gard_train.py \
   --config model/safe_gard_train_config.yaml
 ```
 

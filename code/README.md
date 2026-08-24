@@ -22,7 +22,7 @@ YOLO segmentation
   마스크·박스 plot 저장
         ↓
 관측점 생성
-  마스크 내부 8 m 이하 유효 Depth fragment → representative 1점
+  confidence-qualified 마스크 Depth 중앙값이 8 m 이내인 fragment → representative 1점
   마스크 상·중·하 3점 → 형상 확인용 feature
         ↓
 세계좌표 변환
@@ -313,11 +313,25 @@ YOLO 실행이 끝나면 선형화가 자동 실행됩니다. YOLO 결과만 만
 
 1. segmentation polygon을 원본 RGB 크기의 binary mask로 복원합니다.
 2. 마스크 경계를 erosion해 배경 Depth 혼입을 줄입니다.
-3. Depth 0, 최대거리 초과, confidence 기준 초과 픽셀을 제거합니다.
-4. Depth median/MAD로 fragment 내부 이상치를 제거합니다.
-5. 중심 위치·Depth 잔차가 안정적인 픽셀을 `representative`로 선택합니다.
-6. 마스크 PCA의 `endpoint_a/midpoint/endpoint_b`는 `feature`로만 저장합니다.
-7. 최종 지도 선형에는 `point_usage=mapping`인 representative만 사용합니다.
+3. Depth 0과 confidence 기준 초과 픽셀을 제거한 분포의 중앙값을 구합니다.
+4. 이 중앙값이 `max_depth_mm`를 넘으면 representative와 feature를 모두
+   `beyond_max_depth`로 제외합니다.
+5. 거리 이내 검출에서만 최대거리 초과 픽셀과 median/MAD 이상치를 제거합니다.
+6. 중심 위치·Depth 잔차가 안정적인 픽셀을 `representative`로 선택합니다.
+7. 마스크 PCA의 `endpoint_a/midpoint/endpoint_b`는 `feature`로만 저장합니다.
+8. 최종 지도 선형에는 `point_usage=mapping`인 representative만 사용합니다.
+
+`max_depth_mm`는 초과 깊이를 상한값으로 잘라 쓰는 설정이 아니라 검출 제외
+임계값입니다. 최대거리 필터를 적용하기 전의 confidence-qualified 중앙값으로 먼저
+거리 이내인지 판정하므로, 원거리 마스크에 섞인 소수의 8 m 직하 픽셀이 지도점으로
+채택되지 않습니다. 정확히 임계값인 Depth는 포함하고 이를 초과한 검출은 좌표를
+만들지 않습니다.
+
+`points.csv`의 mapping 행에는 필터 전 거리 판정을 감사할 수 있도록
+`depth_measured_count`와 `depth_measured_median_mm`도 기록됩니다. 거절 행에도
+임계값 이내 후보 수가 `depth_sample_count`로 남을 수 있으므로, 유효 지도점을
+고를 때는 이 개수만 보지 말고 `depth_fragment_status=ok`, `depth_mm>0`,
+`world_status=ok`를 함께 확인해야 합니다.
 
 검출된 프레임 이미지는 원본 복사본이 아니라 YOLO 마스크·박스·라벨이 표시된
 `result.plot()` 이미지로 `detected_plot/`에 저장됩니다.

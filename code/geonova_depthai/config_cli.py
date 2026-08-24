@@ -107,8 +107,15 @@ def write_default_yaml(parser: argparse.ArgumentParser, path: Path) -> None:
 def parse_args_with_yaml(
     parser: argparse.ArgumentParser,
     argv: Sequence[str] | None = None,
+    *,
+    default_config: Path | None = None,
 ) -> argparse.Namespace:
-    """Apply YAML values as parser defaults, then let explicit CLI options win."""
+    """Apply YAML values as parser defaults, then let explicit CLI options win.
+
+    ``default_config`` is opt-in so unrelated commands do not accidentally load
+    a neighbouring ``config.yaml``. An explicit ``--config`` always takes
+    precedence over it.
+    """
     parser.add_argument(
         "--config",
         type=Path,
@@ -127,8 +134,13 @@ def parse_args_with_yaml(
     if known.write_default_config:
         write_default_yaml(parser, known.write_default_config)
         parser.exit(0, f"Wrote default YAML: {known.write_default_config}\n")
-    if known.config:
-        data = load_yaml(known.config.expanduser().resolve())
+    config_path = known.config if known.config is not None else default_config
+    if config_path is not None:
+        config_path = Path(config_path).expanduser().resolve()
+        try:
+            data = load_yaml(config_path)
+        except Exception as exc:
+            parser.error(f"could not load YAML configuration file {config_path}: {exc}")
         actions = {action.dest: action for action in parser._actions}
         unknown = sorted(set(data) - set(actions))
         if unknown:
@@ -142,5 +154,6 @@ def parse_args_with_yaml(
                 parser.error(str(exc))
             if value is not None:
                 action.required = False
+        converted["config"] = config_path
         parser.set_defaults(**converted)
     return parser.parse_args(arguments)

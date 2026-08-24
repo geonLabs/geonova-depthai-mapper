@@ -126,6 +126,8 @@ class DepthObservation:
     confidence_median: float | None
     weight: float
     status: str
+    measured_count: int = 0
+    measured_median_mm: float = 0.0
 
 
 def _snap_to_mask(point: np.ndarray, xy: np.ndarray) -> np.ndarray:
@@ -174,16 +176,37 @@ def median_depth_mm(
     x: int,
     y: int,
     radius: int = 5,
-    max_depth_mm: int = 20_000,
+    max_depth_mm: int = 8_000,
 ) -> tuple[int, int]:
     """Return a robust local depth and the number of valid samples used."""
+    if radius < 0:
+        raise ValueError("radius must be nonnegative.")
+    if max_depth_mm <= 0:
+        raise ValueError("max_depth_mm must be positive.")
     y0, y1 = max(0, y - radius), min(depth.shape[0], y + radius + 1)
     x0, x1 = max(0, x - radius), min(depth.shape[1], x + radius + 1)
     patch = depth[y0:y1, x0:x1]
-    valid = patch[(patch > 0) & (patch <= max_depth_mm)]
+    measured = patch[patch > 0]
+    if not measured.size or float(np.median(measured)) > max_depth_mm:
+        return 0, 0
+    valid = measured[measured <= max_depth_mm]
     if not valid.size:
         return 0, 0
     return int(np.median(valid)), int(valid.size)
+
+
+def _feature_depth_mm(
+    depth: np.ndarray,
+    x: int,
+    y: int,
+    radius: int,
+    max_depth_mm: int,
+    observation_status: str,
+) -> tuple[int, int]:
+    """Return local feature depth unless the whole detection is out of range."""
+    if observation_status == "beyond_max_depth":
+        return 0, 0
+    return median_depth_mm(depth, x, y, radius, max_depth_mm)
 
 
 def mask_depth_observation(
@@ -196,7 +219,14 @@ def mask_depth_observation(
     erosion_px: int = 2,
     confidence_max: int = 200,
 ) -> DepthObservation:
-    """Build one robust mapping observation from a segmented depth fragment."""
+    """Build one robust observation after rejecting masks whose median is too far."""
+    if max_depth_mm <= 0:
+        raise ValueError("max_depth_mm must be positive.")
+    if min_samples <= 0:
+        raise ValueError("min_samples must be positive.")
+    if erosion_px < 0:
+        raise ValueError("erosion_px must be nonnegative.")
+
     binary = mask.astype(np.uint8)
     mask_count = int(np.count_nonzero(binary))
     if mask_count == 0:
@@ -209,10 +239,38 @@ def mask_depth_observation(
         if np.count_nonzero(eroded) >= min_samples:
             working = eroded
 
-    valid = (working > 0) & (depth > 0) & (depth <= max_depth_mm)
+    # Decide whether the detected object is in range before applying the upper
+    # cutoff. Filtering first biases a far-away mask toward the handful of
+    # quantized/noisy samples immediately below max_depth_mm, making a >8 m
+    # object look like a valid observation at roughly 8 m.
+    measured = (working > 0) & (depth > 0)
+    if confidence_map is not None and confidence_map.shape == depth.shape:
+        measured &= confidence_map <= confidence_max
+
+    measured_y, measured_x = np.nonzero(measured)
+    measured_values = depth[measured_y, measured_x].astype(np.float64)
+    measured_count = int(measured_values.size)
+    measured_center = float(np.median(measured_values)) if measured_count else 0.0
+    measured_median_mm = measured_center
+    if measured_values.size:
+        measured_mad = float(np.median(np.abs(measured_values - measured_center)))
+        if measured_center > max_depth_mm:
+            in_range_count = int(np.count_nonzero(measured_values <= max_depth_mm))
+            confidence_median = None
+            if confidence_map is not None and confidence_map.shape == depth.shape:
+                confidence_values = confidence_map[measured]
+                if confidence_values.size:
+                    confidence_median = float(np.median(confidence_values))
+            return DepthObservation(
+                int(np.median(measured_x)), int(np.median(measured_y)), 0,
+                in_range_count, mask_count, in_range_count / mask_count,
+                measured_mad, confidence_median, 0.0, "beyond_max_depth",
+                measured_count, measured_median_mm,
+            )
+
+    valid = measured & (depth <= max_depth_mm)
     confidence_median = None
     if confidence_map is not None and confidence_map.shape == depth.shape:
-        valid &= confidence_map <= confidence_max
         confidence_values = confidence_map[valid]
         if confidence_values.size:
             confidence_median = float(np.median(confidence_values))
@@ -223,6 +281,7 @@ def mask_depth_observation(
         return DepthObservation(
             int(np.median(mask_x)), int(np.median(mask_y)), 0, int(len(xs)), mask_count,
             len(xs) / mask_count, 0.0, confidence_median, 0.0, "insufficient_depth",
+            measured_count, measured_median_mm,
         )
 
     values = depth[ys, xs].astype(np.float64)
@@ -235,6 +294,7 @@ def mask_depth_observation(
         return DepthObservation(
             int(np.median(xs)), int(np.median(ys)), 0, int(len(xs)), mask_count,
             len(xs) / mask_count, depth_mad, confidence_median, 0.0, "depth_outliers",
+            measured_count, measured_median_mm,
         )
 
     center_x, center_y = float(np.median(xs)), float(np.median(ys))
@@ -256,7 +316,7 @@ def mask_depth_observation(
     return DepthObservation(
         int(xs[representative]), int(ys[representative]), int(round(np.median(values))),
         int(len(values)), mask_count, float(valid_ratio), depth_mad, confidence_median,
-        weight, "ok",
+        weight, "ok", measured_count, measured_median_mm,
     )
 
 
@@ -356,6 +416,19 @@ def run_dataset(
 ) -> dict:
     dataset_root = dataset_root.expanduser().resolve()
     model_path = model_path.expanduser().resolve()
+    if max_frames <= 0 or stride <= 0 or batch_size <= 0:
+        raise ValueError("max_frames, stride, and batch_size must be positive.")
+    if max_depth_mm <= 0:
+        raise ValueError("max_depth_mm must be positive.")
+    if fragment_min_samples <= 0:
+        raise ValueError("fragment_min_samples must be positive.")
+    if fragment_erosion_px < 0:
+        raise ValueError("fragment_erosion_px must be nonnegative.")
+    if depth_radius < 0:
+        raise ValueError("depth_radius must be nonnegative.")
+    if not 0.0 <= confidence <= 1.0:
+        raise ValueError("confidence must be between 0.0 and 1.0.")
+
     output_dir = (output_dir or dataset_root / "yolo_seg").expanduser().resolve()
     detected_plot_dir = output_dir / "detected_plot"
     shutil.rmtree(detected_plot_dir, ignore_errors=True)
@@ -371,10 +444,6 @@ def run_dataset(
         raise ValueError("start_frame must be at least 200 for post-warm-up comparison.")
     if start_frame >= dataset.frame_count:
         raise ValueError(f"start_frame {start_frame} exceeds {dataset.frame_count} frames.")
-    if max_frames <= 0 or stride <= 0 or batch_size <= 0:
-        raise ValueError("max_frames, stride, and batch_size must be positive.")
-    if not 0.0 <= confidence <= 1.0:
-        raise ValueError("confidence must be between 0.0 and 1.0.")
 
     model = YOLO(str(model_path))
     if model.task != "segment":
@@ -482,7 +551,14 @@ def run_dataset(
                     axis_point.role,
                     axis_point.x,
                     axis_point.y,
-                    *median_depth_mm(depth, axis_point.x, axis_point.y, depth_radius, max_depth_mm),
+                    *_feature_depth_mm(
+                        depth,
+                        axis_point.x,
+                        axis_point.y,
+                        depth_radius,
+                        max_depth_mm,
+                        observation.status,
+                    ),
                     "feature",
                 )
                 for order, axis_point in enumerate(axis_points)
@@ -516,9 +592,15 @@ def run_dataset(
                     "pixel_y": pixel_y,
                     "depth_mm": depth_mm,
                     "depth_sample_count": depth_count,
+                    "depth_measured_count": observation.measured_count if point_usage == "mapping" else None,
+                    "depth_measured_median_mm": observation.measured_median_mm if point_usage == "mapping" else None,
                     "depth_valid_ratio": round(observation.valid_ratio, 6) if point_usage == "mapping" else None,
                     "depth_mad_mm": round(observation.depth_mad_mm, 3) if point_usage == "mapping" else None,
-                    "depth_fragment_status": observation.status if point_usage == "mapping" else "axis_feature",
+                    "depth_fragment_status": (
+                        observation.status
+                        if point_usage == "mapping" or observation.status == "beyond_max_depth"
+                        else "axis_feature"
+                    ),
                     "depth_confidence_median": observation.confidence_median if point_usage == "mapping" else None,
                     "observation_weight": round(observation.weight, 6) if point_usage == "mapping" else 0.0,
                     "coordinate_quality": quality,
@@ -582,7 +664,8 @@ def run_dataset(
     point_fields = list(point_rows[0]) if point_rows else [
         "frame_index", "detection_id", "point_order", "role", "class_id",
         "class_name", "confidence", "pixel_x", "pixel_y", "depth_mm",
-        "depth_sample_count", "point_usage", "depth_valid_ratio", "depth_mad_mm",
+        "depth_sample_count", "depth_measured_count", "depth_measured_median_mm",
+        "point_usage", "depth_valid_ratio", "depth_mad_mm",
         "depth_fragment_status", "depth_confidence_median", "observation_weight",
         "coordinate_quality", "rtk_fixed", "gps_hdop", "gps_frame_delta_ms",
         "gps_differential_age_s", "pose_source", "course_deg", "optical_heading_deg",
@@ -629,7 +712,10 @@ def run_dataset(
         "world_points": world_count,
         "linearization": linearization_summary,
         "orientation_source": orientation_source,
-        "mapping_observation": "robust mask-depth fragment representative",
+        "mapping_observation": (
+            "confidence-qualified unbounded mask median range gate, then robust "
+            "in-range fragment representative"
+        ),
         "maximum_mapping_depth_mm": max_depth_mm,
         "coordinate_note": (
             "WGS84 coordinates depend on saved GPS, camera intrinsics, camera mount/extrinsics, "
@@ -667,7 +753,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", help="Ultralytics device, for example 0, 0,1, cpu, or mps")
     parser.add_argument("--classes", type=int, nargs="+", help="Optional YOLO class IDs to retain")
     parser.add_argument("--depth-radius", type=int, default=5, help="Pixel radius for axis-feature median Depth")
-    parser.add_argument("--max-depth-mm", type=int, default=8_000, help="Maximum mapping-observation Depth in millimeters")
+    parser.add_argument(
+        "--max-depth-mm",
+        type=int,
+        default=8_000,
+        help="Reject a detection when its confidence-qualified mask median exceeds this Depth in millimeters",
+    )
     parser.add_argument("--fragment-min-samples", type=int, default=20, help="Minimum valid Depth pixels required in a mask fragment")
     parser.add_argument("--fragment-erosion-px", type=int, default=2, help="Mask erosion radius used to reduce background Depth mixing")
     parser.add_argument("--depth-confidence-max", type=int, default=200, help="Maximum accepted DepthAI confidence-map value; lower is better")

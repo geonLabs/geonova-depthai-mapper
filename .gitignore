@@ -16,6 +16,7 @@ data/*
 !data/README.md
 
 # Recording, inference, and debug outputs
+results/
 records/
 records_*/
 image_records/

@@ -9,6 +9,7 @@ import csv
 
 import cv2
 import numpy as np
+import pytest
 from pyproj import Transformer
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -16,10 +17,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from geonova_depthai.yolo_seg_shp import (  # noqa: E402
+    _feature_depth_mm,
     default_model_path,
     main,
     mask_axis_points,
     mask_depth_observation,
+    median_depth_mm,
+    run_dataset,
 )
 from geonova_depthai.fence_linearization import (  # noqa: E402
     CRS_WGS84,
@@ -63,6 +67,131 @@ def test_mask_depth_observation_rejects_far_depth() -> None:
     assert observation.depth_mm == 4_000
     assert observation.valid_count > 1_000
     assert 0.0 < observation.weight <= 1.0
+
+
+def test_mask_depth_observation_rejects_far_mask_with_sparse_near_tail() -> None:
+    mask = np.ones((80, 100), dtype=np.uint8)
+    depth = np.full(mask.shape, 12_000, dtype=np.uint16)
+    depth[20:25, 20:30] = 7_997
+
+    observation = mask_depth_observation(
+        mask,
+        depth,
+        0.9,
+        max_depth_mm=8_000,
+        erosion_px=0,
+    )
+
+    assert observation.status == "beyond_max_depth"
+    assert observation.depth_mm == 0
+    assert observation.valid_count == 50
+    assert observation.valid_ratio == 50 / mask.size
+    assert observation.weight == 0.0
+    assert observation.measured_count == mask.size
+    assert observation.measured_median_mm == 12_000
+
+
+def test_depth_cutoff_keeps_exact_boundary_and_rejects_above_boundary() -> None:
+    mask = np.ones((20, 20), dtype=np.uint8)
+
+    at_limit = np.full(mask.shape, 8_000, dtype=np.uint16)
+    observation = mask_depth_observation(
+        mask, at_limit, max_depth_mm=8_000, erosion_px=0
+    )
+    assert observation.status == "ok"
+    assert observation.depth_mm == 8_000
+
+    above_limit = np.full(mask.shape, 8_001, dtype=np.uint16)
+    observation = mask_depth_observation(
+        mask, above_limit, max_depth_mm=8_000, erosion_px=0
+    )
+    assert observation.status == "beyond_max_depth"
+    assert observation.depth_mm == 0
+
+    split_boundary = np.empty(mask.shape, dtype=np.uint16)
+    split_boundary.flat[: mask.size // 2] = 8_000
+    split_boundary.flat[mask.size // 2 :] = 8_001
+    observation = mask_depth_observation(
+        mask, split_boundary, max_depth_mm=8_000, erosion_px=0
+    )
+    assert observation.status == "beyond_max_depth"
+    assert observation.measured_median_mm == 8_000.5
+
+
+def test_local_feature_depth_rejects_far_patch_with_sparse_near_tail() -> None:
+    depth = np.full((11, 11), 12_000, dtype=np.uint16)
+    depth[5, 5] = 7_997
+    assert median_depth_mm(depth, 5, 5, radius=5, max_depth_mm=8_000) == (0, 0)
+
+    depth[:] = 4_000
+    depth[0, 0] = 12_000
+    assert median_depth_mm(depth, 5, 5, radius=5, max_depth_mm=8_000) == (4_000, 120)
+
+
+def test_out_of_range_detection_suppresses_all_feature_coordinates() -> None:
+    depth = np.full((11, 11), 4_000, dtype=np.uint16)
+    assert _feature_depth_mm(
+        depth, 5, 5, 5, 8_000, "beyond_max_depth"
+    ) == (0, 0)
+    assert _feature_depth_mm(depth, 5, 5, 5, 8_000, "ok") == (4_000, 121)
+
+
+def test_depth_observation_rejects_nonpositive_sample_limit() -> None:
+    mask = np.ones((5, 5), dtype=np.uint8)
+    depth = np.zeros_like(mask, dtype=np.uint16)
+    for min_samples in (0, -1):
+        try:
+            mask_depth_observation(mask, depth, min_samples=min_samples)
+        except ValueError as exc:
+            assert "min_samples must be positive" in str(exc)
+        else:
+            raise AssertionError("nonpositive min_samples should be rejected")
+
+
+def test_depth_range_gate_uses_confidence_qualified_measurements() -> None:
+    mask = np.ones((20, 20), dtype=np.uint8)
+    depth = np.full(mask.shape, 12_000, dtype=np.uint16)
+    depth[5:15, 5:15] = 4_000
+    confidence = np.full(mask.shape, 255, dtype=np.uint8)
+    confidence[5:15, 5:15] = 0
+
+    observation = mask_depth_observation(
+        mask,
+        depth,
+        confidence_map=confidence,
+        max_depth_mm=8_000,
+        min_samples=20,
+        erosion_px=0,
+        confidence_max=200,
+    )
+
+    assert observation.status == "ok"
+    assert observation.depth_mm == 4_000
+    assert observation.measured_count == 100
+    assert observation.measured_median_mm == 4_000
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"max_depth_mm": 0}, "max_depth_mm must be positive"),
+        ({"fragment_min_samples": 0}, "fragment_min_samples must be positive"),
+        ({"fragment_erosion_px": -1}, "fragment_erosion_px must be nonnegative"),
+        ({"depth_radius": -1}, "depth_radius must be nonnegative"),
+    ],
+)
+def test_run_dataset_rejects_invalid_depth_settings_before_creating_output(
+    tmp_path: Path,
+    arguments: dict,
+    message: str,
+) -> None:
+    dataset = tmp_path / "missing-dataset"
+    output = tmp_path / "output"
+
+    with pytest.raises(ValueError, match=message):
+        run_dataset(dataset, tmp_path / "missing-model.pt", output, **arguments)
+
+    assert not output.exists()
 
 
 def _write_rows(path: Path, rows: list[dict]) -> None:

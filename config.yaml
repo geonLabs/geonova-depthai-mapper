@@ -1,0 +1,34 @@
+# Jetson Controller folder-mode capture configuration.
+# Missing keys retain the recorder defaults. Runtime result paths are forced to
+# JETSON_PIPELINE_RESULTS_DIR by main.py when the Controller launches this job.
+output_dir: results
+fps: 30.0
+depth_fps: 30.0
+rgb_width: 0
+rgb_height: 0
+max_runtime_s: 0.0
+
+controller_bridge_enabled: true
+controller_bridge_dir: results/controller-bridge
+controller_status_interval_s: 1.0
+controller_sensor_stale_after_s: 3.0
+controller_preview_fps: 4.0
+controller_preview_max_width: 1280
+controller_preview_jpeg_quality: 78
+
+depth_alignment_mode: auto
+depth_preset: FAST_ACCURACY
+lr_check: true
+subpixel: true
+subpixel_fractional_bits: 5
+stereo_median_filter: "off"
+save_confidence_map: false
+rotate_180: false
+
+enable_gps: true
+rtk_ntrip_auto_mountpoint: true
+rtk_ntrip_mountpoint_format: RTCM31
+rtk_ntrip_position_wait_s: 10.0
+rtk_ntrip_data_timeout_s: 15.0
+rtk_ntrip_max_mountpoints: 12
+enable_external_imu: true
