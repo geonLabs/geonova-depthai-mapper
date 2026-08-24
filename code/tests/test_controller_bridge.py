@@ -9,11 +9,11 @@ import numpy as np
 from geonova_depthai.controller_bridge import ControllerBridge
 
 
-def bridge_args(root: Path, preview_fps=0.0):
+def bridge_args(root: Path, preview_fps=0.0, status_interval_s=1.0):
     return SimpleNamespace(
         controller_bridge_enabled=True,
         controller_bridge_dir=str(root),
-        controller_status_interval_s=1.0,
+        controller_status_interval_s=status_interval_s,
         controller_sensor_stale_after_s=3.0,
         controller_preview_fps=preview_fps,
         controller_preview_max_width=640,
@@ -90,3 +90,39 @@ def test_bridge_writes_resized_jpeg_preview(tmp_path):
     assert decoded.shape[:2] == (360, 640)
     assert bridge.snapshot()["camera"]["previewAvailable"] is True
     bridge.close()
+
+
+def test_bridge_default_preserves_maximum_capture_width(tmp_path):
+    args = bridge_args(tmp_path)
+    del args.controller_preview_max_width
+    bridge = ControllerBridge(args)
+    frame = np.zeros((1200, 1920, 3), dtype=np.uint8)
+
+    bridge.write_preview_frame(frame)
+
+    encoded = np.fromfile(tmp_path / "camera-preview.jpg", dtype=np.uint8)
+    decoded = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+    assert decoded.shape[:2] == (1200, 1920)
+    bridge.close()
+
+
+def test_bridge_heartbeat_continues_during_transient_camera_failure(tmp_path):
+    bridge = ControllerBridge(bridge_args(tmp_path, status_interval_s=0.1))
+    gps = FakeReader({"host_monotonic_ns": time.monotonic_ns(), "fix_quality": "1"})
+    assert bridge.publish({"gps": gps}, force=True)
+    first = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
+
+    bridge.mark_device_disconnected("camera temporarily missing")
+    deadline = time.monotonic() + 1.0
+    current = first
+    while time.monotonic() < deadline:
+        time.sleep(0.03)
+        current = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
+        if current["updatedAtEpochMillis"] > first["updatedAtEpochMillis"]:
+            break
+
+    assert current["updatedAtEpochMillis"] > first["updatedAtEpochMillis"]
+    assert current["pipeline"]["active"] is True
+    assert current["pipeline"]["error"] == "camera temporarily missing"
+    assert current["gnss"]["connected"] is True
+    bridge.close({"gps": gps})

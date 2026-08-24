@@ -7,13 +7,14 @@ depth_fps: 30.0
 rgb_width: 0
 rgb_height: 0
 max_runtime_s: 0.0
+monitor_only: false
 
 controller_bridge_enabled: true
 controller_bridge_dir: results/controller-bridge
 controller_status_interval_s: 1.0
 controller_sensor_stale_after_s: 3.0
 controller_preview_fps: 4.0
-controller_preview_max_width: 1280
+controller_preview_max_width: 1920
 controller_preview_jpeg_quality: 78
 
 depth_alignment_mode: auto
@@ -26,9 +27,16 @@ save_confidence_map: false
 rotate_180: false
 
 enable_gps: true
+gps_device: auto              # u-blox /dev/serial/by-id identity를 자동 선택; ttyACM 번호는 사용하지 않음
 rtk_ntrip_auto_mountpoint: true
 rtk_ntrip_mountpoint_format: RTCM31
 rtk_ntrip_position_wait_s: 10.0
 rtk_ntrip_data_timeout_s: 15.0
 rtk_ntrip_max_mountpoints: 12
+rtk_ntrip_reselect_interval_s: 300.0       # 5분마다 현재 위치 기준으로 더 가까운 기준국 확인
+rtk_ntrip_switch_min_improvement_m: 1000.0 # 최소 1km 이상 가까워질 때만 무중단 전환
+rtk_ntrip_position_max_age_s: 30.0         # 30초 넘게 갱신되지 않은 좌표로는 기준국을 전환하지 않음
+rtk_ntrip_username: "pjmsm0319@gmail.com"
+rtk_ntrip_password: "gnss"
 enable_external_imu: true
+external_imu_device: auto     # EBIMU USB-UART /dev/serial/by-id identity를 자동 선택

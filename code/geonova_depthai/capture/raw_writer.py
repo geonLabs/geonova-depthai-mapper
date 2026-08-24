@@ -3,7 +3,7 @@ import json
 import queue
 import sys
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -71,6 +71,30 @@ def _apply_saved_image_transform(frame, args, interpolation):
     if getattr(args, "rotate_180", False):
         frame = cv2.rotate(frame, cv2.ROTATE_180)
     return frame
+
+
+def _allocate_dataset_root(output_dir, started_wall, max_attempts=10_000):
+    """Atomically reserve a unique ``yyyy-mm-dd-hh-mm-ss_raw`` directory.
+
+    Captures normally use their wall-clock start second.  If that exact name is
+    already present, reserve the next unused second-shaped name.  This keeps one
+    stable naming contract without ever reopening or truncating an older dataset.
+    The exact capture time, including sub-second precision, remains in metadata.
+    """
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    for collision_index in range(max_attempts):
+        slot = started_wall + timedelta(seconds=collision_index)
+        candidate = output_root / f"{slot.strftime('%Y-%m-%d-%H-%M-%S')}_raw"
+        try:
+            candidate.mkdir(exist_ok=False)
+            return candidate
+        except FileExistsError:
+            continue
+    raise RuntimeError(
+        f"Could not allocate a unique raw dataset directory under {output_root} "
+        f"after {max_attempts} attempts"
+    )
 
 
 class ThreadSafeCsv:
@@ -144,15 +168,14 @@ class RawEventDataset:
     ):
         self.args = args
         self.started_wall = datetime.now()
-        self.root = Path(output_dir) / self.started_wall.strftime("%Y-%m-%d_%H-%M-%S_raw")
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.root = _allocate_dataset_root(output_dir, self.started_wall)
         self.rgb_dir = self.root / "rgb"
         self.depth_dir = self.root / "depth_mm"
         self.confidence_dir = self.root / "confidence"
-        self.rgb_dir.mkdir(exist_ok=True)
-        self.depth_dir.mkdir(exist_ok=True)
+        self.rgb_dir.mkdir()
+        self.depth_dir.mkdir()
         if args.save_confidence_map:
-            self.confidence_dir.mkdir(exist_ok=True)
+            self.confidence_dir.mkdir()
 
         self.rgb_events = ThreadSafeCsv(self.root / "rgb_events.csv", RGB_EVENT_FIELDS)
         self.depth_events = ThreadSafeCsv(self.root / "depth_events.csv", DEPTH_EVENT_FIELDS)

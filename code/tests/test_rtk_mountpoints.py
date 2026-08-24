@@ -41,6 +41,76 @@ def test_sort_ntrip_mountpoint_entries_uses_nearest_rover_position() -> None:
     assert ranked[-1]["mountpoint"] == "YANJ-RTCM31"
 
 
+def test_closer_mountpoints_require_a_real_configured_improvement() -> None:
+    entries = [
+        {"mountpoint": "CURRENT", "latitude": 37.0, "longitude": 127.0},
+        {"mountpoint": "EQUAL", "latitude": 37.0, "longitude": 127.0},
+        {"mountpoint": "NEAR", "latitude": 37.09, "longitude": 127.0},
+    ]
+    current = {"mountpoint": "CURRENT", "latitude": 37.0, "longitude": 127.0}
+
+    closer = runtime.closer_ntrip_mountpoint_entries(
+        entries,
+        current,
+        latitude_deg=37.1,
+        longitude_deg=127.0,
+    )
+
+    assert [entry["mountpoint"] for entry in closer] == ["NEAR"]
+    improvement = closer[0]["distance_improvement_m"]
+    assert runtime.closer_ntrip_mountpoint_entries(
+        entries,
+        current,
+        latitude_deg=37.1,
+        longitude_deg=127.0,
+        min_improvement_m=improvement,
+    )
+    assert not runtime.closer_ntrip_mountpoint_entries(
+        entries,
+        current,
+        latitude_deg=37.1,
+        longitude_deg=127.0,
+        min_improvement_m=improvement + 0.01,
+    )
+
+
+def test_closer_mountpoints_skip_an_active_station_without_coordinates() -> None:
+    entries = [{"mountpoint": "NEAR", "latitude": 37.1, "longitude": 127.0}]
+
+    assert not runtime.closer_ntrip_mountpoint_entries(
+        entries,
+        {"mountpoint": "UNKNOWN"},
+        latitude_deg=37.1,
+        longitude_deg=127.0,
+    )
+
+
+def _rtcm_frame(payload: bytes) -> bytes:
+    header = bytes((0xD3, (len(payload) >> 8) & 0x03, len(payload) & 0xFF))
+    body = header + payload
+    return body + runtime.rtcm3_crc24q(body).to_bytes(3, "big")
+
+
+def test_rtcm3_framer_waits_for_a_complete_crc_valid_frame() -> None:
+    assert runtime.rtcm3_crc24q(b"123456789") == 0xCDE703
+    frame = _rtcm_frame(b"split-frame")
+    framer = runtime.Rtcm3Framer()
+
+    assert framer.feed(b"junk" + frame[:2]) == []
+    assert framer.feed(frame[2:-1]) == []
+    assert framer.feed(frame[-1:]) == [frame]
+
+
+def test_rtcm3_framer_recovers_after_bad_crc_and_emits_multiple_frames() -> None:
+    bad = bytearray(_rtcm_frame(b"bad"))
+    bad[-1] ^= 0xFF
+    first = _rtcm_frame(b"first")
+    second = _rtcm_frame(b"second")
+    framer = runtime.Rtcm3Framer()
+
+    assert framer.feed(bytes(bad) + first + second) == [first, second]
+
+
 def test_build_rtk_config_allows_auto_mountpoint_without_primary_mountpoint() -> None:
     args = SimpleNamespace(
         rtk_ntrip_host="www.gnssdata.or.kr",
@@ -62,6 +132,9 @@ def test_build_rtk_config_allows_auto_mountpoint_without_primary_mountpoint() ->
         rtk_ntrip_data_timeout_s=15.0,
         rtk_ntrip_sourcetable_timeout_s=5.0,
         rtk_ntrip_max_mountpoints=12,
+        rtk_ntrip_reselect_interval_s=300.0,
+        rtk_ntrip_switch_min_improvement_m=1000.0,
+        rtk_ntrip_position_max_age_s=30.0,
     )
 
     config = runtime.build_rtk_config(args)
@@ -69,3 +142,6 @@ def test_build_rtk_config_allows_auto_mountpoint_without_primary_mountpoint() ->
     assert config["mountpoint"] == ""
     assert config["auto_mountpoint"] is True
     assert config["mountpoint_candidates"] == "GANS-RTCM31,YANJ-RTCM31"
+    assert config["reselect_interval"] == 300.0
+    assert config["switch_min_improvement_m"] == 1000.0
+    assert config["position_max_age"] == 30.0

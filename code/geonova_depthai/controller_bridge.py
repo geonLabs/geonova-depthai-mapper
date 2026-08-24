@@ -75,7 +75,7 @@ class ControllerBridge:
             0.0, float(getattr(args, "controller_preview_fps", 4.0))
         )
         self.preview_max_width = max(
-            320, int(getattr(args, "controller_preview_max_width", 1280))
+            320, int(getattr(args, "controller_preview_max_width", 1920))
         )
         self.preview_jpeg_quality = max(
             1, min(100, int(getattr(args, "controller_preview_jpeg_quality", 78)))
@@ -91,10 +91,12 @@ class ControllerBridge:
 
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
+        self._publish_lock = threading.Lock()
         self._stop = False
         self._pipeline_active = True
         self._pipeline_error = None
         self._device_connected = False
+        self._camera_error = None
         self._last_camera_monotonic = None
         self._last_camera_epoch_ms = None
         self._last_imu_monotonic = None
@@ -107,6 +109,8 @@ class ControllerBridge:
         self._last_status_monotonic = 0.0
         self._pending_rgb = None
         self._preview_thread = None
+        self._status_thread = None
+        self._serial_readers = {}
 
         if not self.enabled:
             return
@@ -123,10 +127,40 @@ class ControllerBridge:
                 daemon=True,
             )
             self._preview_thread.start()
+        self._status_thread = threading.Thread(
+            target=self._status_worker,
+            name="controller-status",
+            daemon=True,
+        )
+        self._status_thread.start()
 
     def mark_device_connected(self):
         with self._lock:
             self._device_connected = True
+            self._camera_error = None
+            self._pipeline_error = None
+
+    def mark_device_disconnected(self, error=None):
+        """Report a transient camera outage while the monitor keeps running."""
+        with self._condition:
+            self._device_connected = False
+            self._camera_error = str(error) if error else None
+            self._pipeline_error = self._camera_error
+            self._last_camera_monotonic = None
+            self._last_camera_epoch_ms = None
+            self._last_preview_epoch_ms = None
+            self._pending_rgb = None
+            self._condition.notify_all()
+
+    def _status_worker(self):
+        while True:
+            with self._condition:
+                if self._stop:
+                    return
+                self._condition.wait(timeout=self.status_interval_s)
+                if self._stop:
+                    return
+            self.publish()
 
     def offer_rgb(self, message):
         now_monotonic = time.monotonic()
@@ -145,7 +179,7 @@ class ControllerBridge:
             ):
                 self._pending_rgb = message
                 self._next_preview_monotonic = now_monotonic + 1.0 / self.preview_fps
-                self._condition.notify()
+                self._condition.notify_all()
 
     def observe_imu(self):
         with self._lock:
@@ -295,6 +329,7 @@ class ControllerBridge:
                 "previewAvailable": self._last_preview_epoch_ms is not None,
                 "previewUpdatedAtEpochMillis": self._last_preview_epoch_ms,
                 "previewError": self._preview_error,
+                "error": self._camera_error,
             }
             pipeline = {
                 "active": self._pipeline_active,
@@ -328,21 +363,27 @@ class ControllerBridge:
     def publish(self, serial_readers=None, force=False):
         if not self.enabled:
             return False
-        now = time.monotonic()
-        if not force and now - self._last_status_monotonic < self.status_interval_s:
-            return False
-        payload = json.dumps(
-            self.snapshot(serial_readers),
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        self._last_status_monotonic = now
-        try:
-            _atomic_write(self.status_path, payload)
-        except OSError as error:
-            print(f"Controller bridge status write failed: {error}")
-            return False
-        return True
+        if serial_readers is not None:
+            with self._lock:
+                self._serial_readers = serial_readers
+        with self._publish_lock:
+            now = time.monotonic()
+            if not force and now - self._last_status_monotonic < self.status_interval_s:
+                return False
+            with self._lock:
+                readers = self._serial_readers
+            payload = json.dumps(
+                self.snapshot(readers),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            self._last_status_monotonic = now
+            try:
+                _atomic_write(self.status_path, payload)
+            except OSError as error:
+                print(f"Controller bridge status write failed: {error}")
+                return False
+            return True
 
     def close(self, serial_readers=None, error=None):
         if not self.enabled:
@@ -356,4 +397,6 @@ class ControllerBridge:
             self._condition.notify_all()
         if self._preview_thread is not None:
             self._preview_thread.join(timeout=3.0)
+        if self._status_thread is not None:
+            self._status_thread.join(timeout=3.0)
         self.publish(serial_readers, force=True)

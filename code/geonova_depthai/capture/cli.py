@@ -56,6 +56,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--queue-size", type=int, default=d["queue_size"], help="Maximum pending writer tasks before capture backpressure")
     parser.add_argument("--writer-threads", type=int, default=d["writer_threads"], help="Background image encoder/writer workers")
     parser.add_argument("--max-runtime-s", type=nonnegative_float, default=d["max_runtime_s"], help="0 means record until Ctrl-C")
+    parser.add_argument(
+        "--monitor-only",
+        action="store_true",
+        default=d["monitor_only"],
+        help=(
+            "Publish live ControllerBridge camera/GNSS/IMU state without creating "
+            "a dataset; uses a USB2-safe low-bandwidth camera pipeline"
+        ),
+    )
     parser.add_argument("--controller-bridge-enabled", type=str2bool, nargs="?", const=True, default=d["controller_bridge_enabled"], help="Publish live sensor status and camera preview for Jetson Controller")
     parser.add_argument("--no-controller-bridge", dest="controller_bridge_enabled", action="store_false", help="Disable the Jetson Controller live bridge")
     parser.add_argument("--controller-bridge-dir", default=d["controller_bridge_dir"], help="Directory for controller status.json and camera-preview.jpg")
@@ -105,11 +114,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-usb2", action="store_true", default=d["allow_usb2"], help="Allow reduced-bandwidth USB2 operation")
     parser.add_argument("--usb3-retries", type=int, default=d["usb3_retries"], help="USB3 connection retries before failure")
 
-    parser.add_argument("--gps-device", default=d["gps_device"], help="GPS serial device path or Windows COM port")
+    parser.add_argument("--gps-device", default=d["gps_device"], help="GPS serial device path, Windows COM port, or auto for stable /dev/serial/by-id discovery")
     parser.add_argument("--gps-baudrate", type=int, default=d["gps_baudrate"], help="GPS serial baud rate")
     parser.add_argument("--gps-max-hz", type=nonnegative_float, default=d["gps_max_hz"], help="Maximum GPS rows written per second; 0 keeps all")
     parser.add_argument("--no-gps", dest="enable_gps", action="store_false", default=d["enable_gps"], help="Disable GPS and NTRIP acquisition")
-    parser.add_argument("--external-imu-device", default=d["external_imu_device"], help="External IMU serial device path or COM port")
+    parser.add_argument("--external-imu-device", default=d["external_imu_device"], help="External IMU serial device path, COM port, or auto for stable /dev/serial/by-id discovery")
     parser.add_argument("--external-imu-baudrate", type=int, default=d["external_imu_baudrate"], help="External IMU serial baud rate")
     parser.add_argument("--external-imu-format", choices=["ebimu", "raw"], default=d["external_imu_format"], help="External IMU line parser")
     parser.add_argument("--external-imu-max-hz", type=nonnegative_float, default=d["external_imu_max_hz"], help="Maximum external-IMU rows written per second")
@@ -132,6 +141,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rtk-ntrip-data-timeout-s", type=nonnegative_float, default=d["rtk_ntrip_data_timeout_s"], help="Seconds without RTCM data before switching to the next mountpoint; 0 disables")
     parser.add_argument("--rtk-ntrip-sourcetable-timeout-s", type=nonnegative_float, default=d["rtk_ntrip_sourcetable_timeout_s"], help="Seconds before giving up on the NTRIP source table request")
     parser.add_argument("--rtk-ntrip-max-mountpoints", type=int, default=d["rtk_ntrip_max_mountpoints"], help="Maximum auto-selected mountpoints to try per reconnect cycle; 0 keeps all")
+    parser.add_argument("--rtk-ntrip-reselect-interval-s", type=nonnegative_float, default=d["rtk_ntrip_reselect_interval_s"], help="Seconds between nearest-mountpoint checks while connected; 0 disables periodic switching")
+    parser.add_argument("--rtk-ntrip-switch-min-improvement-m", type=nonnegative_float, default=d["rtk_ntrip_switch_min_improvement_m"], help="Minimum distance reduction required before switching to another mountpoint")
+    parser.add_argument("--rtk-ntrip-position-max-age-s", type=nonnegative_float, default=d["rtk_ntrip_position_max_age_s"], help="Maximum age of a live GNSS position used for mountpoint switching; 0 disables the age check")
     parser.add_argument("--rtk-initial-latitude-deg", type=float, default=d["rtk_initial_latitude_deg"], help="Fallback latitude used before the receiver reports a position")
     parser.add_argument("--rtk-initial-longitude-deg", type=float, default=d["rtk_initial_longitude_deg"], help="Fallback longitude used before the receiver reports a position")
     parser.add_argument("--rtk-initial-altitude-m", type=float, default=d["rtk_initial_altitude_m"], help="Fallback ellipsoidal altitude in meters")
@@ -152,6 +164,29 @@ def apply_legacy_compat_defaults(args):
     return args
 
 
+def apply_monitor_only_defaults(args):
+    """Apply bounded-bandwidth settings required by the live monitor mode."""
+    if not getattr(args, "monitor_only", False):
+        return args
+
+    # Monitor mode never persists RGB-D data.  Resolve the same maximum supported
+    # RGB output geometry as capture so the Controller sensor preview does not
+    # discard camera detail.  FPS remains bounded and constrained USB links use
+    # the existing MJPEG transport, so the larger frame does not turn into a raw
+    # USB2 bandwidth spike.
+    args.controller_bridge_enabled = True
+    args.allow_usb2 = True
+    args.save_confidence_map = False
+    args.fps = min(max(float(args.fps), 1.0), 5.0)
+    args.depth_fps = 0.0
+    args.rgb_width = 0
+    args.rgb_height = 0
+    args.controller_preview_max_width = 1920
+    args.imu_rate = min(max(int(args.imu_rate), 1), 100)
+    return args
+
+
 def parse_args(argv=None):
     parser = build_parser()
-    return apply_legacy_compat_defaults(parse_args_with_yaml(parser, argv))
+    args = apply_legacy_compat_defaults(parse_args_with_yaml(parser, argv))
+    return apply_monitor_only_defaults(args)

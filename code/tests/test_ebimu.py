@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument("--device", default=DEFAULTS["external_imu_device"], help="EBIMU serial path or Windows COM port")
+    parser.add_argument("--device", default=DEFAULTS["external_imu_device"], help="EBIMU serial path, Windows COM port, or auto")
     parser.add_argument("--baudrate", type=int, default=DEFAULTS["external_imu_baudrate"], help="EBIMU serial baud rate")
     parser.add_argument("--duration-s", type=float, default=10.0, help="Acquisition duration in seconds")
     parser.add_argument("--min-rate-hz", type=float, default=20.0, help="Minimum parsed sample rate required to pass")
@@ -34,6 +34,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    args.device = runtime.resolve_serial_device(args.device, "external_imu")
+    if not args.device:
+        raise RuntimeError("No safe external IMU serial device was found")
     started = time.monotonic()
     parsed_samples = []
     malformed = 0

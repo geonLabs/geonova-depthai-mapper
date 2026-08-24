@@ -1,5 +1,5 @@
 # 외부 EBIMU의 포맷과 수신 주기를 카메라 없이 검사하는 설정입니다.
-device: /dev/ttyUSB0  # Linux 직렬 포트. Windows에서는 예: COM4로 변경
+device: auto          # Linux에서는 EBIMU /dev/serial/by-id를 선택. Windows에서는 예: COM4
 baudrate: 921600      # EBIMU에 설정된 직렬 통신 속도
 duration_s: 10.0      # 샘플을 수집할 테스트 시간(초)
 min_rate_hz: 20.0     # 테스트 통과에 필요한 최소 유효 자세 샘플률(Hz)

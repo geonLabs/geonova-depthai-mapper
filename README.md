@@ -59,6 +59,18 @@ cd code
 ../.venv/bin/python tests/test_yolo_seg_shp.py --config configs/yolo.yaml
 ```
 
+데이터셋을 만들지 않고 Controller 센서 상태와 카메라 프리뷰만 계속 게시하려면
+모니터 모드를 사용합니다. 이 모드는 센서에 맞는 최대 RGB 캡처 크기를
+선택하되 최대 5 FPS로 제한하고, USB2 급 연결에서는 MJPEG 전송으로
+대역폭을 제한합니다. Controller JPEG 프리뷰는 최대 1920 px 폭입니다.
+
+```bash
+../.venv/bin/python synced_image_recorder.py --config configs/capture.yaml --monitor-only
+```
+
+Linux의 GNSS와 외부 IMU 기본 포트는 `auto`이며 `/dev/serial/by-id` 장치 ID로
+결정됩니다. Android 휴대폰처럼 GNSS가 아닌 `ttyACM` 장치는 자동 선택하지 않습니다.
+
 ### 3) 디버그 뷰어
 
 ```bash
@@ -73,6 +85,10 @@ cd code
 
 Controller 실행 시 `JETSON_PIPELINE_RESULTS_DIR`과 `JETSON_PIPELINE_SENSOR_BRIDGE_DIR`
 환경변수가 우선되어 쓰기 경로 충돌을 줄입니다.
+Controller의 DepthAI preset은 모든 원시 수집을 단일 `/data/collections` 작업 폴더에
+저장하며, 각 데이터셋은 `yyyy-mm-dd-hh-mm-ss_raw` 이름으로 직접 생성됩니다.
+같은 초 이름이 이미 있으면 기존 데이터를 덮어쓰지 않고 다음 빈 초 이름을 원자적으로
+예약합니다.
 
 ## 저장소 구조
 
@@ -127,9 +143,11 @@ cd code
 
 ## 민감 정보 처리
 
-- NTRIP 계정은 코드/공유 YAML에 직접 두지 말고 환경변수 또는 `*.local.yaml`로 분리
+- 노출되면 안 되는 NTRIP 계정은 공유 YAML에 두지 말고 환경변수 또는 `*.local.yaml`로 분리
 - 환경변수: `NTRIP_USERNAME`, `NTRIP_PASSWORD`
 - 크레덴셜이 포함되지 않도록 `.gitignore`에 맞춰 운영
+- 이동 중에는 기본 5분마다 더 가까운 기준국을 확인하고, 새 RTCM3 스트림을
+  검증한 뒤 기존 연결을 닫는 make-before-break 방식으로 전환
 
 ## 로컬 환경과 산출물
 

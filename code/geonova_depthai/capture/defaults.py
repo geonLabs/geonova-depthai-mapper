@@ -24,12 +24,16 @@ DEFAULTS = {
     "queue_size": 16,
     "writer_threads": 4,
     "max_runtime_s": 0.0,
+    "monitor_only": False,
     "controller_bridge_enabled": True,
     "controller_bridge_dir": "/var/lib/jetson-sensors",
     "controller_status_interval_s": 1.0,
     "controller_sensor_stale_after_s": 3.0,
     "controller_preview_fps": 4.0,
-    "controller_preview_max_width": 1280,
+    # The largest RGB geometry produced by the capture pipeline is 1920 px.
+    # Keeping that width preserves sensor detail in the Controller preview;
+    # JPEG encoding and the bounded preview cadence limit network bandwidth.
+    "controller_preview_max_width": 1920,
     "controller_preview_jpeg_quality": 78,
     "rgb_format": "jpg",
     "rgb_jpeg_quality": 100,
@@ -60,11 +64,14 @@ DEFAULTS = {
     "allow_usb2": False,
     "usb3_retries": 2,
     "enable_gps": True,
-    "gps_device": "/dev/ttyACM0",
+    # Resolve Linux sensor ports from stable /dev/serial/by-id identities.  A
+    # numbered ttyACM path is not safe here because an attached Android phone
+    # can claim ttyACM0 before the GNSS receiver is enumerated.
+    "gps_device": "auto",
     "gps_baudrate": 921600,
     "gps_max_hz": 120.0,
     "enable_external_imu": True,
-    "external_imu_device": "/dev/ttyUSB0",
+    "external_imu_device": "auto",
     "external_imu_baudrate": 921600,
     "external_imu_format": "ebimu",
     "external_imu_max_hz": 120.0,
@@ -92,6 +99,9 @@ DEFAULTS = {
     "rtk_ntrip_data_timeout_s": 15.0,
     "rtk_ntrip_sourcetable_timeout_s": 5.0,
     "rtk_ntrip_max_mountpoints": 12,
+    "rtk_ntrip_reselect_interval_s": 300.0,
+    "rtk_ntrip_switch_min_improvement_m": 1000.0,
+    "rtk_ntrip_position_max_age_s": 30.0,
     "rtk_initial_latitude_deg": None,
     "rtk_initial_longitude_deg": None,
     "rtk_initial_altitude_m": 0.0,

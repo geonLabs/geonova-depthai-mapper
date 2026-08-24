@@ -16,6 +16,8 @@ import depthai as dai
 import numpy as np
 import serial
 
+from geonova_depthai.serial_devices import resolve_serial_device, resolve_serial_devices
+
 
 WIDTH = 1280
 HEIGHT = 720
@@ -45,6 +47,8 @@ GPS_FIX_QUALITY_NAMES = {
 }
 
 DEFAULT_RTK_MOUNTPOINT_FORMAT = "RTCM31"
+NTRIP_STREAM_POLL_TIMEOUT_S = 0.25
+NTRIP_HANDOVER_MIN_VALID_PAYLOADS = 2
 FALLBACK_RTK_MOUNTPOINTS = (
     ("GANS-RTCM31", 37.500000, 126.900000, "SMG"),
     ("GUMC-RTCM31", 37.500000, 126.900000, "SMG"),
@@ -855,6 +859,106 @@ def sort_ntrip_mountpoint_entries(entries, latitude_deg=None, longitude_deg=None
     return result
 
 
+def closer_ntrip_mountpoint_entries(
+    entries,
+    current_entry,
+    latitude_deg,
+    longitude_deg,
+    min_improvement_m=0.0,
+):
+    """Return only stations meaningfully closer than the active mountpoint."""
+
+    latitude = _float_or_none(latitude_deg)
+    longitude = _float_or_none(longitude_deg)
+    if latitude is None or longitude is None or not current_entry:
+        return []
+
+    current = dict(current_entry)
+    current_mountpoint = current.get("mountpoint")
+    if _float_or_none(current.get("latitude")) is None or _float_or_none(current.get("longitude")) is None:
+        for entry in entries:
+            if entry.get("mountpoint") == current_mountpoint:
+                current.update(entry)
+                break
+
+    current_latitude = _float_or_none(current.get("latitude"))
+    current_longitude = _float_or_none(current.get("longitude"))
+    if current_latitude is None or current_longitude is None:
+        return []
+
+    current_distance = haversine_distance_m(
+        latitude,
+        longitude,
+        current_latitude,
+        current_longitude,
+    )
+    minimum = max(0.0, float(min_improvement_m or 0.0))
+    closer = []
+    for entry in sort_ntrip_mountpoint_entries(entries, latitude, longitude):
+        if entry.get("mountpoint") == current_mountpoint:
+            continue
+        distance = _float_or_none(entry.get("distance_m"))
+        if distance is None:
+            continue
+        improvement = current_distance - distance
+        if improvement <= 0.0 or improvement < minimum:
+            continue
+        candidate = dict(entry)
+        candidate["current_distance_m"] = current_distance
+        candidate["distance_improvement_m"] = improvement
+        closer.append(candidate)
+    return closer
+
+
+def rtcm3_crc24q(data):
+    """Return the CRC-24Q used by RTCM version 3 frames."""
+
+    crc = 0
+    for value in data:
+        crc ^= int(value) << 16
+        for _ in range(8):
+            crc <<= 1
+            if crc & 0x1000000:
+                crc ^= 0x1864CFB
+    return crc & 0xFFFFFF
+
+
+class Rtcm3Framer:
+    """Buffer a TCP byte stream and emit complete, CRC-valid RTCM3 frames."""
+
+    def __init__(self):
+        self.buffer = bytearray()
+
+    def feed(self, data):
+        if data:
+            self.buffer.extend(data)
+        frames = []
+        while self.buffer:
+            preamble = self.buffer.find(b"\xD3")
+            if preamble < 0:
+                self.buffer.clear()
+                break
+            if preamble:
+                del self.buffer[:preamble]
+            if len(self.buffer) < 3:
+                break
+            if self.buffer[1] & 0xFC:
+                del self.buffer[0]
+                continue
+            payload_length = ((self.buffer[1] & 0x03) << 8) | self.buffer[2]
+            frame_length = 3 + payload_length + 3
+            if len(self.buffer) < frame_length:
+                break
+            frame = bytes(self.buffer[:frame_length])
+            expected_crc = int.from_bytes(frame[-3:], "big")
+            if rtcm3_crc24q(frame[:-3]) != expected_crc:
+                del self.buffer[0]
+                continue
+            del self.buffer[:frame_length]
+            frames.append(frame)
+        return frames
+
+
 def fetch_ntrip_source_table(config):
     host = config["host"]
     port = int(config["port"])
@@ -935,19 +1039,50 @@ class NtripCorrectionClient:
             return gga if gga.endswith("\r\n") else f"{gga}\r\n"
         return self._fallback_gga()
 
+    def _live_position_is_fresh(self):
+        updated = _float_or_none(self.latest_nmea.get("position_monotonic"))
+        max_age = float(self.config.get("position_max_age", 30.0) or 0.0)
+        if updated is None or max_age <= 0.0:
+            return True
+        return time.monotonic() - updated <= max_age
+
     def _rover_position(self):
-        latitude = _float_or_none(self.latest_nmea.get("latitude_deg"))
-        longitude = _float_or_none(self.latest_nmea.get("longitude_deg"))
-        if latitude is not None and longitude is not None:
-            return latitude, longitude
+        if "position_valid" in self.latest_nmea:
+            if not self.latest_nmea.get("position_valid"):
+                return None
+            latitude = _float_or_none(self.latest_nmea.get("latitude_deg"))
+            longitude = _float_or_none(self.latest_nmea.get("longitude_deg"))
+            if (
+                latitude is not None
+                and longitude is not None
+                and self._live_position_is_fresh()
+            ):
+                return latitude, longitude
+            return None
 
         gga = self.latest_nmea.get("gga")
         if gga:
             parsed = parse_nmea_line(gga)
+            if str(parsed.get("fix_quality", "")) in ("", "0"):
+                return None
             latitude = _float_or_none(parsed.get("latitude_deg"))
             longitude = _float_or_none(parsed.get("longitude_deg"))
-            if latitude is not None and longitude is not None:
+            if (
+                latitude is not None
+                and longitude is not None
+                and self._live_position_is_fresh()
+            ):
                 return latitude, longitude
+            return None
+
+        latitude = _float_or_none(self.latest_nmea.get("latitude_deg"))
+        longitude = _float_or_none(self.latest_nmea.get("longitude_deg"))
+        if latitude is not None and longitude is not None:
+            if self._live_position_is_fresh():
+                return latitude, longitude
+            return None
+        if self.latest_nmea.get("position_monotonic") is not None:
+            return None
 
         latitude = _float_or_none(self.config.get("latitude"))
         longitude = _float_or_none(self.config.get("longitude"))
@@ -971,21 +1106,24 @@ class NtripCorrectionClient:
                 return position
         return None
 
-    def _load_source_table_entries(self):
-        if self.source_table_attempted:
+    def _load_source_table_entries(self, force=False):
+        if self.source_table_attempted and not force:
             return self.source_table_entries or []
         self.source_table_attempted = True
+        previous_entries = self.source_table_entries
         try:
             text = fetch_ntrip_source_table(self.config)
             self.source_table_entries = parse_ntrip_source_table(
                 text,
                 self.config.get("mountpoint_format", DEFAULT_RTK_MOUNTPOINT_FORMAT),
             )
+            self.source_table_error = None
             if self.source_table_entries:
                 print(f"RTK NTRIP source table loaded: {len(self.source_table_entries)} mountpoints")
         except Exception as exc:
             self.source_table_error = str(exc)
-            self.source_table_entries = []
+            if previous_entries is None:
+                self.source_table_entries = []
             print(f"RTK NTRIP source table unavailable: {self.source_table_error}")
         return self.source_table_entries or []
 
@@ -995,13 +1133,17 @@ class NtripCorrectionClient:
         ordered = candidates + primary if auto_mountpoint else primary + candidates
         return parse_ntrip_mountpoint_list(ordered)
 
-    def _mountpoint_candidates(self):
+    def _mountpoint_candidates(self, wait_for_position=True, refresh_source_table=False):
         auto_mountpoint = bool(self.config.get("auto_mountpoint", True))
-        position = self._wait_for_rover_position() if auto_mountpoint else self._rover_position()
+        position = (
+            self._wait_for_rover_position()
+            if auto_mountpoint and wait_for_position
+            else self._rover_position()
+        )
         configured_mountpoints = self._configured_mountpoints(auto_mountpoint)
 
         if auto_mountpoint:
-            entries = self._load_source_table_entries()
+            entries = self._load_source_table_entries(force=refresh_source_table)
             if not entries:
                 entries = fallback_rtk_mountpoint_entries(
                     self.config.get("mountpoint_format", DEFAULT_RTK_MOUNTPOINT_FORMAT)
@@ -1026,6 +1168,41 @@ class NtripCorrectionClient:
         self.mountpoint_sequence = ranked
         return ranked
 
+    def _periodic_switch_candidates(self, current_entry):
+        if not self.config.get("auto_mountpoint", True):
+            return []
+        position = self._rover_position()
+        if position is None:
+            return []
+        ranked = self._mountpoint_candidates(
+            wait_for_position=False,
+            refresh_source_table=False,
+        )
+        return closer_ntrip_mountpoint_entries(
+            ranked,
+            current_entry,
+            position[0],
+            position[1],
+            self.config.get("switch_min_improvement_m", 0.0),
+        )
+
+    def _revalidate_periodic_candidate(self, current_entry, candidate):
+        position = self._rover_position()
+        if position is None:
+            return None
+        closer = closer_ntrip_mountpoint_entries(
+            [current_entry, candidate],
+            current_entry,
+            position[0],
+            position[1],
+            self.config.get("switch_min_improvement_m", 0.0),
+        )
+        candidate_mountpoint = candidate.get("mountpoint")
+        return next(
+            (entry for entry in closer if entry.get("mountpoint") == candidate_mountpoint),
+            None,
+        )
+
     def _request(self, mountpoint):
         mountpoint = mountpoint.lstrip("/")
         lines = [
@@ -1043,30 +1220,102 @@ class NtripCorrectionClient:
         lines.extend(["", ""])
         return "\r\n".join(lines).encode("ascii")
 
-    def _stream_mountpoint(self, entry):
+    def _uses_rtcm3_framing(self, entry):
+        descriptions = [entry.get("format"), entry.get("mountpoint")]
+        if self.config.get("auto_mountpoint", True):
+            descriptions.append(self.config.get("mountpoint_format"))
+        return any(
+            "RTCM3" in str(value).replace(" ", "").replace(".", "").upper()
+            for value in descriptions
+            if value
+        )
+
+    def _is_cancelled(self, cancel_event=None):
+        return self.stop_event.is_set() or bool(cancel_event and cancel_event.is_set())
+
+    @staticmethod
+    def _close_socket(sock):
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def _register_handover_socket(self, handover_state, sock):
+        if handover_state is None:
+            return True
+        with handover_state["lock"]:
+            if handover_state["cancel"].is_set():
+                accepted = False
+            else:
+                handover_state["socket"] = sock
+                accepted = True
+        if not accepted:
+            self._close_socket(sock)
+        return accepted
+
+    @staticmethod
+    def _clear_handover_socket(handover_state, sock):
+        if handover_state is None:
+            return
+        with handover_state["lock"]:
+            if handover_state.get("socket") is sock:
+                handover_state["socket"] = None
+
+    def _open_mountpoint_stream(
+        self,
+        entry,
+        require_frame=False,
+        cancel_event=None,
+        handover_state=None,
+    ):
+        """Open a caster stream without mutating the public active-stream state."""
+
         mountpoint = entry["mountpoint"]
         connect_timeout = float(self.config.get("connect_timeout", 10.0) or 10.0)
         data_timeout = float(self.config.get("data_timeout", 15.0) or 0.0)
-        with socket.create_connection((self.config["host"], self.config["port"]), timeout=connect_timeout) as sock:
+        sock = None
+        try:
+            if self._is_cancelled(cancel_event):
+                raise RuntimeError("NTRIP connection cancelled")
+            sock = socket.create_connection(
+                (self.config["host"], self.config["port"]),
+                timeout=connect_timeout,
+            )
+            if not self._register_handover_socket(handover_state, sock):
+                raise RuntimeError("NTRIP connection cancelled")
             sock.settimeout(connect_timeout)
             sock.sendall(self._request(mountpoint))
             response = b""
-            while b"\r\n\r\n" not in response and len(response) < 4096:
-                chunk = sock.recv(1)
+            header_deadline = time.monotonic() + connect_timeout
+            separator = b""
+            while len(response) < 4096:
+                if b"\r\n\r\n" in response:
+                    separator = b"\r\n\r\n"
+                    break
+                if b"\n\n" in response:
+                    separator = b"\n\n"
+                    break
+                if self._is_cancelled(cancel_event):
+                    raise RuntimeError("NTRIP connection cancelled")
+                remaining = header_deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise TimeoutError(f"NTRIP response header timed out after {connect_timeout:.1f}s")
+                sock.settimeout(min(0.5, remaining))
+                try:
+                    chunk = sock.recv(256)
+                except socket.timeout:
+                    continue
                 if not chunk:
                     break
                 response += chunk
-            header, _, remainder = response.partition(b"\r\n\r\n")
+            if not separator:
+                raise RuntimeError("NTRIP caster returned an incomplete response header")
+            header, remainder = response.split(separator, 1)
             first_line = header.splitlines()[0].decode("ascii", errors="replace") if header else ""
-            if "200" not in first_line and "ICY 200" not in first_line:
+            status_parts = first_line.split()
+            if len(status_parts) < 2 or status_parts[1] != "200":
                 raise RuntimeError(f"NTRIP caster rejected request: {first_line}")
-
-            self.connected = True
-            self.current_mountpoint = mountpoint
-            self.error = None
-            distance = entry.get("distance_m")
-            distance_text = f", distance={distance / 1000.0:.1f}km" if distance is not None else ""
-            print(f"RTK NTRIP connected: {self.config['host']}:{self.config['port']}/{mountpoint}{distance_text}")
 
             last_gga_time = 0.0
             gga = self._current_gga()
@@ -1074,15 +1323,301 @@ class NtripCorrectionClient:
                 sock.sendall(gga.encode("ascii", errors="ignore"))
                 last_gga_time = time.monotonic()
 
-            last_data_time = time.monotonic()
-            sock.settimeout(1.0)
-            if remainder:
-                self.serial_write(remainder)
-                self.bytes_received += len(remainder)
-                last_data_time = time.monotonic()
+            framer = Rtcm3Framer() if self._uses_rtcm3_framing(entry) else None
+            frames = framer.feed(remainder) if framer is not None else ([remainder] if remainder else [])
+            required_payloads = NTRIP_HANDOVER_MIN_VALID_PAYLOADS if require_frame else 0
+            if len(frames) < required_payloads:
+                validation_timeout = data_timeout if data_timeout > 0.0 else connect_timeout
+                validation_deadline = time.monotonic() + validation_timeout
+                while len(frames) < required_payloads:
+                    if self._is_cancelled(cancel_event):
+                        raise RuntimeError("NTRIP connection cancelled")
+                    remaining = validation_deadline - time.monotonic()
+                    if remaining <= 0.0:
+                        raise TimeoutError(
+                            f"fewer than {required_payloads} valid correction payloads "
+                            f"received in {validation_timeout:.1f}s"
+                        )
+                    sock.settimeout(min(0.5, remaining))
+                    try:
+                        data = sock.recv(4096)
+                    except socket.timeout:
+                        continue
+                    if not data:
+                        raise RuntimeError("NTRIP stream closed before valid RTCM data")
+                    if framer is not None:
+                        frames.extend(framer.feed(data))
+                    else:
+                        frames.append(data)
 
+            sock.settimeout(NTRIP_STREAM_POLL_TIMEOUT_S)
+            return {
+                "socket": sock,
+                "entry": dict(entry),
+                "framer": framer,
+                "frames": frames,
+                "last_gga_time": last_gga_time,
+            }
+        except Exception:
+            self._clear_handover_socket(handover_state, sock)
+            self._close_socket(sock)
+            raise
+
+    def _forward_rtcm_frames(self, frames):
+        payload = b"".join(frames)
+        if not payload:
+            return False
+        self.serial_write(payload)
+        self.bytes_received += len(payload)
+        return True
+
+    def _handover_worker(
+        self,
+        current_entry,
+        result_queue,
+        cancel_event,
+        handover_state=None,
+    ):
+        errors = []
+        cycle_started = time.monotonic()
+        cycle_timeout = float(self.config.get("reselect_interval", 300.0) or 300.0)
+        try:
+            candidates = self._periodic_switch_candidates(current_entry)
+        except Exception as exc:
+            candidates = []
+            errors.append(f"candidate refresh: {exc}")
+
+        if not candidates and not errors:
+            result = {"status": "keep", "reason": "no meaningfully closer mountpoint"}
+        else:
+            result = None
+            for candidate in candidates:
+                if self._is_cancelled(cancel_event):
+                    return
+                if time.monotonic() - cycle_started >= cycle_timeout:
+                    errors.append(f"handover cycle exceeded {cycle_timeout:.1f}s")
+                    break
+                candidate = self._revalidate_periodic_candidate(current_entry, candidate)
+                if candidate is None:
+                    errors.append("candidate is no longer closer at the current rover position")
+                    continue
+                current_name = current_entry.get("mountpoint", "-")
+                improvement = candidate.get("distance_improvement_m")
+                improvement_text = (
+                    f", {improvement / 1000.0:.1f}km closer"
+                    if improvement is not None
+                    else ""
+                )
+                print(
+                    f"RTK NTRIP validating handover: {current_name} -> "
+                    f"{candidate.get('mountpoint', '-')}{improvement_text}; current stream remains active"
+                )
+                try:
+                    stream = self._open_mountpoint_stream(
+                        candidate,
+                        require_frame=True,
+                        cancel_event=cancel_event,
+                        handover_state=handover_state,
+                    )
+                except Exception as exc:
+                    if self._is_cancelled(cancel_event):
+                        return
+                    errors.append(f"{candidate.get('mountpoint', '-')}: {exc}")
+                    continue
+                validated_candidate = self._revalidate_periodic_candidate(
+                    current_entry,
+                    candidate,
+                )
+                if validated_candidate is None:
+                    self._clear_handover_socket(handover_state, stream.get("socket"))
+                    self._close_socket(stream.get("socket"))
+                    errors.append(
+                        f"{candidate.get('mountpoint', '-')}: rover position changed during validation"
+                    )
+                    continue
+                stream["entry"] = validated_candidate
+                if self._is_cancelled(cancel_event):
+                    self._clear_handover_socket(handover_state, stream.get("socket"))
+                    self._close_socket(stream.get("socket"))
+                    return
+                result = {"status": "ready", "stream": stream}
+                break
+            if result is None:
+                result = {
+                    "status": "failed",
+                    "reason": "; ".join(errors) or "no closer mountpoint accepted RTCM data",
+                }
+
+        if handover_state is not None:
+            with handover_state["lock"]:
+                if handover_state["cancel"].is_set() or self.stop_event.is_set():
+                    cancelled = True
+                else:
+                    result_queue.put_nowait(result)
+                    cancelled = False
+            if cancelled:
+                stream = result.get("stream") if result else None
+                self._clear_handover_socket(handover_state, stream.get("socket") if stream else None)
+                self._close_socket(stream.get("socket") if stream else None)
+            return
+        if not self._is_cancelled(cancel_event):
+            result_queue.put(result)
+
+    def _start_handover(self, current_entry):
+        result_queue = queue.Queue(maxsize=1)
+        cancel_event = threading.Event()
+        handover = {
+            "queue": result_queue,
+            "cancel": cancel_event,
+            "thread": None,
+            "lock": threading.Lock(),
+            "socket": None,
+        }
+        thread = threading.Thread(
+            target=self._handover_worker,
+            args=(dict(current_entry), result_queue, cancel_event, handover),
+            name="gps-ntrip-handover",
+            daemon=True,
+        )
+        handover["thread"] = thread
+        thread.start()
+        return handover
+
+    def _cancel_handover(self, handover):
+        if handover is None:
+            return
+        with handover["lock"]:
+            handover["cancel"].set()
+            sock = handover.get("socket")
+            handover["socket"] = None
+        self._close_socket(sock)
+        handover["thread"].join(timeout=0.2)
+        while True:
+            try:
+                result = handover["queue"].get_nowait()
+            except queue.Empty:
+                break
+            stream = result.get("stream") if result else None
+            self._close_socket(stream.get("socket") if stream else None)
+
+    def _stream_mountpoint(self, entry):
+        data_timeout = float(self.config.get("data_timeout", 15.0) or 0.0)
+        reselect_interval = float(self.config.get("reselect_interval", 300.0) or 0.0)
+        periodic_enabled = bool(self.config.get("auto_mountpoint", True) and reselect_interval > 0.0)
+        stream = self._open_mountpoint_stream(entry, require_frame=True)
+        sock = stream["socket"]
+        framer = stream["framer"]
+        active_entry = stream["entry"]
+        last_gga_time = stream["last_gga_time"]
+        last_data_time = time.monotonic()
+        handover = None
+
+        self.connected = True
+        self.current_mountpoint = active_entry["mountpoint"]
+        self.error = None
+        distance = active_entry.get("distance_m")
+        distance_text = f", distance={distance / 1000.0:.1f}km" if distance is not None else ""
+        print(
+            f"RTK NTRIP connected: {self.config['host']}:{self.config['port']}/"
+            f"{active_entry['mountpoint']}{distance_text}"
+        )
+        if self._forward_rtcm_frames(stream["frames"]):
+            last_data_time = time.monotonic()
+        next_reselect_time = (
+            time.monotonic() + reselect_interval if periodic_enabled else None
+        )
+
+        try:
             while not self.stop_event.is_set():
                 now = time.monotonic()
+                if (
+                    next_reselect_time is not None
+                    and handover is None
+                    and now >= next_reselect_time
+                ):
+                    handover = self._start_handover(active_entry)
+                    next_reselect_time = now + reselect_interval
+
+                if handover is not None:
+                    try:
+                        handover_result = handover["queue"].get_nowait()
+                    except queue.Empty:
+                        handover_result = None
+                    if handover_result is not None:
+                        completed_handover = handover
+                        completed_handover["thread"].join(timeout=0.2)
+                        handover = None
+                        next_reselect_time = time.monotonic() + reselect_interval
+                        status = handover_result.get("status")
+                        if status == "ready":
+                            new_stream = handover_result["stream"]
+                            validated_candidate = self._revalidate_periodic_candidate(
+                                active_entry,
+                                new_stream["entry"],
+                            )
+                            if validated_candidate is None:
+                                self._clear_handover_socket(
+                                    completed_handover,
+                                    new_stream.get("socket"),
+                                )
+                                self._close_socket(new_stream.get("socket"))
+                                print(
+                                    "RTK NTRIP handover skipped; current stream remains active: "
+                                    "rover position/fix changed before promotion"
+                                )
+                                continue
+                            new_stream["entry"] = validated_candidate
+                            try:
+                                forwarded = self._forward_rtcm_frames(new_stream["frames"])
+                            except Exception:
+                                self._clear_handover_socket(
+                                    completed_handover,
+                                    new_stream.get("socket"),
+                                )
+                                self._close_socket(new_stream.get("socket"))
+                                raise
+                            if not forwarded:
+                                self._clear_handover_socket(
+                                    completed_handover,
+                                    new_stream.get("socket"),
+                                )
+                                self._close_socket(new_stream.get("socket"))
+                                raise RuntimeError("validated NTRIP handover contained no RTCM frame")
+                            self._clear_handover_socket(
+                                completed_handover,
+                                new_stream.get("socket"),
+                            )
+                            old_sock = sock
+                            old_mountpoint = active_entry.get("mountpoint", "-")
+                            sock = new_stream["socket"]
+                            framer = new_stream["framer"]
+                            active_entry = new_stream["entry"]
+                            last_gga_time = new_stream["last_gga_time"]
+                            last_data_time = time.monotonic()
+                            self.current_mountpoint = active_entry["mountpoint"]
+                            self.error = None
+                            self._close_socket(old_sock)
+                            improvement = active_entry.get("distance_improvement_m")
+                            improvement_text = (
+                                f", {improvement / 1000.0:.1f}km closer"
+                                if improvement is not None
+                                else ""
+                            )
+                            print(
+                                f"RTK NTRIP seamless handover complete: {old_mountpoint} -> "
+                                f"{active_entry['mountpoint']}{improvement_text}"
+                            )
+                        elif status == "failed":
+                            print(
+                                "RTK NTRIP handover skipped; current stream remains active: "
+                                f"{handover_result.get('reason', 'candidate validation failed')}"
+                            )
+                        else:
+                            print(
+                                f"RTK NTRIP reevaluation: keeping {active_entry['mountpoint']} "
+                                f"({handover_result.get('reason', 'already nearest')})"
+                            )
+
                 if self.config.get("gga_interval", 10.0) > 0:
                     if now - last_gga_time >= self.config.get("gga_interval", 10.0):
                         gga = self._current_gga()
@@ -1097,9 +1632,12 @@ class NtripCorrectionClient:
                     continue
                 if not data:
                     raise RuntimeError("NTRIP stream closed")
-                self.serial_write(data)
-                self.bytes_received += len(data)
-                last_data_time = time.monotonic()
+                frames = framer.feed(data) if framer is not None else [data]
+                if self._forward_rtcm_frames(frames):
+                    last_data_time = time.monotonic()
+        finally:
+            self._cancel_handover(handover)
+            self._close_socket(sock)
 
     def _run(self):
         reconnect_delay = float(self.config.get("reconnect_delay", 5.0) or 0.0)
@@ -1116,18 +1654,29 @@ class NtripCorrectionClient:
                 if self.stop_event.is_set():
                     break
                 self.connected = False
-                self.current_mountpoint = entry.get("mountpoint")
                 try:
                     self._stream_mountpoint(entry)
                 except Exception as exc:
+                    had_active_stream = self.connected
+                    failed_mountpoint = (
+                        self.current_mountpoint
+                        if had_active_stream and self.current_mountpoint
+                        else entry.get("mountpoint", "-")
+                    )
                     self.connected = False
-                    self.error = f"{entry.get('mountpoint', '-')}: {exc}"
+                    self.error = f"{failed_mountpoint}: {exc}"
                     if not self.stop_event.is_set():
                         print(f"RTK NTRIP switching after error: {self.error}")
+                    if had_active_stream:
+                        # A long-lived stream may have handed over and moved far
+                        # from this stale candidate list. Re-rank immediately on
+                        # the next outer reconnect cycle.
+                        break
                     continue
 
             if not self.stop_event.is_set():
                 self.stop_event.wait(reconnect_delay)
+        self.connected = False
 
 
 class NmeaParserState:
@@ -1498,15 +2047,29 @@ def read_stereo_depth_metadata(device, args):
 
 
 class SerialRateLimitedReader:
-    def __init__(self, name, device, baudrate, max_hz, parser=None, timeout=0.2, rtk_config=None):
+    def __init__(
+        self,
+        name,
+        device,
+        baudrate,
+        max_hz,
+        parser=None,
+        timeout=0.2,
+        rtk_config=None,
+        device_resolver=None,
+        reconnect_delay_s=1.0,
+    ):
         self.name = name
         self.device = device
+        self.device_resolver = device_resolver
         self.baudrate = baudrate
         self.max_hz = max_hz
         self.parser = parser
         self.timeout = timeout
         self.rtk_config = rtk_config
+        self.reconnect_delay_s = max(0.1, float(reconnect_delay_s))
         self.rtk_client = None
+        self.connection_stop_event = None
         self.write_lock = threading.Lock()
         self.latest_nmea = {}
         self.samples = queue.Queue()
@@ -1525,99 +2088,166 @@ class SerialRateLimitedReader:
 
     def stop(self):
         self.stop_event.set()
+        connection_stop_event = self.connection_stop_event
+        if connection_stop_event is not None:
+            connection_stop_event.set()
         if self.thread is not None:
             self.thread.join(timeout=2.0)
 
-    def _run(self):
+    def _resolve_device(self):
+        if self.device_resolver is None:
+            return self.device
+        return self.device_resolver()
+
+    def _open_serial(self, device):
+        try:
+            return serial.Serial(
+                device,
+                self.baudrate,
+                timeout=self.timeout,
+                exclusive=True,
+            )
+        except TypeError:
+            # Older pyserial releases and some non-POSIX backends do not expose
+            # the exclusive keyword. Keep those platforms compatible.
+            return serial.Serial(device, self.baudrate, timeout=self.timeout)
+
+    def _read_connection(self, port, connection_stop_event):
         min_interval = 1.0 / self.max_hz if self.max_hz > 0 else 0.0
         last_saved_monotonic = 0.0
-        try:
-            with serial.Serial(self.device, self.baudrate, timeout=self.timeout) as port:
-                self.started = True
-                if self.rtk_config is not None:
-                    def write_corrections(data):
-                        with self.write_lock:
-                            port.write(data)
+        if self.rtk_config is not None:
+            def write_corrections(data):
+                with self.write_lock:
+                    port.write(data)
 
-                    self.rtk_client = NtripCorrectionClient(
-                        self.rtk_config,
-                        write_corrections,
-                        self.stop_event,
-                        latest_nmea=self.latest_nmea,
+            self.rtk_client = NtripCorrectionClient(
+                self.rtk_config,
+                write_corrections,
+                connection_stop_event,
+                latest_nmea=self.latest_nmea,
+            )
+            self.rtk_client.start()
+            mountpoint_text = (
+                self.rtk_config.get("mountpoint")
+                or self.rtk_config.get("mountpoint_candidates")
+                or "auto"
+            )
+            print(
+                f"RTK NTRIP enabled: {self.rtk_config['host']}:{self.rtk_config['port']}/"
+                f"{mountpoint_text}"
+            )
+        while not self.stop_event.is_set() and not connection_stop_event.is_set():
+            raw = port.readline()
+            if not raw:
+                continue
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            raw_nmea = parse_nmea_line(line) if self.rtk_config is not None else {}
+            if self.rtk_config is not None:
+                nmea_type = raw_nmea.get("nmea_type")
+                if nmea_type == "GGA":
+                    self.latest_nmea["gga"] = line
+                    valid_fix = (
+                        str(raw_nmea.get("fix_quality", "")) not in ("", "0")
+                        and raw_nmea.get("latitude_deg") not in ("", None)
+                        and raw_nmea.get("longitude_deg") not in ("", None)
                     )
-                    self.rtk_client.start()
-                    mountpoint_text = (
-                        self.rtk_config.get("mountpoint")
-                        or self.rtk_config.get("mountpoint_candidates")
-                        or "auto"
-                    )
-                    print(
-                        f"RTK NTRIP enabled: {self.rtk_config['host']}:{self.rtk_config['port']}/"
-                        f"{mountpoint_text}"
-                    )
-                while not self.stop_event.is_set():
-                    raw = port.readline()
-                    if not raw:
-                        continue
-                    line = raw.decode("utf-8", errors="replace").strip()
-                    if not line:
-                        continue
-                    raw_nmea = parse_nmea_line(line) if self.rtk_config is not None else {}
-                    if self.rtk_config is not None:
-                        if raw_nmea.get("nmea_type") == "GGA":
-                            self.latest_nmea["gga"] = line
+                    if valid_fix:
                         for key in ("latitude_deg", "longitude_deg", "altitude_m"):
                             value = raw_nmea.get(key)
                             if value not in ("", None):
                                 self.latest_nmea[key] = value
-                    parsed = self.parser(line) if self.parser is not None else {}
-                    received_monotonic = time.monotonic()
-                    # GGA carries the RTK solution state, correction age, and base ID.
-                    # Preserve it even when other high-rate NMEA sentences are throttled.
-                    preserve_gga = self.name == "gps" and parsed.get("nmea_type") == "GGA"
-                    if (
-                        min_interval
-                        and not preserve_gga
-                        and received_monotonic - last_saved_monotonic < min_interval
-                    ):
-                        self.dropped_count += 1
-                        continue
-                    last_saved_monotonic = received_monotonic
+                        self.latest_nmea["position_monotonic"] = time.monotonic()
+                        self.latest_nmea["position_valid"] = True
+                    else:
+                        for key in ("latitude_deg", "longitude_deg", "altitude_m"):
+                            self.latest_nmea.pop(key, None)
+                        self.latest_nmea["position_monotonic"] = time.monotonic()
+                        self.latest_nmea["position_valid"] = False
+                elif nmea_type == "RMC" and raw_nmea.get("status") == "A":
+                    for key in ("latitude_deg", "longitude_deg"):
+                        value = raw_nmea.get(key)
+                        if value not in ("", None):
+                            self.latest_nmea[key] = value
+                    self.latest_nmea["position_monotonic"] = time.monotonic()
+                    self.latest_nmea["position_valid"] = True
+                elif nmea_type == "RMC" and raw_nmea.get("status") == "V":
+                    for key in ("latitude_deg", "longitude_deg"):
+                        self.latest_nmea.pop(key, None)
+                    self.latest_nmea["position_monotonic"] = time.monotonic()
+                    self.latest_nmea["position_valid"] = False
+            parsed = self.parser(line) if self.parser is not None else {}
+            received_monotonic = time.monotonic()
+            preserve_gga = self.name == "gps" and parsed.get("nmea_type") == "GGA"
+            if (
+                min_interval
+                and not preserve_gga
+                and received_monotonic - last_saved_monotonic < min_interval
+            ):
+                self.dropped_count += 1
+                continue
+            last_saved_monotonic = received_monotonic
 
-                    received_wall_ns = time.time_ns()
-                    received_monotonic_ns = time.monotonic_ns()
-                    sample = {
-                        "sample_index": self.sample_count,
-                        "source": self.name,
-                        "device": self.device,
-                        "host_wall_time": wall_iso_from_unix_ns(received_wall_ns),
-                        "host_monotonic_ns": received_monotonic_ns,
-                        "raw": line,
-                    }
-                    sample.update(parsed)
-                    if self.name == "gps":
-                        measurement_wall_ns = parse_gps_datetime_utc_ns(sample)
-                        if measurement_wall_ns is not None:
-                            receive_latency_ns = received_wall_ns - measurement_wall_ns
-                            sample["measurement_wall_time_utc"] = datetime.fromtimestamp(
-                                measurement_wall_ns / 1_000_000_000.0,
-                                tz=timezone.utc,
-                            ).isoformat(timespec="milliseconds")
-                            sample["measurement_host_monotonic_ns"] = (
-                                received_monotonic_ns - receive_latency_ns
-                            )
-                            sample["receive_latency_ms"] = receive_latency_ns / 1_000_000.0
+            received_wall_ns = time.time_ns()
+            received_monotonic_ns = time.monotonic_ns()
+            sample = {
+                "sample_index": self.sample_count,
+                "source": self.name,
+                "device": self.device,
+                "host_wall_time": wall_iso_from_unix_ns(received_wall_ns),
+                "host_monotonic_ns": received_monotonic_ns,
+                "raw": line,
+            }
+            sample.update(parsed)
+            if self.name == "gps":
+                measurement_wall_ns = parse_gps_datetime_utc_ns(sample)
+                if measurement_wall_ns is not None:
+                    receive_latency_ns = received_wall_ns - measurement_wall_ns
+                    sample["measurement_wall_time_utc"] = datetime.fromtimestamp(
+                        measurement_wall_ns / 1_000_000_000.0,
+                        tz=timezone.utc,
+                    ).isoformat(timespec="milliseconds")
+                    sample["measurement_host_monotonic_ns"] = (
+                        received_monotonic_ns - receive_latency_ns
+                    )
+                    sample["receive_latency_ms"] = receive_latency_ns / 1_000_000.0
 
-                    self.sample_count += 1
-                    self.samples.put(sample)
-                    with self.lock:
-                        self.recent.append(sample)
-        except Exception as exc:
-            self.error = str(exc)
-            print(f"{self.name} serial disabled: {self.error}")
-        finally:
-            if self.rtk_client is not None:
-                self.rtk_client.stop()
+            self.sample_count += 1
+            self.samples.put(sample)
+            with self.lock:
+                self.recent.append(sample)
+
+    def _run(self):
+        previous_error = None
+        while not self.stop_event.is_set():
+            connection_stop_event = threading.Event()
+            self.connection_stop_event = connection_stop_event
+            try:
+                device = self._resolve_device()
+                if not device:
+                    raise RuntimeError(f"No safe {self.name} serial device was found")
+                self.device = device
+                with self._open_serial(device) as port:
+                    self.started = True
+                    self.error = None
+                    previous_error = None
+                    print(f"{self.name} serial connected: {device}")
+                    self._read_connection(port, connection_stop_event)
+            except Exception as exc:
+                self.error = str(exc)
+                if not self.stop_event.is_set() and self.error != previous_error:
+                    print(f"{self.name} serial reconnecting after error: {self.error}")
+                previous_error = self.error
+            finally:
+                self.started = False
+                connection_stop_event.set()
+                if self.rtk_client is not None:
+                    self.rtk_client.stop()
+                    self.rtk_client.connected = False
+                self.connection_stop_event = None
+            if not self.stop_event.is_set():
+                self.stop_event.wait(self.reconnect_delay_s)
 
     def drain(self):
         drained = []
@@ -1704,11 +2334,17 @@ def build_rtk_config(args):
         "data_timeout": getattr(args, "rtk_ntrip_data_timeout_s", 15.0),
         "sourcetable_timeout": getattr(args, "rtk_ntrip_sourcetable_timeout_s", 5.0),
         "max_mountpoints": getattr(args, "rtk_ntrip_max_mountpoints", 12),
+        "reselect_interval": getattr(args, "rtk_ntrip_reselect_interval_s", 300.0),
+        "switch_min_improvement_m": getattr(args, "rtk_ntrip_switch_min_improvement_m", 1000.0),
+        "position_max_age": getattr(args, "rtk_ntrip_position_max_age_s", 30.0),
     }
 
 
 def create_serial_readers(args):
     readers = {}
+    gps_selector = getattr(args, "gps_device", "auto")
+    external_imu_selector = getattr(args, "external_imu_device", "auto")
+    resolve_serial_devices(args)
     gps_max_hz, external_imu_max_hz = serial_max_hz_values(args)
     if args.enable_gps:
         readers["gps"] = SerialRateLimitedReader(
@@ -1718,28 +2354,48 @@ def create_serial_readers(args):
             gps_max_hz,
             parser=NmeaParserState(),
             rtk_config=build_rtk_config(args),
+            device_resolver=lambda: resolve_serial_device(gps_selector, "gps"),
         )
     if args.enable_external_imu:
         parser = parse_ebimu_line if args.external_imu_format == "ebimu" else None
+
+        def resolve_external_imu():
+            gps_reader = readers.get("gps")
+            excluded = [gps_reader.device] if gps_reader is not None else []
+            return resolve_serial_device(
+                external_imu_selector,
+                "external_imu",
+                exclude_devices=excluded,
+            )
+
         readers["external_imu"] = SerialRateLimitedReader(
             "external_imu",
             args.external_imu_device,
             args.external_imu_baudrate,
             external_imu_max_hz,
             parser=parser,
+            device_resolver=resolve_external_imu,
         )
     return readers
 
 
 def start_serial_readers(readers):
     for reader in readers.values():
-        print(f"Starting {reader.name} serial: {reader.device} @ {reader.baudrate}, max {reader.max_hz:g} Hz")
+        device = reader.device or "<unresolved>"
+        print(f"Starting {reader.name} serial: {device} @ {reader.baudrate}, max {reader.max_hz:g} Hz")
         reader.start()
 
 
 def stop_serial_readers(readers):
+    first_error = None
     for reader in readers.values():
-        reader.stop()
+        try:
+            reader.stop()
+        except Exception as error:
+            if first_error is None:
+                first_error = error
+    if first_error is not None:
+        raise first_error
 
 
 def usb_speed_name(device):
@@ -1808,6 +2464,48 @@ def create_mjpeg_output(pipeline, input_output, fps, quality):
     encoder.setQuality(quality)
     input_output.link(encoder.input)
     return encoder.bitstream
+
+
+def configure_monitor_pipeline(pipeline, args):
+    """Build the low-bandwidth RGB + OAK IMU pipeline used by --monitor-only."""
+    require_depthai_v3()
+    args.rgb_undistort = True
+    args.rgb_undistort_effective = True
+
+    device = pipeline.getDefaultDevice()
+    set_device_identity_metadata(device, args)
+    try:
+        args.depthai_platform = enum_name(device.getPlatform())
+    except Exception:
+        args.depthai_platform = "unknown"
+    rgb_size = resolve_rgb_output_size(device, args)
+    color_socket = getattr(args, "rgb_socket", dai.CameraBoardSocket.CAM_A)
+
+    camera = pipeline.create(dai.node.Camera).build(color_socket)
+    rgb_output = request_camera_output(
+        camera,
+        args.fps,
+        size=rgb_size,
+        frame_type=dai.ImgFrame.Type.NV12,
+        enable_undistortion=True,
+    )
+    imu = pipeline.create(dai.node.IMU)
+    imu.enableIMUSensor(
+        [dai.IMUSensor.ACCELEROMETER_RAW, dai.IMUSensor.GYROSCOPE_RAW],
+        args.imu_rate,
+    )
+    imu.setBatchReportThreshold(1)
+    imu.setMaxBatchReports(args.imu_batch)
+
+    if args.rgb_transport_effective == "mjpeg":
+        rgb_output = create_mjpeg_output(
+            pipeline, rgb_output, args.fps, args.rgb_transport_quality
+        )
+    print(
+        f"Monitor-only camera pipeline: rgb={rgb_size[0]}x{rgb_size[1]} "
+        f"@ {float(args.fps):g} FPS, depth=disabled, imu={int(args.imu_rate)} Hz"
+    )
+    return {"mode": "monitor", "rgb": rgb_output, "imu": imu.out}
 
 
 def configure_pipeline(pipeline, args, sync_imu=True):

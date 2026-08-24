@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from types import SimpleNamespace
 
+from geonova_depthai.capture import raw_writer
 from geonova_depthai.capture.raw_writer import RawEventDataset
 
 
@@ -70,3 +72,30 @@ def test_raw_metadata_records_versions_and_stereo_config(tmp_path) -> None:
         "width": 1280,
         "height": 800,
     }
+
+
+def test_dataset_roots_are_unique_when_wall_clock_is_identical(
+    tmp_path, monkeypatch
+) -> None:
+    fixed_wall_time = datetime(2026, 8, 24, 15, 30, 45, 123456)
+
+    class FrozenDateTime:
+        @classmethod
+        def now(cls):
+            return fixed_wall_time
+
+    monkeypatch.setattr(raw_writer, "datetime", FrozenDateTime)
+    first = RawEventDataset(tmp_path, recorder_args())
+    first_root = first.root
+    first.close()
+    marker = first_root / "first-dataset-marker"
+    marker.write_text("preserve", encoding="utf-8")
+
+    second = RawEventDataset(tmp_path, recorder_args())
+    try:
+        assert first_root != second.root
+        assert first_root.name == "2026-08-24-15-30-45_raw"
+        assert second.root.name == "2026-08-24-15-30-46_raw"
+        assert marker.read_text(encoding="utf-8") == "preserve"
+    finally:
+        second.close()

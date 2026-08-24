@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=SafeDefaultsHelpFormatter
     )
-    parser.add_argument("--gps-device", default=d["gps_device"], help="GPS serial path or Windows COM port")
+    parser.add_argument("--gps-device", default=d["gps_device"], help="GPS serial path, Windows COM port, or auto")
     parser.add_argument("--gps-baudrate", type=int, default=d["gps_baudrate"], help="GPS serial baud rate")
     parser.add_argument("--duration-s", type=float, default=30.0, help="Test duration in seconds")
     parser.add_argument("--no-ntrip", action="store_true", help="Read GPS without opening the NTRIP correction stream")
@@ -63,6 +63,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rtk-ntrip-data-timeout-s", type=nonnegative_float, default=d["rtk_ntrip_data_timeout_s"], help="Seconds without RTCM data before switching mountpoints")
     parser.add_argument("--rtk-ntrip-sourcetable-timeout-s", type=nonnegative_float, default=d["rtk_ntrip_sourcetable_timeout_s"], help="Seconds before giving up on source table")
     parser.add_argument("--rtk-ntrip-max-mountpoints", type=int, default=d["rtk_ntrip_max_mountpoints"], help="Maximum auto-selected mountpoints per reconnect cycle")
+    parser.add_argument("--rtk-ntrip-reselect-interval-s", type=nonnegative_float, default=d["rtk_ntrip_reselect_interval_s"], help="Seconds between nearest-mountpoint checks; 0 disables")
+    parser.add_argument("--rtk-ntrip-switch-min-improvement-m", type=nonnegative_float, default=d["rtk_ntrip_switch_min_improvement_m"], help="Minimum distance reduction before switching mountpoints")
+    parser.add_argument("--rtk-ntrip-position-max-age-s", type=nonnegative_float, default=d["rtk_ntrip_position_max_age_s"], help="Maximum live GNSS position age used for switching; 0 disables")
     parser.add_argument("--rtk-initial-latitude-deg", type=float, default=d["rtk_initial_latitude_deg"], help="Fallback latitude before a GPS fix")
     parser.add_argument("--rtk-initial-longitude-deg", type=float, default=d["rtk_initial_longitude_deg"], help="Fallback longitude before a GPS fix")
     parser.add_argument("--rtk-initial-altitude-m", type=float, default=d["rtk_initial_altitude_m"], help="Fallback altitude in meters")
@@ -77,6 +80,9 @@ def main() -> None:
     if args.no_ntrip:
         values["rtk_ntrip_host"] = ""
     config = SimpleNamespace(**values)
+    config.gps_device = runtime.resolve_serial_device(config.gps_device, "gps")
+    if not config.gps_device:
+        raise RuntimeError("No safe GNSS serial device was found")
     reader = runtime.SerialRateLimitedReader(
         "gps",
         config.gps_device,

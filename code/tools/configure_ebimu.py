@@ -7,9 +7,17 @@ import argparse
 import math
 import sys
 import time
+from pathlib import Path
 from typing import Iterable
 
 import serial
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from geonova_depthai.capture.defaults import DEFAULTS  # noqa: E402
+from geonova_depthai.serial_devices import resolve_serial_device  # noqa: E402
 
 
 BAUD_COMMANDS = {
@@ -28,7 +36,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Configure EBIMU-9DOFV5 for synced camera/GPS recording."
     )
-    parser.add_argument("--port", default="/dev/ttyUSB0", help="Serial device path.")
+    parser.add_argument(
+        "--port",
+        default=DEFAULTS["external_imu_device"],
+        help="Serial device path, COM port, or auto for stable /dev/serial/by-id discovery.",
+    )
     parser.add_argument(
         "--baudrate",
         type=int,
@@ -318,7 +330,7 @@ def run_guided_calibration(ser: serial.Serial, args: argparse.Namespace) -> None
     print()
     print("보정이 완료되었습니다. 스트리밍을 멈추고 종료합니다.")
     send_command(ser, "<stop>", timeout=2.0)
-    print("Done. 다음 녹화 전에는 `python configure_ebimu.py --port /dev/ttyUSB0`로 출력 확인을 할 수 있습니다.")
+    print("Done. 다음 녹화 전에는 `python configure_ebimu.py --port auto`로 출력 확인을 할 수 있습니다.")
 
 
 def verify_output_lines(ser: serial.Serial, count: int, timeout: float) -> None:
@@ -356,6 +368,10 @@ def verify_output_lines(ser: serial.Serial, count: int, timeout: float) -> None:
 
 def main() -> int:
     args = parse_args()
+    if not args.dry_run:
+        args.port = resolve_serial_device(args.port, "external_imu")
+        if not args.port:
+            raise RuntimeError("No safe external IMU serial device was found")
     commands = recommended_commands(args)
     print_plan(args, commands)
 

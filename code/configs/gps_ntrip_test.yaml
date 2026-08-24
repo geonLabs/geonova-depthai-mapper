@@ -1,5 +1,5 @@
 # GPS NMEA 수신과 NTRIP/RTCM 보정 링크를 카메라 없이 검사하는 설정입니다.
-gps_device: /dev/ttyACM0  # Linux GPS 포트. Windows에서는 예: COM3으로 변경
+gps_device: auto          # Linux에서는 u-blox /dev/serial/by-id를 선택. Windows에서는 예: COM3
 gps_baudrate: 921600      # GPS 수신기 직렬 통신 속도
 duration_s: 30.0          # 테스트를 수행할 시간(초)
 no_ntrip: false           # true이면 NTRIP 연결 없이 GPS NMEA 수신만 검사
@@ -10,5 +10,8 @@ rtk_ntrip_mountpoint_candidates: "GANS-RTCM31,GUMC-RTCM31,DBON-RTCM31,PAJU-RTCM3
 rtk_ntrip_position_wait_s: 10.0 # 처음 연결 전 GPS 위치를 기다리는 시간
 rtk_ntrip_data_timeout_s: 15.0  # RTCM 데이터가 이 시간 동안 없으면 다음 기준국으로 전환
 rtk_ntrip_max_mountpoints: 12
+rtk_ntrip_reselect_interval_s: 300.0       # 이동 중 5분마다 가장 가까운 기준국을 다시 확인
+rtk_ntrip_switch_min_improvement_m: 1000.0 # 현재 기준국보다 최소 1km 가까울 때만 전환
+rtk_ntrip_position_max_age_s: 30.0         # 30초 넘게 갱신되지 않은 좌표로는 전환하지 않음
 # rtk_ntrip_host/port/mountpoint/username/password를 비공개 YAML에 추가할 수 있습니다.
 # 비밀번호가 포함된 YAML은 Git에 커밋하지 마세요.

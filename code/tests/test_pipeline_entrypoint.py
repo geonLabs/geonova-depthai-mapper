@@ -81,3 +81,7 @@ def test_root_config_is_a_valid_capture_config() -> None:
     assert args.output_dir == "results"
     assert args.controller_bridge_dir == "results/controller-bridge"
     assert args.max_runtime_s == 0.0
+    assert args.monitor_only is False
+    assert args.allow_usb2 is False
+    assert args.fps == 30.0
+    assert args.depth_fps == 30.0

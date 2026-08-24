@@ -144,13 +144,33 @@ Charuco board는 화면 전체에 띄우고 실제 square size를 cm 단위로 �
 python synced_image_recorder.py --config configs/capture.yaml
 ```
 
+데이터셋 저장 없이 Jetson Controller용 상태와 프리뷰만 게시하려면 다음처럼
+실행합니다.
+
+```bash
+python synced_image_recorder.py --config configs/capture.yaml --monitor-only
+```
+
+`--monitor-only`는 연결된 컬러 센서에서 지원하는 최대 캡처 RGB 크기
+(`1920x1200`/`1920x1080`/`1280x720` 후보 중 센서 비율에 맞는 크기)를 선택하고
+최대 5 FPS로 제한합니다. depth/confidence 저장 파이프라인을 만들지 않으며,
+USB2 급 연결에서는 MJPEG 장치 전송을 사용해 원본 raw frame의 대역폭 급증을
+막습니다. RGB 프리뷰, OAK IMU,
+GNSS/NTRIP, 외부 IMU 상태는 종료 신호를 받을 때까지 계속 게시됩니다. 이 모드에서는
+타임스탬프 데이터셋 디렉터리가 생성되지 않습니다.
+
+Linux 직렬 장치 기본값 `auto`는 `/dev/serial/by-id`의 u-blox GNSS 및 EBIMU
+USB-UART ID를 사용합니다. `ttyACM0` 같은 번호 포트는 Android 휴대폰이 먼저 차지할
+수 있으므로 GNSS로 자동 선택하지 않습니다. 필요한 경우 `--gps-device`와
+`--external-imu-device`에 명시적인 안정 경로 또는 Windows COM 포트를 지정합니다.
+
 ### Jetson Controller 앱 연동
 
 수집 프로세스는 기본적으로 `/var/lib/jetson-sensors`에 앱 연동용 최신 상태를
 게시합니다.
 
 - `status.json`: 카메라·GNSS·IMU heartbeat, GNSS fix quality, NTRIP 상태와 위치
-- `camera-preview.jpg`: 최대 4 Hz, 1280 px 폭의 최신 RGB 프리뷰
+- `camera-preview.jpg`: 최대 4 Hz, 1920 px 폭의 최신 RGB 프리뷰
 
 파일은 같은 디렉터리에서 원자적으로 교체되므로 Jetson Control API가 기록 중인
 파일을 읽지 않습니다. `controller_sensor_stale_after_s` 동안 새 샘플이 없으면 해당
@@ -249,6 +269,22 @@ NTRIP 값은 CLI 또는 `NTRIP_HOST`, `NTRIP_PORT`, `NTRIP_MOUNTPOINT`,
 못하거나 GPS 위치가 아직 없으면 서울/경기권 fallback 후보
 `GANS-RTCM31,GUMC-RTCM31,DBON-RTCM31,PAJU-RTCM31,...` 순서로 시도하며,
 연결 또는 RTCM 데이터 수신 timeout이 나면 다음 기준국으로 넘어갑니다.
+
+이동 수집 중에는 `rtk_ntrip_reselect_interval_s` 주기로 현재 GNSS 위치에서
+기준국 거리를 다시 계산합니다. 기본값 `300`은 5분이며 `0`이면 주기 전환을
+비활성화합니다. 새 기준국이 `rtk_ntrip_switch_min_improvement_m`(기본 1000m)
+이상 가까울 때만 후보로 사용해 경계 지역에서 기준국이 왕복 전환되는 것을
+줄입니다. 유효한 최신 GGA 위치만 사용하며, 위치가
+`rtk_ntrip_position_max_age_s`(기본 30초)보다 오래됐거나 fix가 유효하지 않으면
+전환을 건너뜁니다. 캐시된 source table의 거리를 다시 계산하고 후보 연결은 기존
+RTCM 스트림과 별도로 수행하며, 새 연결에서 CRC가 유효한 완전한 RTCM3 프레임을
+최소 두 개 받은 뒤 해당 데이터를 GNSS에
+전달하고 기존 연결을 닫습니다. 후보 인증·연결·데이터 검증이 실패하면 기존
+연결을 그대로 유지합니다.
+
+이 방식은 의도적인 RTCM 전송 공백을 만들지 않지만, NTRIP 계정의 동시 접속을
+caster가 제한하면 전환 후보는 거부될 수 있습니다. 또한 기준국 자체가 바뀌면
+GNSS 수신기가 정수 모호성을 다시 계산하면서 RTK FIX가 잠시 FLOAT가 될 수 있습니다.
 
 ## 3. 데이터 동기화
 

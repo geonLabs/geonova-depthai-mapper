@@ -1428,7 +1428,7 @@ INDEX_HTML = r"""<!doctype html>
 <body>
   <div class="app">
     <header class="topbar">
-      <input id="pathInput" class="pathInput" placeholder="dataset folder path, e.g. ../data/2026-06-17_11-27-13_raw" />
+      <input id="pathInput" class="pathInput" placeholder="dataset folder path, e.g. /data/collections/2026-06-17-11-27-13_raw" />
       <button id="latestBtn" title="Open latest dataset under this path">Latest</button>
       <button id="openBtn" title="Open dataset">Open</button>
       <select id="depthMaxSelect" title="Depth color range">
