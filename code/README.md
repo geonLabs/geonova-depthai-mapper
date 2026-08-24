@@ -39,52 +39,41 @@ CSV + Point/Polyline SHP + QA
 
 ## 설치
 
-Python 3.11을 권장합니다. 설치기는 `uv`를 준비하고 `nvcc --version` 결과에
-따라 PyTorch 2.7.1의 CPU/CUDA 빌드를 자동 선택합니다.
+저장소 루트의 설치 진입점 하나로 플랫폼을 자동 판별합니다. 부트스트랩용 Python
+3.8 이상만 있으면 `uv`와 실제 프로젝트 환경은 설치기가 준비합니다.
 
-저장소 루트에서는 Linux/macOS의 `./install.sh`, Windows PowerShell의
-`.\install.ps1` 한 명령으로 아래 설치기를 실행할 수 있습니다. 부트스트랩에는
-Python 3.8 이상만 있으면 되고, 프로젝트용 Python 3.11은 `uv`가 준비합니다.
+### Jetson / Ubuntu PC
+
+```bash
+chmod +x install.sh
+./install.sh --dev
+. .venv/bin/activate
+```
 
 ### Windows PowerShell
 
 ```powershell
-.\scripts\setup_env.ps1 --config configs\setup.yaml
+.\install.ps1 --dev
 .\.venv\Scripts\Activate.ps1
 ```
 
-### Linux
+| 환경 | Python | PyTorch | 요구사항 파일 |
+|---|---|---|---|
+| Jetson | JetPack 시스템 Python | NVIDIA CUDA 빌드 재사용 또는 NVIDIA wheel 탐색 | `requirements-jetson.txt` |
+| Ubuntu PC | uv Python 3.11 | 공식 CUDA/CPU wheel 자동 선택 | `requirements.txt` |
+| Windows PC | uv Python 3.11 | 공식 CUDA/CPU wheel 자동 선택 | `requirements.txt` |
 
-```bash
-chmod +x scripts/setup_env.sh
-./scripts/setup_env.sh --config configs/setup.yaml
-. .venv/bin/activate
-```
+Jetson에서는 `/etc/nv_tegra_release`로 L4T를 감지합니다. 일반 PC용 PyTorch wheel로
+NVIDIA 빌드를 덮어쓰지 않으며, PyTorch 버전에 맞는 torchvision을 자동 구성합니다.
+Jetson 첫 설치의 torchvision 소스 빌드는 몇 분 걸릴 수 있습니다.
 
-`configs/setup.yaml`에서 `dev: true`로 바꾸면 `pytest`도 설치합니다. 기존
-`.venv`를 그대로 쓰는데 테스트 패키지만 빠져 있다면 아래처럼 보충합니다.
+기존 환경을 보존한 채 누락 패키지만 맞추는 것이 기본입니다. 완전 재생성은 명시적으로
+요청할 때만 `./install.sh --recreate --dev` 또는
+`.\install.ps1 --recreate --dev`를 사용합니다.
 
-```bash
-python -m pip install pytest
-```
-
-Python 3.11 환경은 `requirements.txt`의 고정 버전을 그대로 따릅니다. 오래된
-Python 3.8 `.venv`에서 회귀 테스트만 돌릴 때 `pyproj==3.7.2` wheel이 없으면
-3.8 호환 버전인 `pyproj==3.5.0`을 사용할 수 있습니다.
-
-```bash
-python -m pip install pyproj==3.5.0
-```
-
-자동 선택 대신 PyTorch 빌드를 지정하려면 YAML의 `cuda`를 바꾸거나 CLI로 한
-값만 덮어씁니다.
-
-```bash
-python setup_env.py --config configs/setup.yaml --cuda cu118
-```
-
-YAML에 없는 값은 기존 코드 기본값을 그대로 사용하며, 명시한 CLI 옵션은 YAML보다
-우선합니다.
+데스크톱 PyTorch 빌드를 직접 고르려면 `--cuda cpu|cu118|cu126|cu128`, Jetson에
+별도 NVIDIA wheel을 지정하려면 `--jetson-torch <wheel-or-url>`을 사용합니다.
+YAML에 없는 값은 기본값을 사용하며 CLI 옵션이 `configs/setup.yaml`보다 우선합니다.
 
 ## 1. 센서 연결 검증
 

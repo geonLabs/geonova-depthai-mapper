@@ -1,5 +1,5 @@
-# depthai==3.1.0 is installed by setup_env.py. Some multi-Python wheels have
-# strict RECORD metadata that uv rejects, so the installer has a pip fallback.
+# Desktop requirements. PyTorch and depthai are installed by setup_env.py so
+# platform-specific package indexes and the DepthAI metadata fallback are applied.
 numpy>=2,<3
 opencv-python==4.13.0.92
 pyproj==3.7.2
