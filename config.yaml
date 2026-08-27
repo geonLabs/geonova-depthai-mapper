@@ -36,7 +36,6 @@ rtk_ntrip_max_mountpoints: 12
 rtk_ntrip_reselect_interval_s: 300.0       # 5분마다 현재 위치 기준으로 더 가까운 기준국 확인
 rtk_ntrip_switch_min_improvement_m: 1000.0 # 최소 1km 이상 가까워질 때만 무중단 전환
 rtk_ntrip_position_max_age_s: 30.0         # 30초 넘게 갱신되지 않은 좌표로는 기준국을 전환하지 않음
-rtk_ntrip_username: "pjmsm0319@gmail.com"
-rtk_ntrip_password: "gnss"
+# NTRIP_USERNAME과 NTRIP_PASSWORD는 공유 YAML이 아니라 Controller 보호 환경변수로 주입합니다.
 enable_external_imu: true
 external_imu_device: auto     # EBIMU USB-UART /dev/serial/by-id identity를 자동 선택

@@ -1,0 +1,41 @@
+# Bag input can be a single .bag file, a folder, or a list mixing both.
+# Relative paths are resolved from this config.yaml location.
+bags:
+  paths:
+    - .
+  recursive: false
+
+topics:
+  lidar: /lidar0/velodyne_points
+  camera: /roof_clpe_ros/roof_cam_1/image_raw
+
+output:
+  root_dir: ./extracted
+  group_by_bag: true
+  pcd_dir: pcd
+  image_dir: images
+
+extract:
+  # Keep the first run light. Set save_all: true to export every matched pair.
+  save_all: false
+  max_pairs: 1
+  every_lidar: 1
+
+  # Use "bag" for faster indexing, or "header" to use each ROS message header stamp.
+  timestamp_source: bag
+  timezone: Asia/Seoul
+
+  # Nearest camera image is matched to each lidar frame.
+  # Set null to always use the nearest image regardless of time gap.
+  match_tolerance_ms: 100
+  require_camera_match: true
+
+pcd:
+  # null exports all fields in PointCloud2. Example: [x, y, z, intensity]
+  fields: null
+  drop_nan: false
+
+image:
+  # png or jpg
+  format: jpg
+  jpeg_quality: 80
