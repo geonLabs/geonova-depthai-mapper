@@ -32,6 +32,12 @@ ui_debug_sample/
 alignment_meta_sample/
 test_output/
 
+# LiDAR/ROS source data and generated point clouds
+*.bag
+*.pcd
+tools/lidar/extracted/
+tools/lidar/overlay-output/
+
 # Training artifacts. The existing small field checkpoint is tracked under
 # model/n_model; downloaded seed models, 100 MiB+ X model, and runs stay local.
 model/runs/
