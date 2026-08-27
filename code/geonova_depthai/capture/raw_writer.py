@@ -236,6 +236,11 @@ class RawEventDataset:
                 "types": list(getattr(args, "rgb_sensor_types", []) or []),
                 "resolution_source": getattr(args, "rgb_resolution_source", "unknown"),
             },
+            "rgb_camera_output_size": {
+                "width": int(getattr(args, "rgb_camera_width", width) or width),
+                "height": int(getattr(args, "rgb_camera_height", height) or height),
+                "source": getattr(args, "rgb_camera_resolution_source", "requested"),
+            },
             "stereo_sensors": {
                 "left": dict(getattr(args, "left_sensor", {}) or {}),
                 "right": dict(getattr(args, "right_sensor", {}) or {}),

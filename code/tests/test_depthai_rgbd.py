@@ -46,6 +46,8 @@ def recorder_args(args: argparse.Namespace) -> SimpleNamespace:
     values = dict(DEFAULTS)
     values.update(
         fps=args.fps,
+        rgb_width=1920,
+        rgb_height=1200,
         depth_alignment_mode="auto",
         rgb_undistort=True,
         sync_mode="device",

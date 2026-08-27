@@ -83,5 +83,6 @@ def test_root_config_is_a_valid_capture_config() -> None:
     assert args.max_runtime_s == 0.0
     assert args.monitor_only is False
     assert args.allow_usb2 is False
-    assert args.fps == 30.0
-    assert args.depth_fps == 30.0
+    assert args.fps == 15.0
+    assert args.depth_fps == 15.0
+    assert (args.rgb_width, args.rgb_height) == (1920, 1200)

@@ -146,9 +146,10 @@ def test_monitor_only_defaults_use_full_preview_geometry_with_bounded_bandwidth(
     assert args.controller_bridge_enabled is True
     assert args.allow_usb2 is True
     assert args.save_confidence_map is False
-    assert args.fps == 5.0
+    assert args.fps == 15.0
     assert (args.rgb_width, args.rgb_height) == (0, 0)
     assert args.controller_preview_max_width == 1920
+    assert args.controller_preview_fps == 15.0
     assert args.imu_rate == 100
 
 

@@ -509,6 +509,70 @@ def resolve_rgb_output_size(device, args, color_socket=None):
     return width, height
 
 
+def resolve_rgb_camera_output_size(args, requested_size):
+    """Choose the physical camera output used before optional RGB upscaling.
+
+    Some OAK-D Pro W units use an OV9782 color sensor whose maximum output is
+    1280x800.  A 1920x1200 request has the same 16:10 geometry but cannot be
+    produced directly by that sensor.  Capture the full sensor output in that
+    case; configure_pipeline() scales this undistorted RGB frame before using it
+    as StereoDepth.inputAlignTo, so RGB and aligned depth retain identical pixel
+    coordinates at the requested saved size.
+    """
+    requested_width, requested_height = (int(value) for value in requested_size)
+    sensor_width = int(getattr(args, "rgb_sensor_width", 0) or 0)
+    sensor_height = int(getattr(args, "rgb_sensor_height", 0) or 0)
+    camera_width, camera_height = requested_width, requested_height
+    source = "requested"
+    if (
+        sensor_width > 0
+        and sensor_height > 0
+        and (requested_width > sensor_width or requested_height > sensor_height)
+    ):
+        requested_aspect = requested_width / requested_height
+        sensor_aspect = sensor_width / sensor_height
+        if abs(requested_aspect - sensor_aspect) > 1e-6:
+            raise RuntimeError(
+                f"Requested RGB size {requested_width}x{requested_height} exceeds "
+                f"the {sensor_width}x{sensor_height} color sensor and has a different "
+                "aspect ratio; refusing a geometry-changing resize."
+            )
+        camera_width, camera_height = sensor_width, sensor_height
+        source = "sensor_max_then_uniform_upscale"
+
+    args.rgb_camera_width = camera_width
+    args.rgb_camera_height = camera_height
+    args.rgb_camera_resolution_source = source
+    return camera_width, camera_height
+
+
+def resize_camera_output(pipeline, camera_output, source_size, target_size):
+    """Uniformly resize an undistorted camera frame on-device when required."""
+    if tuple(source_size) == tuple(target_size):
+        return camera_output
+    source_width, source_height = source_size
+    target_width, target_height = target_size
+    if source_width * target_height != target_width * source_height:
+        raise RuntimeError(
+            f"RGB resize must preserve geometry: {source_width}x{source_height} -> "
+            f"{target_width}x{target_height}"
+        )
+    resize = pipeline.create(dai.node.ImageManip)
+    resize.initialConfig.setOutputSize(
+        target_width,
+        target_height,
+        dai.ImageManipConfig.ResizeMode.STRETCH,
+    )
+    resize.initialConfig.setFrameType(dai.ImgFrame.Type.NV12)
+    resize.setMaxOutputFrameSize(target_width * target_height * 3 // 2)
+    camera_output.link(resize.inputImage)
+    print(
+        f"RGB on-device uniform upscale: {source_width}x{source_height} -> "
+        f"{target_width}x{target_height}"
+    )
+    return resize.out
+
+
 def request_camera_output(camera, fps, size=(WIDTH, HEIGHT), frame_type=None, enable_undistortion=False):
     """Request a DepthAI v3 camera output with explicit undistortion control.
 
@@ -2520,6 +2584,7 @@ def configure_pipeline(pipeline, args, sync_imu=True):
     set_device_identity_metadata(device, args)
     platform = device.getPlatform()
     rgb_size = resolve_rgb_output_size(device, args)
+    rgb_camera_size = resolve_rgb_camera_output_size(args, rgb_size)
     depth_fps = resolve_depth_fps(args)
     requested_alignment = args.depth_alignment_mode
     if requested_alignment == "auto":
@@ -2569,12 +2634,18 @@ def configure_pipeline(pipeline, args, sync_imu=True):
     imu = pipeline.create(dai.node.IMU)
     sync = pipeline.create(dai.node.Sync) if args.sync_mode == "device" else None
 
-    rgb_output = request_camera_output(
+    rgb_camera_output = request_camera_output(
         cam_rgb,
         args.fps,
-        size=rgb_size,
+        size=rgb_camera_size,
         frame_type=dai.ImgFrame.Type.NV12,
         enable_undistortion=True,
+    )
+    rgb_output = resize_camera_output(
+        pipeline,
+        rgb_camera_output,
+        rgb_camera_size,
+        rgb_size,
     )
     left_output = request_camera_output(mono_left, depth_fps, size=mono_size, frame_type=dai.ImgFrame.Type.GRAY8)
     right_output = request_camera_output(mono_right, depth_fps, size=mono_size, frame_type=dai.ImgFrame.Type.GRAY8)

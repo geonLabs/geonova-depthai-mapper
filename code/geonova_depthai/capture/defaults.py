@@ -29,10 +29,10 @@ DEFAULTS = {
     "controller_bridge_dir": "/var/lib/jetson-sensors",
     "controller_status_interval_s": 1.0,
     "controller_sensor_stale_after_s": 3.0,
-    "controller_preview_fps": 4.0,
+    "controller_preview_fps": 15.0,
     # The largest RGB geometry produced by the capture pipeline is 1920 px.
     # Keeping that width preserves sensor detail in the Controller preview;
-    # JPEG encoding and the bounded preview cadence limit network bandwidth.
+    # JPEG encoding runs off the capture thread and keeps only the latest frame.
     "controller_preview_max_width": 1920,
     "controller_preview_jpeg_quality": 78,
     "rgb_format": "jpg",

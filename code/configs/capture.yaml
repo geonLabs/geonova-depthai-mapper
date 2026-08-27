@@ -1,17 +1,17 @@
 # RGB-D/GPS/IMU 원시 이벤트 수집 설정입니다.
 # 없는 장치 포트와 NTRIP 값은 코드 기본값 또는 NTRIP_* 환경변수를 사용합니다.
 output_dir: ../data            # 타임스탬프별 *_raw 폴더가 만들어질 저장소 루트 데이터 폴더
-fps: 30.0                      # 요청 RGB-D 프레임률(Hz). USB 대역폭/저장 속도를 고려
-depth_fps: 30                  # 0이면 RGB fps와 동일. RGB 정렬 Depth 저장 cadence는 RGB fps에 제한될 수 있음
-rgb_width: 0                   # 0이면 컬러 센서를 보고 1920x1200/1920x1080/1280x720 중 자동 선택
-rgb_height: 0                  # 0이면 컬러 센서를 보고 자동 선택
+fps: 15.0                      # 1920x1200 RGB-D 저장 실측에서 안정적으로 유지되는 프레임률
+depth_fps: 15                  # RGB와 같은 cadence로 요청해 인접 프레임 오매칭을 방지
+rgb_width: 1920                # OAK-D Pro W RGB 및 RGB 정렬 Depth 저장 폭
+rgb_height: 1200               # 저장 RGB와 aligned Depth가 동일한 픽셀 geometry 사용
 max_runtime_s: 0               # 최대 수집 시간(초). 0이면 Ctrl-C까지 계속 수집
 monitor_only: false            # true면 데이터셋 없이 저대역폭 센서 상태/프리뷰만 계속 게시
 controller_bridge_enabled: true # 앱용 센서 상태 JSON과 카메라 프리뷰 생성
 controller_bridge_dir: /var/lib/jetson-sensors
 controller_status_interval_s: 1.0
 controller_sensor_stale_after_s: 3.0
-controller_preview_fps: 4.0
+controller_preview_fps: 15.0
 controller_preview_max_width: 1920
 controller_preview_jpeg_quality: 78
 depth_alignment_mode: auto     # auto 권장: RVC2/3=StereoDepth, RVC4=ImageAlign

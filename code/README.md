@@ -170,7 +170,7 @@ USB-UART ID를 사용합니다. `ttyACM0` 같은 번호 포트는 Android 휴대
 게시합니다.
 
 - `status.json`: 카메라·GNSS·IMU heartbeat, GNSS fix quality, NTRIP 상태와 위치
-- `camera-preview.jpg`: 최대 4 Hz, 1920 px 폭의 최신 RGB 프리뷰
+- `camera-preview.jpg`: 최대 15 Hz, 1920 px 폭의 최신 RGB 프리뷰
 
 파일은 같은 디렉터리에서 원자적으로 교체되므로 Jetson Control API가 기록 중인
 파일을 읽지 않습니다. `controller_sensor_stale_after_s` 동안 새 샘플이 없으면 해당
@@ -186,6 +186,12 @@ systemd로 실행할 때 파이프라인 사용자에게 `/var/lib/jetson-sensor
 Windows PowerShell에서는 `\` 대신 백틱을 사용하거나 한 줄로 실행합니다.
 
 기본 RGB-D 정렬은 `--depth-alignment-mode auto`입니다.
+
+현재 OAK-D Pro W 수집 프로필은 RGB와 aligned Depth를 `1920x1200 @ 15 FPS`로
+저장합니다. 연결된 장치가 `OV9782 1280x800` RGB 센서인 경우에는 factory
+undistort된 full-sensor RGB를 같은 16:10 비율로 장치에서 균일 확대하고, 그
+`1920x1200` 출력을 `StereoDepth.inputAlignTo`에 연결합니다. 따라서 저장 RGB와
+Depth의 픽셀 좌표는 같지만 실제 광학 디테일은 1280x800 센서 수준입니다.
 
 - RGB 해상도: `rgb_width: 0`, `rgb_height: 0`이면 연결된 컬러 센서의
   `getConnectedCameraFeatures()` 결과를 보고 자동 선택

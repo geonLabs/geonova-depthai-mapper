@@ -72,7 +72,7 @@ class ControllerBridge:
             0.5, float(getattr(args, "controller_sensor_stale_after_s", 3.0))
         )
         self.preview_fps = max(
-            0.0, float(getattr(args, "controller_preview_fps", 4.0))
+            0.0, float(getattr(args, "controller_preview_fps", 15.0))
         )
         self.preview_max_width = max(
             320, int(getattr(args, "controller_preview_max_width", 1920))

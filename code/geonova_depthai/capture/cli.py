@@ -170,14 +170,13 @@ def apply_monitor_only_defaults(args):
         return args
 
     # Monitor mode never persists RGB-D data.  Resolve the same maximum supported
-    # RGB output geometry as capture so the Controller sensor preview does not
-    # discard camera detail.  FPS remains bounded and constrained USB links use
-    # the existing MJPEG transport, so the larger frame does not turn into a raw
-    # USB2 bandwidth spike.
+    # RGB output geometry and cadence match capture so the Controller preview is
+    # genuinely live. Monitor mode has no depth stream, and constrained USB links
+    # keep using MJPEG transport, so this remains bounded on USB2.
     args.controller_bridge_enabled = True
     args.allow_usb2 = True
     args.save_confidence_map = False
-    args.fps = min(max(float(args.fps), 1.0), 5.0)
+    args.fps = min(max(float(args.fps), 1.0), 15.0)
     args.depth_fps = 0.0
     args.rgb_width = 0
     args.rgb_height = 0

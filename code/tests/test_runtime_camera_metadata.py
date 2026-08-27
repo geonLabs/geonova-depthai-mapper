@@ -126,3 +126,23 @@ def test_ov9282_stereo_sensor_prefers_full_800p_height():
 
     assert (width, height) == (1280, 800)
     assert source == "sensor_aspect_platform_limit"
+
+
+def test_ov9782_rgb_uses_full_sensor_before_uniform_1920x1200_upscale():
+    args = SimpleNamespace(rgb_sensor_width=1280, rgb_sensor_height=800)
+
+    size = runtime.resolve_rgb_camera_output_size(args, (1920, 1200))
+
+    assert size == (1280, 800)
+    assert args.rgb_camera_resolution_source == "sensor_max_then_uniform_upscale"
+
+
+def test_rgb_upscale_rejects_aspect_ratio_change():
+    args = SimpleNamespace(rgb_sensor_width=1280, rgb_sensor_height=800)
+
+    try:
+        runtime.resolve_rgb_camera_output_size(args, (1920, 1080))
+    except RuntimeError as error:
+        assert "different aspect ratio" in str(error)
+    else:
+        raise AssertionError("geometry-changing RGB resize was accepted")
