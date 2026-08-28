@@ -137,6 +137,81 @@ def test_ov9782_rgb_uses_full_sensor_before_uniform_1920x1200_upscale():
     assert args.rgb_camera_resolution_source == "sensor_max_then_uniform_upscale"
 
 
+def test_monitor_pipeline_resizes_physical_sensor_frame_to_preview_geometry(monkeypatch):
+    requested_sizes = []
+    resized_sizes = []
+
+    class FakeDevice:
+        def getPlatform(self):
+            return dai.Platform.RVC2
+
+    class FakeCamera:
+        def build(self, socket):
+            assert socket == dai.CameraBoardSocket.CAM_A
+            return self
+
+    class FakeImu:
+        out = object()
+
+        def enableIMUSensor(self, sensors, rate):  # noqa: ARG002
+            return None
+
+        def setBatchReportThreshold(self, threshold):  # noqa: ARG002
+            return None
+
+        def setMaxBatchReports(self, reports):  # noqa: ARG002
+            return None
+
+    class FakePipeline:
+        def __init__(self):
+            self.nodes = iter((FakeCamera(), FakeImu()))
+
+        def getDefaultDevice(self):
+            return FakeDevice()
+
+        def create(self, node_type):  # noqa: ARG002
+            return next(self.nodes)
+
+    args = SimpleNamespace(
+        fps=15.0,
+        imu_rate=100,
+        imu_batch=5,
+        rgb_transport_effective="raw",
+        rgb_transport_quality=80,
+        rgb_width=1920,
+        rgb_height=1200,
+        rgb_sensor_width=1280,
+        rgb_sensor_height=800,
+        rgb_socket=dai.CameraBoardSocket.CAM_A,
+    )
+
+    monkeypatch.setattr(runtime, "require_depthai_v3", lambda: None)
+    monkeypatch.setattr(runtime, "set_device_identity_metadata", lambda device, args: None)
+    monkeypatch.setattr(runtime, "resolve_rgb_output_size", lambda device, args: (1920, 1200))
+    monkeypatch.setattr(
+        runtime,
+        "resolve_rgb_camera_output_size",
+        lambda args, requested: (1280, 800),
+    )
+
+    def request_output(camera, fps, size, frame_type, enable_undistortion):  # noqa: ARG001
+        requested_sizes.append(size)
+        return "camera-output"
+
+    def resize_output(pipeline, output, source_size, target_size):  # noqa: ARG001
+        resized_sizes.append((source_size, target_size))
+        return "resized-output"
+
+    monkeypatch.setattr(runtime, "request_camera_output", request_output)
+    monkeypatch.setattr(runtime, "resize_camera_output", resize_output)
+
+    outputs = runtime.configure_monitor_pipeline(FakePipeline(), args)
+
+    assert requested_sizes == [(1280, 800)]
+    assert resized_sizes == [((1280, 800), (1920, 1200))]
+    assert outputs["rgb"] == "resized-output"
+
+
 def test_rgb_upscale_rejects_aspect_ratio_change():
     args = SimpleNamespace(rgb_sensor_width=1280, rgb_sensor_height=800)
 

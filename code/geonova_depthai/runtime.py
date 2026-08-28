@@ -2543,15 +2543,22 @@ def configure_monitor_pipeline(pipeline, args):
     except Exception:
         args.depthai_platform = "unknown"
     rgb_size = resolve_rgb_output_size(device, args)
+    rgb_camera_size = resolve_rgb_camera_output_size(args, rgb_size)
     color_socket = getattr(args, "rgb_socket", dai.CameraBoardSocket.CAM_A)
 
     camera = pipeline.create(dai.node.Camera).build(color_socket)
     rgb_output = request_camera_output(
         camera,
         args.fps,
-        size=rgb_size,
+        size=rgb_camera_size,
         frame_type=dai.ImgFrame.Type.NV12,
         enable_undistortion=True,
+    )
+    rgb_output = resize_camera_output(
+        pipeline,
+        rgb_output,
+        rgb_camera_size,
+        rgb_size,
     )
     imu = pipeline.create(dai.node.IMU)
     imu.enableIMUSensor(

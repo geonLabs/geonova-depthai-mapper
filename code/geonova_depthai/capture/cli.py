@@ -169,17 +169,19 @@ def apply_monitor_only_defaults(args):
     if not getattr(args, "monitor_only", False):
         return args
 
-    # Monitor mode never persists RGB-D data.  Resolve the same maximum supported
-    # RGB output geometry and cadence match capture so the Controller preview is
-    # genuinely live. Monitor mode has no depth stream, and constrained USB links
-    # keep using MJPEG transport, so this remains bounded on USB2.
+    # Monitor mode never persists RGB-D data.  Use the same 1920x1200 output
+    # geometry and cadence as capture so the Controller preview is genuinely
+    # representative.  OV9782 devices provide a physical 1280x800 frame; the
+    # monitor pipeline uniformly upscales that full-FOV 16:10 image on-device.
+    # Monitor mode has no depth stream, and constrained USB links keep using
+    # MJPEG transport, so this remains bounded on USB2.
     args.controller_bridge_enabled = True
     args.allow_usb2 = True
     args.save_confidence_map = False
     args.fps = min(max(float(args.fps), 1.0), 15.0)
     args.depth_fps = 0.0
-    args.rgb_width = 0
-    args.rgb_height = 0
+    args.rgb_width = 1920
+    args.rgb_height = 1200
     args.controller_preview_max_width = 1920
     args.imu_rate = min(max(int(args.imu_rate), 1), 100)
     return args
