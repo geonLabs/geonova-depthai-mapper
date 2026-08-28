@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from types import SimpleNamespace
 
 from geonova_depthai import runtime
@@ -14,6 +15,68 @@ STR;SUWN-RTCM32;SUWN-RTCM32;RTCM 3.2;RTCM(1);2;GPS+GLONASS;Single Base;KOR;37.28
 STR;PAJU-RTCM31;PAJU-RTCM31;RTCM 3.1;RTCM(1);2;GPS+GLONASS;Single Base;KOR;37.75;126.74;0;0;;;B;N;0;;
 ENDSOURCETABLE
 """
+
+
+class SourceTableSocket:
+    def __init__(self, response):
+        self.response = response.encode("utf-8")
+        self.request = b""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return None
+
+    def settimeout(self, timeout):  # noqa: ARG002
+        return None
+
+    def sendall(self, data):
+        self.request += data
+
+    def recv(self, size):
+        if not self.response:
+            return b""
+        chunk, self.response = self.response[:size], self.response[size:]
+        return chunk
+
+
+def test_source_table_request_omits_stream_credentials_for_public_catalogue(monkeypatch) -> None:
+    sock = SourceTableSocket(SOURCE_TABLE)
+    monkeypatch.setattr(runtime.socket, "create_connection", lambda *args, **kwargs: sock)
+
+    text = runtime.fetch_ntrip_source_table({
+        "host": "www.gnssdata.or.kr",
+        "port": 2101,
+        "username": "field-user",
+        "password": "field-password",
+    })
+
+    assert "STR;YANJ-RTCM31" in text
+    assert b"Authorization:" not in sock.request
+
+
+def test_private_source_table_retries_with_stream_credentials(monkeypatch) -> None:
+    unauthorized = SourceTableSocket("HTTP/1.1 401 Unauthorized\r\n\r\n")
+    authorized = SourceTableSocket(SOURCE_TABLE)
+    sockets = iter((unauthorized, authorized))
+    monkeypatch.setattr(
+        runtime.socket,
+        "create_connection",
+        lambda *args, **kwargs: next(sockets),
+    )
+
+    text = runtime.fetch_ntrip_source_table({
+        "host": "private-caster.test",
+        "port": 2101,
+        "username": "field-user",
+        "password": "field-password",
+    })
+
+    token = base64.b64encode(b"field-user:field-password")
+    assert "STR;YANJ-RTCM31" in text
+    assert b"Authorization:" not in unauthorized.request
+    assert b"Authorization: Basic " + token in authorized.request
 
 
 def test_parse_ntrip_source_table_filters_requested_mountpoint_format() -> None:

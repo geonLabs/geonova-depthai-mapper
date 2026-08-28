@@ -1023,7 +1023,7 @@ class Rtcm3Framer:
         return frames
 
 
-def fetch_ntrip_source_table(config):
+def _fetch_ntrip_source_table_response(config, authenticate=False):
     host = config["host"]
     port = int(config["port"])
     timeout = float(config.get("sourcetable_timeout", 5.0) or 5.0)
@@ -1034,9 +1034,9 @@ def fetch_ntrip_source_table(config):
         "Ntrip-Version: Ntrip/2.0",
         "Connection: close",
     ]
-    username = config.get("username")
-    password = config.get("password")
-    if username or password:
+    username = config.get("username") if authenticate else None
+    password = config.get("password") if authenticate else None
+    if authenticate and (username or password):
         token = base64.b64encode(f"{username or ''}:{password or ''}".encode("utf-8")).decode("ascii")
         lines.append(f"Authorization: Basic {token}")
     lines.extend(["", ""])
@@ -1057,10 +1057,39 @@ def fetch_ntrip_source_table(config):
                 break
             chunks.append(data)
             total += len(data)
-    text = b"".join(chunks).decode("utf-8", errors="replace")
-    if "STR;" not in text:
-        raise RuntimeError("NTRIP source table did not contain STR mountpoint entries")
-    return text
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
+
+def _ntrip_response_status(text):
+    first_line = str(text or "").splitlines()[0].strip() if text else "empty response"
+    return first_line[:160]
+
+
+def fetch_ntrip_source_table(config):
+    """Fetch a caster catalogue without breaking public source-table endpoints.
+
+    Some casters, including gnssdata.or.kr, return ``404 Not Found`` for their
+    public ``/`` catalogue when an otherwise valid stream Authorization header
+    is present. Private casters may require the opposite. Try the public request
+    first and only retry with credentials when the unauthenticated response did
+    not contain a source table. Mountpoint stream requests remain authenticated.
+    """
+
+    text = _fetch_ntrip_source_table_response(config, authenticate=False)
+    if "STR;" in text:
+        return text
+
+    statuses = [_ntrip_response_status(text)]
+    if config.get("username") or config.get("password"):
+        authenticated_text = _fetch_ntrip_source_table_response(config, authenticate=True)
+        if "STR;" in authenticated_text:
+            return authenticated_text
+        statuses.append(_ntrip_response_status(authenticated_text))
+
+    raise RuntimeError(
+        "NTRIP source table did not contain STR mountpoint entries "
+        f"(responses: {'; '.join(statuses)})"
+    )
 
 
 class NtripCorrectionClient:
