@@ -1298,6 +1298,27 @@ class NtripCorrectionClient:
         return self.stop_event.is_set() or bool(cancel_event and cancel_event.is_set())
 
     @staticmethod
+    def _split_response_header(response):
+        """Return a complete NTRIP response header and its stream payload.
+
+        NTRIP v2 casters use a regular HTTP header terminated by an empty
+        line. Older NTRIP v1 casters commonly reply with only
+        ``ICY 200 OK\r\n`` and start the RTCM stream immediately afterwards.
+        Waiting for a second CRLF in that response consumes RTCM data as if it
+        were a header and eventually reports a false incomplete-header error.
+        """
+
+        for separator in (b"\r\n\r\n", b"\n\n"):
+            if separator in response:
+                return response.split(separator, 1)
+
+        if response.startswith(b"ICY "):
+            for separator in (b"\r\n", b"\n"):
+                if separator in response:
+                    return response.split(separator, 1)
+        return None
+
+    @staticmethod
     def _close_socket(sock):
         if sock is not None:
             try:
@@ -1352,13 +1373,10 @@ class NtripCorrectionClient:
             sock.sendall(self._request(mountpoint))
             response = b""
             header_deadline = time.monotonic() + connect_timeout
-            separator = b""
+            parsed_response = None
             while len(response) < 4096:
-                if b"\r\n\r\n" in response:
-                    separator = b"\r\n\r\n"
-                    break
-                if b"\n\n" in response:
-                    separator = b"\n\n"
+                parsed_response = self._split_response_header(response)
+                if parsed_response is not None:
                     break
                 if self._is_cancelled(cancel_event):
                     raise RuntimeError("NTRIP connection cancelled")
@@ -1373,9 +1391,16 @@ class NtripCorrectionClient:
                 if not chunk:
                     break
                 response += chunk
-            if not separator:
+            if parsed_response is None:
+                parsed_response = self._split_response_header(response)
+            if parsed_response is None:
+                if not response:
+                    raise RuntimeError(
+                        "NTRIP caster closed the connection without a response; "
+                        "verify NTRIP username and password"
+                    )
                 raise RuntimeError("NTRIP caster returned an incomplete response header")
-            header, remainder = response.split(separator, 1)
+            header, remainder = parsed_response
             first_line = header.splitlines()[0].decode("ascii", errors="replace") if header else ""
             status_parts = first_line.split()
             if len(status_parts) < 2 or status_parts[1] != "200":

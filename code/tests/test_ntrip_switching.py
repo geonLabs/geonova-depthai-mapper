@@ -189,6 +189,57 @@ def test_candidate_connection_waits_for_complete_valid_rtcm(monkeypatch) -> None
     client._close_socket(stream["socket"])
 
 
+def test_ntrip_v1_icy_status_line_starts_rtcm_stream(monkeypatch) -> None:
+    first = _rtcm_frame(b"legacy-one")
+    second = _rtcm_frame(b"legacy-two")
+    sock = ScriptedSocket([b"ICY 200 OK\r\n" + first + second])
+    client = runtime.NtripCorrectionClient(
+        _client_config(),
+        lambda data: None,
+        threading.Event(),
+    )
+    monkeypatch.setattr(runtime.socket, "create_connection", lambda *args, **kwargs: sock)
+
+    stream = client._open_mountpoint_stream(
+        {"mountpoint": "LEGACY"},
+        require_frame=True,
+    )
+
+    assert stream["frames"] == [first, second]
+    assert sock.closed is False
+    client._close_socket(stream["socket"])
+
+
+def test_ntrip_v1_rejected_status_is_reported(monkeypatch) -> None:
+    sock = ScriptedSocket([b"ICY 401 Unauthorized\n"])
+    client = runtime.NtripCorrectionClient(
+        _client_config(),
+        lambda data: None,
+        threading.Event(),
+    )
+    monkeypatch.setattr(runtime.socket, "create_connection", lambda *args, **kwargs: sock)
+
+    with pytest.raises(RuntimeError, match="401 Unauthorized"):
+        client._open_mountpoint_stream({"mountpoint": "LEGACY"})
+
+    assert sock.closed is True
+
+
+def test_empty_caster_response_reports_missing_credentials(monkeypatch) -> None:
+    sock = ScriptedSocket([])
+    client = runtime.NtripCorrectionClient(
+        _client_config(),
+        lambda data: None,
+        threading.Event(),
+    )
+    monkeypatch.setattr(runtime.socket, "create_connection", lambda *args, **kwargs: sock)
+
+    with pytest.raises(RuntimeError, match="verify NTRIP username and password"):
+        client._open_mountpoint_stream({"mountpoint": "AUTH_REQUIRED"})
+
+    assert sock.closed is True
+
+
 def test_rejected_candidate_connection_is_closed(monkeypatch) -> None:
     sock = ScriptedSocket([b"HTTP/1.1 401 Unauthorized\r\n\r\n"])
     client = runtime.NtripCorrectionClient(
