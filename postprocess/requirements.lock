@@ -1,0 +1,8 @@
+# Offline numerical processing, Python 3.11-3.12. No camera or serial SDK.
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
+PyYAML==6.0.2
+pyproj==3.7.2
+pyshp==2.3.1
+scipy==1.14.1
+certifi==2026.7.22

@@ -10,7 +10,10 @@ from typing import Mapping, Sequence
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent
-CODE_ROOT = REPOSITORY_ROOT / "code"
+CODE_ROOT = REPOSITORY_ROOT / "capture" / "src"
+if not CODE_ROOT.is_dir():  # Standalone capture export.
+    CODE_ROOT = REPOSITORY_ROOT / "src"
+SHARED_ROOT = REPOSITORY_ROOT / "shared" / "src"
 DEFAULT_CONFIG = REPOSITORY_ROOT / "config.yaml"
 
 
@@ -27,7 +30,7 @@ def recorder_arguments(
     arguments = list(sys.argv[1:] if argv is None else argv)
     environment = os.environ if environ is None else environ
     if not _has_option(arguments, "--config"):
-        arguments[:0] = ["--config", str(DEFAULT_CONFIG)]
+        arguments[:0] = ["--config", environment.get("JETSON_PIPELINE_CONFIG", "").strip() or str(DEFAULT_CONFIG)]
 
     results_dir = environment.get("JETSON_PIPELINE_RESULTS_DIR", "").strip()
     if results_dir:
@@ -46,6 +49,9 @@ def recorder_arguments(
 def _load_recorder_main():
     if not CODE_ROOT.is_dir():
         raise RuntimeError(f"DepthAI source directory is missing: {CODE_ROOT}")
+    if SHARED_ROOT.is_dir() and str(SHARED_ROOT) not in sys.path:
+        sys.path.insert(0, str(SHARED_ROOT))
+    sys.dont_write_bytecode = True  # Immutable Controller source snapshots.
     code_path = str(CODE_ROOT)
     if code_path not in sys.path:
         sys.path.insert(0, code_path)

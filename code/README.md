@@ -1,3 +1,5 @@
+> **구조 변경 안내:** 아래는 기존 통합 개발환경과 알고리즘의 상세 참고 문서입니다. 현재 수집·서버 설치와 실행은 [루트 README](../README.md), 경로 이동은 [분리 안내](../docs/CAPTURE_POSTPROCESS_SPLIT_KO.md)를 따릅니다. 루트 `install.sh`는 이제 수집 전용이며 `--dev` 같은 이전 옵션을 받지 않습니다. 기존 혼합 개발환경이 필요한 경우에만 이 디렉터리의 `python setup_env.py --dev`를 사용합니다. 새 동기화 CLI에는 별도 `--output-dir`이 필수입니다.
+
 # DepthAI RGB-D·RTK 방호울타리 선형화
 
 OAK RGB-D 카메라, GPS/RTK, 내장 IMU와 외부 EBIMU를 동기 수집하고 YOLO

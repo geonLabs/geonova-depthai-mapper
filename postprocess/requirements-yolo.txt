@@ -1,0 +1,4 @@
+# Optional model inference. Install a server-compatible torch/torchvision first.
+# Record the complete resolved environment with tools/install_component.py.
+ultralytics==8.4.75
+opencv-python==4.10.0.84

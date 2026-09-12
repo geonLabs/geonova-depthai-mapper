@@ -29,7 +29,7 @@ jobs:
           python -m pip install -r tools/lidar/requirements.txt pytest
 
       - name: Compile Python sources
-        run: python -m compileall -q main.py code tools/lidar
+        run: python -m compileall -q main.py code capture postprocess shared tools tests
 
       - name: Run LiDAR helper regression tests
         run: python -m pytest -q tools/lidar/tests
@@ -45,3 +45,18 @@ jobs:
           if leaked:
               raise SystemExit("shared config contains NTRIP credential keys: " + ", ".join(leaked))
           PY
+
+
+  component-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install numerical and camera test dependencies without Torch
+        run: python -m pip install -r postprocess/requirements.lock depthai==3.1.0 pyserial==3.5 pytest
+      - name: Verify component boundaries and existing regressions
+        env:
+          PYTHONPATH: code
+        run: python -m pytest -q tests code/tests

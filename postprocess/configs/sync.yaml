@@ -1,0 +1,6 @@
+# Paths are relative to this YAML; CLI paths can be absolute.
+dataset: /srv/geonova/raw/REPLACE_RUN_ID
+output_dir: /srv/geonova/processed/REPLACE_RUN_ID/synced
+sync_threshold_ms: 50.0
+rgb_depth_threshold_ms: 10.0
+allow_legacy: false
