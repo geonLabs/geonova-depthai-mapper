@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 
 from geonova_depthai import runtime
+from geonova_common.run_contract import atomic_json, write_capture_manifest
 
 
 RGB_EVENT_FIELDS = [
@@ -190,6 +191,7 @@ class RawEventDataset:
         self.camera_model_updated_from_rgb = False
         self.metadata = self._build_metadata(camera_model or {}, stereo_depth_model or {})
         self.write_metadata(self.metadata)
+        write_capture_manifest(self.root, "recording")
 
     def next_index(self, stream):
         with self.counter_lock:
@@ -317,8 +319,7 @@ class RawEventDataset:
         }
 
     def write_metadata(self, metadata):
-        with open(self.root / "metadata.json", "w") as file:
-            json.dump(metadata, file, indent=2, ensure_ascii=False)
+        atomic_json(self.root / "metadata.json", metadata)
 
     def update_camera_model_from_rgb_frame(self, msg):
         if self.camera_model_updated_from_rgb:
@@ -446,9 +447,23 @@ class RawEventDataset:
             self.counters[name] += 1
 
     def close(self):
+        first_error = None
         for writer in [self.rgb_events, self.depth_events, self.confidence_events, self.imu_events, self.gps_events, self.external_imu_events]:
             if writer is not None:
-                writer.close()
+                try:
+                    writer.close()
+                except Exception as error:
+                    if first_error is None:
+                        first_error = error
+        if first_error is not None:
+            raise first_error
         self.metadata["finished_wall_time"] = datetime.now().isoformat(timespec="milliseconds")
         self.metadata["raw_event_counts"] = dict(self.counters)
         self.write_metadata(self.metadata)
+
+
+    def finalize(self, error=None):
+        """Called only after image writers, CSV files and sensor owners close."""
+        return write_capture_manifest(
+            self.root, "failed" if error is not None else "complete", self.counters, error
+        )

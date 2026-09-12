@@ -3,7 +3,7 @@ import os
 from types import SimpleNamespace
 
 from .defaults import DEFAULTS
-from ..config_cli import SafeDefaultsHelpFormatter, parse_args_with_yaml
+from geonova_common.config_cli import SafeDefaultsHelpFormatter, parse_args_with_yaml
 
 
 def str2bool(value):

@@ -49,3 +49,10 @@ model/*.log
 .DS_Store
 *.log
 *.tmp
+
+
+# Component deployments and local environment records
+**/environment.freeze.txt
+**/environment.json
+dist/
+postprocess/.venv/

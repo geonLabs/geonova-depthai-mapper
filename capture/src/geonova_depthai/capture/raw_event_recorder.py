@@ -48,35 +48,35 @@ def _close_recording_resources(
     device,
     error=None,
 ):
-    """Close every recorder resource even when an earlier cleanup step fails."""
+    """Drain every owner before publishing the server handoff manifest."""
     serial_readers = serial_readers or {}
-    try:
-        if controller_bridge is not None:
-            controller_bridge.close(serial_readers, error=error)
-    finally:
+    cleanup_errors = []
+
+    def attempt(action):
         try:
-            runtime.stop_serial_readers(serial_readers)
-        finally:
-            try:
-                if image_pool is not None:
-                    print("Finishing pending image writes...")
-                    image_pool.close()
-            finally:
-                try:
-                    if dataset is not None:
-                        try:
-                            for name, reader in serial_readers.items():
-                                dataset.write_serial_samples(name, reader.drain())
-                        finally:
-                            dataset.close()
-                        print(f"Raw dataset closed: {dataset.root}")
-                        print(f"Next: python build_synced_dataset.py --dataset {dataset.root}")
-                finally:
-                    if device is not None:
-                        try:
-                            device.close()
-                        except Exception:
-                            pass
+            action()
+        except Exception as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+
+    if controller_bridge is not None:
+        attempt(lambda: controller_bridge.close(serial_readers, error=error))
+    attempt(lambda: runtime.stop_serial_readers(serial_readers))
+    if image_pool is not None:
+        print("Finishing pending image writes...", flush=True)
+        attempt(image_pool.close)
+    if dataset is not None:
+        for name, reader in serial_readers.items():
+            attempt(lambda name=name, reader=reader: dataset.write_serial_samples(name, reader.drain()))
+        attempt(dataset.close)
+    if device is not None:
+        attempt(device.close)
+    final_error = error or (cleanup_errors[0] if cleanup_errors else None)
+    if dataset is not None and hasattr(dataset, "finalize"):
+        attempt(lambda: dataset.finalize(error=final_error))
+        print(f"Raw dataset closed: {dataset.root}", flush=True)
+        print("Transfer the complete run folder to the postprocessing server.", flush=True)
+    if cleanup_errors:
+        raise cleanup_errors[0]
 
 
 def _monitor_runtime_reached(args, started):
@@ -202,6 +202,14 @@ def _run_monitor_only(args, controller_bridge, serial_readers):
 
 
 def record_raw_events(args):
+    from pathlib import Path
+    config = getattr(args, "config", None)
+    config_root = Path(config).parent if config else Path.cwd()
+    for name in ("output_dir", "controller_bridge_dir"):
+        path = Path(getattr(args, name)).expanduser()
+        if not path.is_absolute():
+            path = config_root / path
+        setattr(args, name, str(path.resolve()))
     apply_monitor_only_defaults(args)
     # Enforce the same pixel geometry before camera metadata is read.
     args.rgb_undistort = True
@@ -257,7 +265,7 @@ def record_raw_events(args):
             started = time.monotonic()
             last_status = started
             print(f"Recording raw event dataset to: {dataset.root}")
-            print("Press Ctrl-C to stop. Run build_synced_dataset.py on this folder afterwards.")
+            print("Press Ctrl-C to stop. Transfer the closed run folder for server postprocessing.")
 
             def submit_image(stream, msg):
                 if stream == "rgb":

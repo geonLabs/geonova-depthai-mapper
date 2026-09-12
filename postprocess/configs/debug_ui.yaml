@@ -1,0 +1,3 @@
+# Optional local inspection; expose externally only behind the server access controls.
+host: 127.0.0.1
+port: 8088
