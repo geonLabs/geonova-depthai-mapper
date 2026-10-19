@@ -312,8 +312,12 @@ device timestamp가 없는 RGB 행은 버리고 `quality_report.json`의 `no_dev
 동기화 메타데이터는 `metadata.sync.json`에 저장하며, 캡처 원본 `metadata.json`은
 수정하지 않습니다. 수집 폴더에서 재동기화하면 `metadata.json`의 `format_version`이
 `raw_events_v1` 또는 `synced_from_raw_events_v1`인 경우에만 위 네 산출물을 교체합니다.
-각 파일은 같은 폴더의 임시 파일을 완성한 뒤 원자적으로 교체하며, 다른 형식의 기존
-파일은 덮어쓰지 않습니다. 캡처 파일은 재동기화에서도 바이트 그대로 보존합니다.
+같은 폴더에 네 임시 파일을 완성한 뒤 `sync.incomplete` 표시와 이전 산출물의
+`*.prev` 백업을 유지하며 교체합니다. 성공하면 백업을 삭제하고 표시를 마지막에
+제거하며, 교체 실패 시 이전 산출물을 복원합니다. 중단 표시가 남은 실행은 다음
+동기화에서 먼저 복구하고, 완전한 백업이 없으면 네 산출물을 모두 지워 다시 만듭니다.
+0프레임이면 교체 전에 개수를 포함한 오류로 중단하여 이전 결과를 보존합니다.
+다른 형식의 기존 파일은 덮어쓰지 않습니다. 캡처 파일은 재동기화에서도 바이트 그대로 보존합니다.
 
 ```bash
 python build_synced_dataset.py --config configs/sync.yaml --copy-images

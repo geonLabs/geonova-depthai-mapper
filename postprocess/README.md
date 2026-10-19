@@ -47,7 +47,7 @@ YOLO는 기본적으로 선형화도 실행합니다. 세 번째 명령은 설�
 
 `sync`는 기본값인 빈 `output_dir`에서 수집 폴더에 `timestamps.csv`, `imu.csv`, `metadata.sync.json`, `quality_report.json`을 저장합니다. 별도의 `--output-dir`를 지정하면 비어 있는 새 출력 폴더에 이미지와 동기화 결과를 복사합니다. GPS는 RGB 캡처 시각에서 가장 가까운 샘플을 찾고, 기본 `gps_max_delta_ms: 150` ms를 넘으면 해당 프레임의 GPS를 연결하지 않습니다. IMU 매칭이 없는 프레임은 IMU 필드를 비워 유지하고 `quality_report.json`의 `no_imu_match`에 개수를 기록합니다. device timestamp가 없는 RGB 행은 기존처럼 버리고 `no_device_ts`에 개수를 기록합니다. 수집 원본의 `metadata.json`은 수정하지 않으며, 동기화 설정과 품질 정보는 `metadata.sync.json`에 따로 저장됩니다.
 
-수집 폴더에서 재동기화하면 `metadata.json`의 `format_version`이 `raw_events_v1` 또는 `synced_from_raw_events_v1`인 경우에만 위 네 산출물을 교체합니다. 각 파일은 같은 폴더의 임시 파일을 완성한 뒤 원자적으로 교체하며, 캡처 파일은 바이트 그대로 보존합니다. 다른 형식의 기존 파일은 덮어쓰지 않습니다. 별도의 `--output-dir`는 계속 비어 있는 새 폴더를 사용합니다.
+수집 폴더에서 재동기화하면 `metadata.json`의 `format_version`이 `raw_events_v1` 또는 `synced_from_raw_events_v1`인 경우에만 위 네 산출물을 교체합니다. 같은 폴더에 네 임시 파일을 완성한 뒤 `sync.incomplete` 표시와 이전 산출물의 `*.prev` 백업을 유지하며 교체합니다. 성공하면 백업을 삭제하고 표시를 마지막에 제거하며, 교체 실패 시 이전 산출물을 복원합니다. 중단 표시가 남은 실행은 다음 동기화에서 먼저 복구하고, 완전한 백업이 없으면 네 산출물을 모두 지워 다시 만듭니다. 0프레임이면 교체 전에 개수를 포함한 오류로 중단하여 이전 결과를 보존합니다. 캡처 파일은 바이트 그대로 보존하며, 다른 형식의 기존 파일은 덮어쓰지 않습니다. 별도의 `--output-dir`는 계속 비어 있는 새 폴더를 사용합니다.
 
 자세 기본값 `gps-course`는 GPS course를 yaw로, OAK IMU의 roll/pitch를 기울기로 사용합니다. IMU 시각 차이가 `imu_max_delta_ms` 이내일 때만 기울기 샘플을 신뢰하며, 장치 보정 extrinsics가 없거나 유효하지 않으면 `imu_to_camera_rpy_deg` 설정을 대체값으로 사용합니다. `gps-course-level`은 카메라가 수평이라고 보는 근사 모드입니다.
 

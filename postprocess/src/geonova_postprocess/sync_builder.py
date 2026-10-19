@@ -40,6 +40,7 @@ DEFAULT_SYNC_THRESHOLD_MS = 50.0
 DEFAULT_RGB_DEPTH_THRESHOLD_MS = 10.0
 DEFAULT_GPS_MAX_DELTA_MS = 150.0
 SYNC_OUTPUT_FILES = ("timestamps.csv", "imu.csv", "metadata.sync.json", "quality_report.json")
+SYNC_INCOMPLETE = "sync.incomplete"
 RAW_EVENT_FORMATS = ("raw_events_v1", "synced_from_raw_events_v1")
 
 
@@ -103,8 +104,50 @@ def write_csv(file, fieldnames: List[str], rows: Iterable[Dict[str, object]]):
         writer.writerow({key: row.get(key, "") for key in fieldnames})
 
 
+def finish_sync_generation(output_dir):
+    """Remove transaction files, exposing the generation only at the last step."""
+    for name in SYNC_OUTPUT_FILES:
+        (output_dir / (name + ".prev")).unlink(missing_ok=True)
+        for temporary in output_dir.glob("." + name + ".*.tmp"):
+            temporary.unlink(missing_ok=True)
+    (output_dir / SYNC_INCOMPLETE).unlink()
+
+
+def recover_sync_generation(output_dir):
+    """Recover a crash before reading or publishing another sync generation."""
+    if not (output_dir / SYNC_INCOMPLETE).exists():
+        return
+    backups = [output_dir / (name + ".prev") for name in SYNC_OUTPUT_FILES]
+    if all(backup.is_file() for backup in backups):
+        # Keep every backup until restoration finishes, including on a second
+        # interruption. Dataset readers refuse the folder while marked.
+        for name, backup in zip(SYNC_OUTPUT_FILES, backups):
+            shutil.copy2(backup, output_dir / name)
+    else:
+        # Without a complete previous generation no subset is safe to publish.
+        for name in SYNC_OUTPUT_FILES:
+            (output_dir / name).unlink(missing_ok=True)
+    finish_sync_generation(output_dir)
+
+
+def backup_sync_output(path):
+    # Rename only a fully copied backup so crash recovery cannot mistake a
+    # half-written fourth backup for a complete previous generation.
+    with tempfile.NamedTemporaryFile(
+        dir=str(path.parent), prefix="." + path.name + ".", suffix=".tmp", delete=False,
+    ) as file:
+        temporary = Path(file.name)
+    try:
+        shutil.copy2(path, temporary)
+        with temporary.open("rb+") as file:
+            os.fsync(file.fileno())
+        temporary.rename(path.with_name(path.name + ".prev"))
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def write_sync_outputs(output_dir, timestamp_rows, synced_imu_rows, metadata):
-    """Stage the complete result before replacing any existing output file."""
+    """Stage all four outputs and publish a recoverable generation."""
     payloads = (
         ("timestamps.csv", TIMESTAMP_FIELDS, timestamp_rows),
         ("imu.csv", SYNCED_IMU_FIELDS, synced_imu_rows),
@@ -127,8 +170,33 @@ def write_sync_outputs(output_dir, timestamp_rows, synced_imu_rows, metadata):
                     write_csv(file, fieldnames, payload)
                 file.flush()
                 os.fsync(file.fileno())
-        for temporary, path in staged:
-            os.replace(temporary, path)
+        marker_created = False
+        publishing = False
+        previous = set()
+        try:
+            with (output_dir / SYNC_INCOMPLETE).open("x", encoding="utf-8") as file:
+                marker_created = True
+                file.write("Sync generation incomplete\n")
+                file.flush()
+                os.fsync(file.fileno())
+            for _, path in staged:
+                if path.exists():
+                    backup_sync_output(path)
+                    previous.add(path.name)
+            publishing = True
+            for temporary, path in staged:
+                os.replace(temporary, path)
+        except BaseException:
+            if publishing:
+                for _, path in staged:
+                    if path.name in previous:
+                        shutil.copy2(path.with_name(path.name + ".prev"), path)
+                    else:
+                        path.unlink(missing_ok=True)
+            if marker_created:
+                finish_sync_generation(output_dir)
+            raise
+        finish_sync_generation(output_dir)
     finally:
         for temporary, _ in staged:
             temporary.unlink(missing_ok=True)
@@ -247,6 +315,9 @@ def build_synced_dataset(
     """Build or replace sync outputs; leave capture metadata and streams intact."""
     validate_thresholds(threshold_ms, rgb_depth_threshold_ms, gps_max_delta_ms)
     dataset = dataset.expanduser().resolve()
+    if (dataset / SYNC_INCOMPLETE).exists():
+        check_existing_outputs(dataset, dataset)
+        recover_sync_generation(dataset)
     if output_dir is None:
         output_dir = dataset
     else:
@@ -391,6 +462,14 @@ def build_synced_dataset(
         timestamp_rows.append(row)
         frame_index += 1
 
+    if not timestamp_rows:
+        raise ValueError(
+            "No synchronized frames survived: kept=0, rgb={}, depth={}, "
+            "no_device_ts={}, no_depth={}".format(
+                len(rgb_rows), len(depth_rows), dropped["no_device_ts"], dropped["no_depth"],
+            )
+        )
+
     if output_dir != dataset:
         for dirname in ["rgb", "depth_mm", "confidence"]:
             src = dataset / dirname
@@ -406,7 +485,8 @@ def build_synced_dataset(
                     dst.symlink_to(src, target_is_directory=True)
                 except OSError:
                     shutil.copytree(src, dst)
-        for filename in ["gps.csv", "rgb_events.csv", "depth_events.csv", "confidence_events.csv", "imu_events.csv", "metadata.json"]:
+        for filename in ["gps.csv", "rgb_events.csv", "depth_events.csv", "confidence_events.csv",
+                         "imu_events.csv", "metadata.json", "metadata.overrides.json"]:
             src = dataset / filename
             if src.exists():
                 shutil.copy2(src, output_dir / filename)
@@ -475,6 +555,9 @@ def main(argv=None):
         path = Path(value).expanduser()
         return path if path.is_absolute() else config_root / path
     dataset = configured_path(args.dataset).resolve()
+    if (dataset / SYNC_INCOMPLETE).exists():
+        check_existing_outputs(dataset, dataset)
+        recover_sync_generation(dataset)
     output = separate_output(dataset, configured_path(args.output_dir)) if args.output_dir else None
     check_existing_outputs(dataset, output if output is not None else dataset)
     capture = validate_sync_capture(dataset, allow_legacy=args.allow_legacy)
@@ -483,8 +566,6 @@ def main(argv=None):
             dataset, args.sync_threshold_ms, output, True, args.rgb_depth_threshold_ms,
             gps_max_delta_ms=args.gps_max_delta_ms,
         )
-        if not report["kept_frame_count"]:
-            raise ValueError("No synchronized frames survived; inspect quality_report.json")
     except BaseException as error:
         if output is not None and output.is_dir():
             atomic_json(output / "processing_manifest.json", {
