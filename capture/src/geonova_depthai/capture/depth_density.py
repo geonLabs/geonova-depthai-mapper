@@ -6,7 +6,7 @@ short field recordings made with different StereoDepth settings or mounts.
 It needs only NumPy and OpenCV, so it also runs as a plain script::
 
     python capture/src/geonova_depthai/capture/depth_density.py \
-        /data/collections/<run>_raw --band 0.55,0.70 --json /tmp/density.json
+        /data/collections/<run>_raw --json /tmp/density.json
 """
 
 from __future__ import annotations
@@ -22,15 +22,19 @@ import numpy as np
 # Road seen from a vehicle mount is at least ~1.5 m away, so rows whose
 # median depth is closer than this are most likely the vehicle itself.
 NEAR_DEPTH_MM = 1200
+# The road rectangle the server-side deterioration gate scores, as fractions
+# of the image height and width, so field checks report the same number.
+ROAD_ROWS = (0.58, 0.80)
+ROAD_COLUMNS = (0.08, 0.92)
 
 
 def parse_band(text):
     try:
         start, end = (float(value) for value in str(text).split(","))
     except ValueError as error:
-        raise argparse.ArgumentTypeError("band must be 'start,end' fractions of the image height") from error
+        raise argparse.ArgumentTypeError("expected 'start,end' fractions of the image size") from error
     if not 0.0 <= start < end <= 1.0:
-        raise argparse.ArgumentTypeError("band needs 0 <= start < end <= 1")
+        raise argparse.ArgumentTypeError("fractions need 0 <= start < end <= 1")
     return start, end
 
 
@@ -75,21 +79,24 @@ def _percentile(values, q):
     return round(float(np.percentile(np.asarray(values, dtype=np.float64), q)), 3) if values else None
 
 
-def depth_coverage(run, rows, band, row_step):
+def depth_coverage(run, rows, band, row_step, columns=ROAD_COLUMNS):
     frame_ratios, band_ratios = [], []
     bins = {}
     missing = 0
-    band_rows = None
+    band_rows = band_columns = None
     for row in rows:
         depth = cv2.imread(str(_depth_path(run, row["file"])), cv2.IMREAD_UNCHANGED)
         if depth is None or depth.ndim != 2:
             missing += 1
             continue
         valid = depth > 0
-        height = depth.shape[0]
-        band_rows = (int(round(band[0] * height)), int(round(band[1] * height)))
+        height, width = depth.shape
+        band_rows = (int(band[0] * height), int(band[1] * height))
+        band_columns = (int(columns[0] * width), int(columns[1] * width))
         frame_ratios.append(float(valid.mean()))
-        band_ratios.append(float(valid[band_rows[0]:band_rows[1]].mean()))
+        band_ratios.append(float(
+            valid[band_rows[0]:band_rows[1], band_columns[0]:band_columns[1]].mean()
+        ))
         for start in range(0, height, row_step):
             stop = min(start + row_step, height)
             ratios, depths = bins.setdefault((start, stop), ([], []))
@@ -117,7 +124,12 @@ def depth_coverage(run, rows, band, row_step):
     return {
         "sampled_frames": len(frame_ratios),
         "unreadable_frames": missing,
-        "band": {"from": band[0], "to": band[1], "rows": list(band_rows) if band_rows else None},
+        "band": {
+            "from": band[0],
+            "to": band[1],
+            "rows": list(band_rows) if band_rows else None,
+            "columns": list(band_columns) if band_columns else None,
+        },
         "valid_ratio": {
             "frame_median": _percentile(frame_ratios, 50),
             "frame_p10": _percentile(frame_ratios, 10),
@@ -149,7 +161,7 @@ def gnss_fix_summary(run):
     }
 
 
-def summarise_run(run, band=(0.55, 0.70), samples=60, row_step=50):
+def summarise_run(run, band=ROAD_ROWS, samples=60, row_step=50, columns=ROAD_COLUMNS):
     run = Path(run).resolve()
     metadata = json.loads((run / "metadata.json").read_text(encoding="utf-8"))
     events = read_depth_events(run)
@@ -160,7 +172,7 @@ def summarise_run(run, band=(0.55, 0.70), samples=60, row_step=50):
         "depth_cadence": depth_cadence(events),
         "gnss": gnss_fix_summary(run),
     }
-    report.update(depth_coverage(run, evenly_spaced(events, samples), band, row_step))
+    report.update(depth_coverage(run, evenly_spaced(events, samples), band, row_step, columns))
     return report
 
 
@@ -174,8 +186,8 @@ def format_report(report):
         f"lr={config.get('lr_check_threshold', 'n/a')} subpixel_bits={config.get('subpixel_fractional_bits')}",
         f"depth fps={cadence['fps']} frames={cadence['frames']} gaps>1.5f={cadence['gaps_over_1_5_frames']} "
         f"max_gap_ms={cadence['max_gap_ms']}",
-        f"valid depth: frame median={ratio['frame_median']} band {report['band']['rows']} "
-        f"median={ratio['band_median']} p10={ratio['band_p10']} min={ratio['band_min']} "
+        f"valid depth: frame median={ratio['frame_median']} road band rows {report['band']['rows']} "
+        f"cols {report['band']['columns']} median={ratio['band_median']} p10={ratio['band_p10']} min={ratio['band_min']} "
         f"({report['sampled_frames']} frames)",
     ]
     gnss = report.get("gnss")
@@ -197,7 +209,8 @@ def format_report(report):
 def build_parser():
     parser = argparse.ArgumentParser(description="Summarise aligned-depth coverage of a raw capture run.")
     parser.add_argument("run", type=Path, help="Raw capture folder containing metadata.json and depth_events.csv")
-    parser.add_argument("--band", type=parse_band, default=(0.55, 0.70), help="Road band as start,end fractions of the image height")
+    parser.add_argument("--band", type=parse_band, default=ROAD_ROWS, help="Road band rows as start,end fractions of the image height")
+    parser.add_argument("--columns", type=parse_band, default=ROAD_COLUMNS, help="Road band columns as start,end fractions of the image width")
     parser.add_argument("--samples", type=int, default=60, help="Depth frames sampled evenly across the run; 0 reads all")
     parser.add_argument("--row-step", type=int, default=50, help="Row-profile bin height in pixels")
     parser.add_argument("--json", type=Path, help="Also write the full report as JSON")
@@ -206,7 +219,9 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    report = summarise_run(args.run, band=args.band, samples=args.samples, row_step=max(args.row_step, 1))
+    report = summarise_run(
+        args.run, band=args.band, samples=args.samples, row_step=max(args.row_step, 1), columns=args.columns
+    )
     if args.json:
         args.json.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     print(format_report(report))

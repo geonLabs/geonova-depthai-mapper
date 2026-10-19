@@ -62,6 +62,21 @@ def test_report_measures_band_cadence_and_vehicle_rows(tmp_path):
     assert "probably the vehicle body" in depth_density.format_report(report)
 
 
+def test_road_band_defaults_to_the_server_gate_rectangle(tmp_path):
+    frame = road_frame(10)
+    frame[:, 0] = 0
+    frame[:, -1] = 0
+    run = write_run(tmp_path / "run_raw", [frame], [0.0])
+
+    gate = depth_density.summarise_run(run, band=(0.5, 0.75), samples=0)
+    full_width = depth_density.summarise_run(run, band=(0.5, 0.75), samples=0, columns=(0.0, 1.0))
+
+    assert gate["band"]["columns"] == [1, 18]
+    assert gate["valid_ratio"]["band_median"] == pytest.approx(1.0)
+    assert full_width["valid_ratio"]["band_median"] == pytest.approx(0.9)
+    assert depth_density.ROAD_ROWS == (0.58, 0.80)
+
+
 def test_vehicle_rows_tolerate_one_far_bin_at_the_bottom(tmp_path):
     frame = road_frame(10)
     frame[38:] = 1500  # far-reading strip inside the vehicle body
