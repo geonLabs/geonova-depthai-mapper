@@ -138,7 +138,9 @@ class PostprocessConfigTests(unittest.TestCase):
         changes = {}
         for field in fields(lines.LinearizationConfig):
             value = getattr(lines.LinearizationConfig(), field.name)
-            changes[field.name] = ("EPSG:32652" if isinstance(value, str) else value + 1)
+            # The smoothing window must stay odd, so it moves by two.
+            step = 2 if field.name == "gps_smoothing_window" else 1
+            changes[field.name] = ("EPSG:32652" if isinstance(value, str) else value + step)
         config = lines.LinearizationConfig(**changes)
         world = {"status": "ok", "trusted": False, "gps": {"position_quality": {"trusted": True}},
                  "longitude_deg": 127, "latitude_deg": 37, "altitude_m": 100}
