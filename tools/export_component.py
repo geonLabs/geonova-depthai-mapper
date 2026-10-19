@@ -49,7 +49,11 @@ def export_component(component, destination, init_git=False):
         "contract": "JetsonControllerApp/docs/EXTERNAL_PIPELINE_CONTRACT.md",
     }, indent=2) + "\n", encoding="utf-8")
     if init_git:
-        subprocess.run(["git", "init", "-b", "main", str(destination)], check=True)
+        subprocess.run(["git", "init", str(destination)], check=True)
+        subprocess.run(
+            ["git", "-C", str(destination), "symbolic-ref", "HEAD", "refs/heads/main"],
+            check=True,
+        )
         subprocess.run(["git", "add", "."], cwd=destination, check=True)
         subprocess.run(["git", "-c", "user.name=Geonova Export", "-c", "user.email=export@localhost",
                         "commit", "-m", f"Export {component} from {revision}"], cwd=destination, check=True)
