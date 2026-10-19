@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from uuid import UUID
 
 from geonova_depthai.postprocess import sync_builder
 from geonova_depthai.postprocess.sync_builder import (
@@ -29,6 +30,12 @@ def write_rows(path: Path, rows: list[dict[str, object]]) -> None:
         writer = csv.DictWriter(file, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def file_bytes(root):
+    # sync.lock is a permanent coordination entry, including after failed runs.
+    return {p: p.read_bytes() for p in root.rglob("*")
+            if p.is_file() and p.name != "sync.lock"}
 
 
 def make_dataset(tmp_path: Path, rgb_rows, depth_rows, imu_rows) -> Path:
@@ -264,7 +271,7 @@ class SyncSafetyTests(unittest.TestCase):
         (dataset / "metadata.overrides.json").write_bytes(b'{"world_coordinates": {"mount_height_m": 2.1}}\n')
         (dataset / "external_imu.csv").write_bytes(b"untouched legacy stream\n")
         write_capture_manifest(dataset, "complete")
-        original = {path: path.read_bytes() for path in dataset.rglob("*") if path.is_file()}
+        original = file_bytes(dataset)
 
         output, report = build_synced_dataset(dataset)
         first_outputs = {name: (dataset / name).read_bytes() for name in SYNC_OUTPUT_FILES}
@@ -288,17 +295,21 @@ class SyncSafetyTests(unittest.TestCase):
 
         self.assertEqual(output, dataset)
         self.assertEqual(replacements, list(SYNC_OUTPUT_FILES))
+        self.assertEqual(replacements[-1], "metadata.sync.json")
         self.assertNotEqual((dataset / "timestamps.csv").read_bytes(), first_outputs["timestamps.csv"])
         self.assert_empty_gps(read_timestamps(dataset)[0])
         for path, content in original.items():
             self.assertEqual(path.read_bytes(), content, str(path))
         self.assertEqual((dataset / "metadata.json").read_bytes(), raw_metadata)
         sidecar = json.loads((dataset / "metadata.sync.json").read_text())
+        self.assertEqual(UUID(sidecar["generation"]).version, 4)
+        self.assertEqual(UUID(sidecar["generation"]).hex, sidecar["generation"])
+        self.assertNotEqual(sidecar["generation"], json.loads(first_outputs["metadata.sync.json"])["generation"])
         self.assertEqual(sidecar["sync"]["gps_max_delta_ms"], 75.0)
         self.assertEqual(sidecar["quality_report"], report)
         self.assertEqual(validate_capture(dataset)["state"], "complete")
         self.assertEqual({path for path in dataset.rglob("*") if path.is_file()},
-                         set(original) | {dataset / name for name in SYNC_OUTPUT_FILES})
+                         set(original) | {dataset / "sync.lock"} | {dataset / name for name in SYNC_OUTPUT_FILES})
 
     def test_existing_outputs_require_recognisable_raw_metadata(self):
         dataset = self.make_raw()
@@ -314,10 +325,10 @@ class SyncSafetyTests(unittest.TestCase):
                         metadata_path.write_bytes(metadata)
                     path = dataset / filename
                     path.write_bytes(b"existing capture content\r\n")
-                    original = {p: p.read_bytes() for p in dataset.rglob("*") if p.is_file()}
+                    original = file_bytes(dataset)
                     with self.assertRaisesRegex(FileExistsError, "Refusing to replace.*raw_events_v1"):
                         build_synced_dataset(dataset)
-                    self.assertEqual({p: p.read_bytes() for p in dataset.rglob("*") if p.is_file()}, original)
+                    self.assertEqual(file_bytes(dataset), original)
                     path.unlink()
 
     def test_partial_previous_sync_can_be_replaced(self):
@@ -333,19 +344,29 @@ class SyncSafetyTests(unittest.TestCase):
     def test_interruption_before_first_replace_keeps_all_previous_outputs(self):
         dataset = self.make_raw()
         build_synced_dataset(dataset)
-        original = {path: path.read_bytes() for path in dataset.rglob("*") if path.is_file()}
+        original = file_bytes(dataset)
 
-        with mock.patch.object(sync_builder.os, "replace", side_effect=OSError("Interrupted before replace")) as replace:
+        replace_output = sync_builder.os.replace
+        failed = False
+
+        def fail_once(source, destination):
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise OSError("Interrupted before replace")
+            return replace_output(source, destination)
+
+        with mock.patch.object(sync_builder.os, "replace", side_effect=fail_once) as replace:
             with self.assertRaisesRegex(OSError, "Interrupted before replace"):
                 build_synced_dataset(dataset, gps_max_delta_ms=25.0)
 
-        replace.assert_called_once()
-        self.assertEqual({path: path.read_bytes() for path in dataset.rglob("*") if path.is_file()}, original)
+        self.assertEqual(replace.call_count, 5)  # Failed publication, then four fresh restorations.
+        self.assertEqual(file_bytes(dataset), original)
 
     def test_interrupted_serialization_keeps_all_previous_outputs(self):
         dataset = self.make_raw()
         build_synced_dataset(dataset)
-        original = {path: path.read_bytes() for path in dataset.rglob("*") if path.is_file()}
+        original = file_bytes(dataset)
         write_csv = sync_builder.write_csv
         dump = json.dump
 
@@ -369,7 +390,7 @@ class SyncSafetyTests(unittest.TestCase):
                             with self.assertRaisesRegex(OSError, "Interrupted write"):
                                 build_synced_dataset(dataset, gps_max_delta_ms=25.0)
                 replace.assert_not_called()
-                self.assertEqual({p: p.read_bytes() for p in dataset.rglob("*") if p.is_file()}, original)
+                self.assertEqual(file_bytes(dataset), original)
 
     def test_each_failed_swap_restores_the_previous_generation(self):
         dataset = self.make_raw()
@@ -383,26 +404,29 @@ class SyncSafetyTests(unittest.TestCase):
                     (dataset / name).write_bytes(first_outputs[name])
                 else:
                     (dataset / name).unlink(missing_ok=True)
-            original = {p: p.read_bytes() for p in dataset.rglob("*") if p.is_file()}
+            original = file_bytes(dataset)
             for failed_name in SYNC_OUTPUT_FILES:
                 with self.subTest(previous_count=previous_count, failed_name=failed_name):
+                    failed = False
                     def fail_swap(source, destination):
+                        nonlocal failed
                         self.assertTrue((dataset / "sync.incomplete").is_file())
                         for name in SYNC_OUTPUT_FILES[:previous_count]:
                             self.assertEqual((dataset / (name + ".prev")).read_bytes(), first_outputs[name])
-                        if destination.name == failed_name:
+                        if destination.name == failed_name and not failed:
+                            failed = True
                             raise OSError("Swap failed")
                         replace(source, destination)
 
                     with mock.patch.object(sync_builder.os, "replace", side_effect=fail_swap):
                         with self.assertRaisesRegex(OSError, "Swap failed"):
                             build_synced_dataset(dataset, gps_max_delta_ms=25.0)
-                    self.assertEqual({p: p.read_bytes() for p in dataset.rglob("*") if p.is_file()}, original)
+                    self.assertEqual(file_bytes(dataset), original)
 
     def test_failed_backup_keeps_the_previous_generation(self):
         dataset = self.make_raw()
         build_synced_dataset(dataset)
-        original = {p: p.read_bytes() for p in dataset.rglob("*") if p.is_file()}
+        original = file_bytes(dataset)
         copy = sync_builder.shutil.copy2
 
         def fail_backup(source, destination):
@@ -416,13 +440,13 @@ class SyncSafetyTests(unittest.TestCase):
                 with self.assertRaisesRegex(OSError, "Backup failed"):
                     build_synced_dataset(dataset)
         replace.assert_not_called()
-        self.assertEqual({p: p.read_bytes() for p in dataset.rglob("*") if p.is_file()}, original)
+        self.assertEqual(file_bytes(dataset), original)
 
     def test_crash_after_each_swap_recovers_before_the_next_sync(self):
         dataset = self.make_raw()
         write_rows(dataset / "depth_events.csv", [image_row(0, "depth_mm", 1_010_000_000)])
         build_synced_dataset(dataset)
-        original = {p: p.read_bytes() for p in dataset.rglob("*") if p.is_file()}
+        original = file_bytes(dataset)
         root = Path(__file__).resolve().parents[2]
         script = """import os
 import sys
@@ -453,7 +477,7 @@ sync_builder.build_synced_dataset(Path(sys.argv[2]), gps_max_delta_ms=25.0)
                 # A failing next sync still recovers the old generation first.
                 with self.assertRaisesRegex(ValueError, "No synchronized frames survived"):
                     build_synced_dataset(dataset, rgb_depth_threshold_ms=0.0)
-                self.assertEqual({p: p.read_bytes() for p in dataset.rglob("*") if p.is_file()}, original)
+                self.assertEqual(file_bytes(dataset), original)
 
         _, report = build_synced_dataset(dataset, gps_max_delta_ms=25.0)
         self.assertEqual(report["gps_max_delta_ms"], 25.0)
@@ -461,7 +485,7 @@ sync_builder.build_synced_dataset(Path(sys.argv[2]), gps_max_delta_ms=25.0)
 
     def test_incomplete_crash_backups_clear_all_outputs_before_rebuilding(self):
         dataset = self.make_raw()
-        raw = {p: p.read_bytes() for p in dataset.rglob("*") if p.is_file()}
+        raw = file_bytes(dataset)
         write_outputs = sync_builder.write_sync_outputs
         for backup_count in range(4):
             with self.subTest(backup_count=backup_count):
@@ -473,7 +497,7 @@ sync_builder.build_synced_dataset(Path(sys.argv[2]), gps_max_delta_ms=25.0)
                 (dataset / ".timestamps.csv.crashed.tmp").write_bytes(b"partial backup\n")
 
                 def check_recovered(*args):
-                    self.assertEqual({p: p.read_bytes() for p in dataset.rglob("*") if p.is_file()}, raw)
+                    self.assertEqual(file_bytes(dataset), raw)
                     return write_outputs(*args)
 
                 with mock.patch.object(sync_builder, "write_sync_outputs", side_effect=check_recovered):
@@ -485,26 +509,26 @@ sync_builder.build_synced_dataset(Path(sys.argv[2]), gps_max_delta_ms=25.0)
         dataset = self.make_raw()
         write_rows(dataset / "depth_events.csv", [image_row(0, "depth_mm", 1_010_000_000)])
         build_synced_dataset(dataset)
-        original = {p: p.read_bytes() for p in dataset.rglob("*") if p.is_file()}
+        original = file_bytes(dataset)
 
         with self.assertRaisesRegex(ValueError, "kept=0, rgb=1, depth=1, no_device_ts=0, no_depth=1"):
             build_synced_dataset(dataset, rgb_depth_threshold_ms=0.0)
 
-        self.assertEqual({p: p.read_bytes() for p in dataset.rglob("*") if p.is_file()}, original)
+        self.assertEqual(file_bytes(dataset), original)
         output = self.root / "empty"
         with self.assertRaisesRegex(ValueError, "No synchronized frames survived"):
             build_synced_dataset(dataset, output_dir=output, rgb_depth_threshold_ms=0.0)
-        self.assertEqual(list(output.iterdir()), [])
+        self.assertEqual([p.name for p in output.iterdir()], ["sync.lock"])
 
     def test_zero_frame_counts_include_rgb_rows_without_device_timestamps(self):
         dataset = self.make_raw()
         write_rows(dataset / "rgb_events.csv", [
             image_row(0, "rgb", ""), image_row(1, "rgb", 2_000_000_000),
         ])
-        original = {p: p.read_bytes() for p in dataset.rglob("*") if p.is_file()}
+        original = file_bytes(dataset)
         with self.assertRaisesRegex(ValueError, "kept=0, rgb=2, depth=1, no_device_ts=1, no_depth=1"):
             build_synced_dataset(dataset)
-        self.assertEqual({p: p.read_bytes() for p in dataset.rglob("*") if p.is_file()}, original)
+        self.assertEqual(file_bytes(dataset), original)
 
     def test_empty_imu_stream_keeps_frames_with_empty_imu_fields(self):
         dataset = self.make_raw((1_000_000_000, 2_000_000_000))
@@ -633,7 +657,7 @@ sync_builder.build_synced_dataset(Path(sys.argv[2]), gps_max_delta_ms=25.0)
         self.add_capture_images(dataset)
         (dataset / "imu_events.csv").write_bytes(b"message_index,message_device_ts_ns\r\n")
         write_capture_manifest(dataset, "complete")
-        original = {path: path.read_bytes() for path in dataset.rglob("*") if path.is_file()}
+        original = file_bytes(dataset)
         config = self.root / "sync.yaml"
         config.write_text('dataset: "raw"\noutput_dir: ""\n', encoding="utf-8")
         root = Path(__file__).resolve().parents[2]
@@ -652,7 +676,7 @@ sync_builder.build_synced_dataset(Path(sys.argv[2]), gps_max_delta_ms=25.0)
                         self.assertEqual(path.read_bytes(), content, str(path))
                     self.assertEqual(validate_capture(dataset)["state"], "complete")
                     self.assertEqual({p for p in dataset.rglob("*") if p.is_file()},
-                                     set(original) | {dataset / name for name in SYNC_OUTPUT_FILES})
+                                     set(original) | {dataset / "sync.lock"} | {dataset / name for name in SYNC_OUTPUT_FILES})
 
     def test_legacy_synced_format_resyncs_through_both_entrypoints(self):
         dataset = self.make_raw()
@@ -660,7 +684,7 @@ sync_builder.build_synced_dataset(Path(sys.argv[2]), gps_max_delta_ms=25.0)
         (dataset / "metadata.json").write_bytes(
             b'{ "format_version": "synced_from_raw_events_v1", "sync": {"old": true} }\n'
         )
-        original = {path: path.read_bytes() for path in dataset.rglob("*") if path.is_file()}
+        original = file_bytes(dataset)
         for name in SYNC_OUTPUT_FILES:
             (dataset / name).write_bytes(b"old sync output\n")
         root = Path(__file__).resolve().parents[2]
@@ -683,7 +707,7 @@ sync_builder.build_synced_dataset(Path(sys.argv[2]), gps_max_delta_ms=25.0)
         self.add_capture_images(dataset)
         write_capture_manifest(dataset, "complete")
         build_synced_dataset(dataset)
-        original = {p: p.read_bytes() for p in dataset.rglob("*") if p.is_file()}
+        original = file_bytes(dataset)
         root = Path(__file__).resolve().parents[2]
         entrypoints = ([root / "postprocess/main.py", "sync"], [root / "code/build_synced_dataset.py"])
         for entrypoint in entrypoints:
@@ -699,7 +723,7 @@ sync_builder.build_synced_dataset(Path(sys.argv[2]), gps_max_delta_ms=25.0)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("No synchronized frames survived", result.stderr)
                 self.assertIn("kept=0, rgb=1, depth=1, no_device_ts=0, no_depth=1", result.stderr)
-                self.assertEqual({p: p.read_bytes() for p in dataset.rglob("*") if p.is_file()}, original)
+                self.assertEqual(file_bytes(dataset), original)
 
     def test_legacy_format_keeps_manifest_and_path_validation(self):
         dataset = self.make_raw()
@@ -727,7 +751,7 @@ sync_builder.build_synced_dataset(Path(sys.argv[2]), gps_max_delta_ms=25.0)
         self.add_capture_images(dataset)
         (dataset / "metadata.json").write_bytes(b'{"format_version":"synced_capture_v1"}\n')
         (dataset / "timestamps.csv").write_bytes(b"timestamps from recorder\n")
-        original = {path: path.read_bytes() for path in dataset.rglob("*") if path.is_file()}
+        original = file_bytes(dataset)
         root = Path(__file__).resolve().parents[2]
 
         result = subprocess.run([
@@ -736,7 +760,7 @@ sync_builder.build_synced_dataset(Path(sys.argv[2]), gps_max_delta_ms=25.0)
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Refusing to replace sync outputs", result.stderr)
-        self.assertEqual({path: path.read_bytes() for path in dataset.rglob("*") if path.is_file()}, original)
+        self.assertEqual(file_bytes(dataset), original)
 
     def test_separate_output_must_still_be_new_and_portable(self):
         dataset = self.make_raw()
@@ -746,7 +770,7 @@ sync_builder.build_synced_dataset(Path(sys.argv[2]), gps_max_delta_ms=25.0)
         )
         overrides = b'{ "world_coordinates": {"mount_height_m": 2.1, "mount_pitch_deg": -4.0} }\r\n'
         (dataset / "metadata.overrides.json").write_bytes(overrides)
-        original = {path: path.read_bytes() for path in dataset.rglob("*") if path.is_file()}
+        original = file_bytes(dataset)
 
         output, _ = build_synced_dataset(dataset, output_dir=self.root / "synced", copy_images=True)
 
@@ -754,14 +778,14 @@ sync_builder.build_synced_dataset(Path(sys.argv[2]), gps_max_delta_ms=25.0)
         self.assertEqual((output / "rgb/0000000.png").read_bytes(), (dataset / "rgb/0000000.png").read_bytes())
         self.assertEqual((output / "metadata.json").read_bytes(), (dataset / "metadata.json").read_bytes())
         self.assertEqual((output / "metadata.overrides.json").read_bytes(), overrides)
-        previous = {path: path.read_bytes() for path in output.rglob("*") if path.is_file()}
+        previous = file_bytes(output)
         with self.assertRaisesRegex(ValueError, "new or empty"):
             build_synced_dataset(dataset, output_dir=output)
         for path in (dataset, dataset / "nested"):
             with self.assertRaisesRegex(ValueError, "separate"):
                 build_synced_dataset(dataset, output_dir=path)
-        self.assertEqual({path: path.read_bytes() for path in output.rglob("*") if path.is_file()}, previous)
-        self.assertEqual({path: path.read_bytes() for path in dataset.rglob("*") if path.is_file()}, original)
+        self.assertEqual(file_bytes(output), previous)
+        self.assertEqual(file_bytes(dataset), original)
 
     def test_invalid_thresholds_fail_before_writing_outputs(self):
         dataset = self.make_raw()

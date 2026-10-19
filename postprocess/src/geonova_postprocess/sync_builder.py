@@ -1,15 +1,19 @@
 import argparse
 import bisect
 import csv
+import errno
 import json
 import math
 import os
 import shutil
+import stat
 import tempfile
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+from uuid import uuid4
 
 from geonova_common.config_cli import parse_args_with_yaml
 from geonova_common.run_contract import atomic_json, relative_file, separate_output, validate_capture, utc_now
@@ -39,8 +43,9 @@ SYNCED_IMU_FIELDS = [
 DEFAULT_SYNC_THRESHOLD_MS = 50.0
 DEFAULT_RGB_DEPTH_THRESHOLD_MS = 10.0
 DEFAULT_GPS_MAX_DELTA_MS = 150.0
-SYNC_OUTPUT_FILES = ("timestamps.csv", "imu.csv", "metadata.sync.json", "quality_report.json")
+SYNC_OUTPUT_FILES = ("timestamps.csv", "imu.csv", "quality_report.json", "metadata.sync.json")
 SYNC_INCOMPLETE = "sync.incomplete"
+SYNC_LOCK = "sync.lock"
 RAW_EVENT_FORMATS = ("raw_events_v1", "synced_from_raw_events_v1")
 
 
@@ -104,25 +109,170 @@ def write_csv(file, fieldnames: List[str], rows: Iterable[Dict[str, object]]):
         writer.writerow({key: row.get(key, "") for key in fieldnames})
 
 
+def validate_sync_file(path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink > 1:
+        raise ValueError("Unsafe sync path (requires a regular file without links): " + path.name)
+
+
+def validate_sync_paths(output_dir):
+    # Validate the whole transaction before recovery, lock creation or cleanup.
+    for name in SYNC_OUTPUT_FILES:
+        validate_sync_file(output_dir / name)
+        validate_sync_file(output_dir / (name + ".prev"))
+        for temporary in output_dir.glob("." + name + ".*.tmp"):
+            validate_sync_file(temporary)
+    for name in (SYNC_INCOMPLETE, SYNC_LOCK):
+        validate_sync_file(output_dir / name)
+
+
+@contextmanager
+def sync_writer_lock(output_dir):
+    """Keep the lock entry permanently: unlinking it would split the lock."""
+    validate_sync_paths(output_dir)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    with os.fdopen(os.open(str(output_dir / SYNC_LOCK), flags, 0o600), "r+b") as file:
+        info = os.fstat(file.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink > 1:
+            raise ValueError("Unsafe sync path: " + SYNC_LOCK)
+        if os.name == "nt":
+            import msvcrt
+
+            def lock():
+                file.seek(0)
+                msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
+
+            def unlock():
+                file.seek(0)
+                msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            def lock():
+                fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            def unlock():
+                fcntl.flock(file.fileno(), fcntl.LOCK_UN)
+        try:
+            lock()
+        except OSError as error:
+            if error.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                raise
+            raise RuntimeError("Sync writer already active: sync.lock") from error
+        try:
+            yield
+        finally:
+            unlock()
+
+
+def fsync_directory(directory):
+    """Persist directory entries on POSIX; unsupported filesystems may skip it."""
+    if os.name == "nt":
+        return
+    unsupported = (errno.EINVAL, errno.ENOTSUP, errno.EBADF, errno.ENOSYS)
+    try:
+        descriptor = os.open(str(directory), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError as error:
+        if error.errno in unsupported:
+            return
+        raise
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as error:
+            if error.errno not in unsupported:
+                raise
+    finally:
+        os.close(descriptor)
+
+
+def write_sync_state(file, state, previous=None):
+    record = {"state": state}
+    if previous is not None:
+        record["previous"] = previous
+    # A leading newline isolates a torn final record on a later recovery.
+    file.write("\n" + json.dumps(record) + "\n")
+    file.flush()
+    os.fsync(file.fileno())
+
+
+def read_sync_state(output_dir):
+    state, previous = None, None
+    for line in (output_dir / SYNC_INCOMPLETE).read_text(encoding="utf-8").splitlines(keepends=True):
+        if not line.endswith("\n"):
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        if record.get("state") == "preparing":
+            names = record.get("previous")
+            if isinstance(names, list) and all(name in SYNC_OUTPUT_FILES for name in names):
+                state, previous = "preparing", names
+        elif record.get("state") == "publishing" and state == "preparing":
+            state = "publishing"
+        elif record.get("state") == "complete":
+            state = "complete"
+    return state, previous
+
+
 def finish_sync_generation(output_dir):
-    """Remove transaction files, exposing the generation only at the last step."""
+    """Caller holds sync.lock; make cleanup restartable before removing backups."""
+    validate_sync_paths(output_dir)
+    fsync_directory(output_dir)
+    with (output_dir / SYNC_INCOMPLETE).open("a", encoding="utf-8") as file:
+        write_sync_state(file, "complete")
     for name in SYNC_OUTPUT_FILES:
         (output_dir / (name + ".prev")).unlink(missing_ok=True)
         for temporary in output_dir.glob("." + name + ".*.tmp"):
             temporary.unlink(missing_ok=True)
+    fsync_directory(output_dir)
     (output_dir / SYNC_INCOMPLETE).unlink()
+    fsync_directory(output_dir)
+
+
+def restore_sync_output(backup, path):
+    # Never copy into an existing entry: even recovery must not write through a
+    # symlink or a hard link into a capture file.
+    with tempfile.NamedTemporaryFile(
+        dir=str(path.parent), prefix="." + path.name + ".", suffix=".tmp", delete=False,
+    ) as file:
+        temporary = Path(file.name)
+    try:
+        shutil.copy2(backup, temporary)
+        with temporary.open("rb+") as file:
+            os.fsync(file.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def recover_sync_generation(output_dir):
-    """Recover a crash before reading or publishing another sync generation."""
+    """Caller holds sync.lock, including throughout restoration and cleanup."""
+    validate_sync_paths(output_dir)
     if not (output_dir / SYNC_INCOMPLETE).exists():
         return
-    backups = [output_dir / (name + ".prev") for name in SYNC_OUTPUT_FILES]
+    state, previous = read_sync_state(output_dir)
+    if state in ("preparing", "complete"):
+        # No output was swapped yet, or all output renames were already synced.
+        finish_sync_generation(output_dir)
+        return
+    if previous is None:  # Round-3 markers had no journal records.
+        previous = list(SYNC_OUTPUT_FILES)
+    backups = [output_dir / (name + ".prev") for name in previous]
     if all(backup.is_file() for backup in backups):
         # Keep every backup until restoration finishes, including on a second
         # interruption. Dataset readers refuse the folder while marked.
-        for name, backup in zip(SYNC_OUTPUT_FILES, backups):
-            shutil.copy2(backup, output_dir / name)
+        for name in SYNC_OUTPUT_FILES:  # Restore metadata last as well.
+            if name in previous:
+                restore_sync_output(output_dir / (name + ".prev"), output_dir / name)
+            else:
+                (output_dir / name).unlink(missing_ok=True)
     else:
         # Without a complete previous generation no subset is safe to publish.
         for name in SYNC_OUTPUT_FILES:
@@ -142,20 +292,30 @@ def backup_sync_output(path):
         with temporary.open("rb+") as file:
             os.fsync(file.fileno())
         temporary.rename(path.with_name(path.name + ".prev"))
+        fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
 
 def write_sync_outputs(output_dir, timestamp_rows, synced_imu_rows, metadata):
-    """Stage all four outputs and publish a recoverable generation."""
+    """Caller holds sync.lock; publish metadata last behind a durable marker."""
+    validate_sync_paths(output_dir)
+    metadata = dict(metadata, generation=uuid4().hex)
     payloads = (
         ("timestamps.csv", TIMESTAMP_FIELDS, timestamp_rows),
         ("imu.csv", SYNCED_IMU_FIELDS, synced_imu_rows),
-        ("metadata.sync.json", None, metadata),
         ("quality_report.json", None, metadata["quality_report"]),
+        ("metadata.sync.json", None, metadata),
     )
     staged = []
+    marker_created = False
+    publishing = False
+    previous = [name for name in SYNC_OUTPUT_FILES if (output_dir / name).exists()]
     try:
+        with (output_dir / SYNC_INCOMPLETE).open("x", encoding="utf-8") as file:
+            marker_created = True
+            write_sync_state(file, "preparing", previous)
+        fsync_directory(output_dir)
         for filename, fieldnames, payload in payloads:
             with tempfile.NamedTemporaryFile(
                 mode="w", encoding="utf-8", newline="", dir=str(output_dir),
@@ -170,36 +330,26 @@ def write_sync_outputs(output_dir, timestamp_rows, synced_imu_rows, metadata):
                     write_csv(file, fieldnames, payload)
                 file.flush()
                 os.fsync(file.fileno())
-        marker_created = False
-        publishing = False
-        previous = set()
-        try:
-            with (output_dir / SYNC_INCOMPLETE).open("x", encoding="utf-8") as file:
-                marker_created = True
-                file.write("Sync generation incomplete\n")
-                file.flush()
-                os.fsync(file.fileno())
-            for _, path in staged:
-                if path.exists():
-                    backup_sync_output(path)
-                    previous.add(path.name)
-            publishing = True
-            for temporary, path in staged:
-                os.replace(temporary, path)
-        except BaseException:
+        for name in previous:
+            backup_sync_output(output_dir / name)
+        fsync_directory(output_dir)
+        with (output_dir / SYNC_INCOMPLETE).open("a", encoding="utf-8") as file:
+            write_sync_state(file, "publishing")
+        publishing = True
+        for temporary, path in staged:
+            os.replace(temporary, path)
+        fsync_directory(output_dir)
+    except BaseException:
+        if marker_created:
             if publishing:
-                for _, path in staged:
-                    if path.name in previous:
-                        shutil.copy2(path.with_name(path.name + ".prev"), path)
-                    else:
-                        path.unlink(missing_ok=True)
-            if marker_created:
+                recover_sync_generation(output_dir)
+            else:
                 finish_sync_generation(output_dir)
-            raise
-        finish_sync_generation(output_dir)
+        raise
     finally:
         for temporary, _ in staged:
             temporary.unlink(missing_ok=True)
+    finish_sync_generation(output_dir)
 
 
 def check_existing_outputs(dataset, output_dir):
@@ -304,6 +454,27 @@ def stats(values):
     return {"count": len(values), "p50": values[len(values)//2], "p95": values[p95_index], "max": values[-1]}
 
 
+@contextmanager
+def sync_build_session(dataset, output_dir):
+    dataset = dataset.expanduser().resolve()
+    output = separate_output(dataset, output_dir) if output_dir is not None else dataset
+    validate_sync_paths(dataset)
+    if output == dataset or (dataset / SYNC_INCOMPLETE).exists():
+        check_existing_outputs(dataset, dataset)
+    with sync_writer_lock(dataset):
+        # Repeat the read-only checks after acquiring the lock.
+        validate_sync_paths(dataset)
+        if output == dataset or (dataset / SYNC_INCOMPLETE).exists():
+            check_existing_outputs(dataset, dataset)
+        if output == dataset:
+            yield dataset, output
+        else:
+            output = separate_output(dataset, output)
+            output.mkdir(parents=True, exist_ok=True)
+            with sync_writer_lock(output):
+                yield dataset, output
+
+
 def build_synced_dataset(
     dataset: Path,
     threshold_ms: float = DEFAULT_SYNC_THRESHOLD_MS,
@@ -314,15 +485,17 @@ def build_synced_dataset(
 ):
     """Build or replace sync outputs; leave capture metadata and streams intact."""
     validate_thresholds(threshold_ms, rgb_depth_threshold_ms, gps_max_delta_ms)
-    dataset = dataset.expanduser().resolve()
+    with sync_build_session(dataset, output_dir) as (dataset, output_dir):
+        return _build_synced_dataset(
+            dataset, threshold_ms, output_dir, copy_images, rgb_depth_threshold_ms, gps_max_delta_ms,
+        )
+
+
+def _build_synced_dataset(dataset, threshold_ms, output_dir, copy_images,
+                         rgb_depth_threshold_ms, gps_max_delta_ms):
+    """Build within an existing writer session (shared by both CLI adapters)."""
     if (dataset / SYNC_INCOMPLETE).exists():
-        check_existing_outputs(dataset, dataset)
         recover_sync_generation(dataset)
-    if output_dir is None:
-        output_dir = dataset
-    else:
-        output_dir = separate_output(dataset, output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
 
     check_existing_outputs(dataset, output_dir)
 
@@ -555,31 +728,29 @@ def main(argv=None):
         path = Path(value).expanduser()
         return path if path.is_absolute() else config_root / path
     dataset = configured_path(args.dataset).resolve()
-    if (dataset / SYNC_INCOMPLETE).exists():
-        check_existing_outputs(dataset, dataset)
-        recover_sync_generation(dataset)
-    output = separate_output(dataset, configured_path(args.output_dir)) if args.output_dir else None
-    check_existing_outputs(dataset, output if output is not None else dataset)
-    capture = validate_sync_capture(dataset, allow_legacy=args.allow_legacy)
-    try:
-        out, report = build_synced_dataset(
-            dataset, args.sync_threshold_ms, output, True, args.rgb_depth_threshold_ms,
-            gps_max_delta_ms=args.gps_max_delta_ms,
-        )
-    except BaseException as error:
-        if output is not None and output.is_dir():
-            atomic_json(output / "processing_manifest.json", {
-                "schema": "geonova.processing-run/v1", "state": "failed", "stage": "sync",
+    output = configured_path(args.output_dir) if args.output_dir else None
+    with sync_build_session(dataset, output) as (dataset, out):
+        # Validate capture paths and inventory before recovery can modify entries.
+        capture = validate_sync_capture(dataset, allow_legacy=args.allow_legacy)
+        try:
+            out, report = _build_synced_dataset(
+                dataset, args.sync_threshold_ms, out, True, args.rgb_depth_threshold_ms,
+                args.gps_max_delta_ms,
+            )
+        except BaseException as error:
+            if output is not None:
+                atomic_json(out / "processing_manifest.json", {
+                    "schema": "geonova.processing-run/v1", "state": "failed", "stage": "sync",
+                    "source_run_id": capture["run_id"] if capture else dataset.name,
+                    "updated_at_utc": utc_now(), "error_type": type(error).__name__,
+                })
+            raise
+        if output is not None:
+            atomic_json(out / "processing_manifest.json", {
+                "schema": "geonova.processing-run/v1", "state": "complete", "stage": "sync",
                 "source_run_id": capture["run_id"] if capture else dataset.name,
-                "updated_at_utc": utc_now(), "error_type": type(error).__name__,
+                "source_capture": capture, "updated_at_utc": utc_now(),
             })
-        raise
-    if output is not None:
-        atomic_json(out / "processing_manifest.json", {
-            "schema": "geonova.processing-run/v1", "state": "complete", "stage": "sync",
-            "source_run_id": capture["run_id"] if capture else dataset.name,
-            "source_capture": capture, "updated_at_utc": utc_now(),
-        })
     print(f"Synced dataset ready: {out}")
     print(json.dumps(report, indent=2, ensure_ascii=False))
 
