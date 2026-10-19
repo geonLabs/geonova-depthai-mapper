@@ -106,6 +106,16 @@ def make_dataset(root, events, timestamp=1_000_000_000, metadata=None, gps_rows=
     return geometry.Dataset(root)
 
 
+def confirm_gps_stops(dataset, *windows):
+    """Add independent 10 Hz GPS speed reports, mapped through the synced clock."""
+    row = dataset.timestamps[0]
+    offset = int(row["frame_host_monotonic_ns"]) - int(row["rgb_device_ts_ns"])
+    for start, end in windows:
+        for timestamp in range(start, end + 1, 100_000_000):
+            dataset.gps_rows.append({"host_monotonic_ns": timestamp + offset,
+                                     "speed_knots": 0, "hdop": 0.5, "position_valid": 1})
+
+
 class CameraImuTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -141,6 +151,7 @@ class CameraImuTests(unittest.TestCase):
         for row in events[201:]:
             row["accel_x_m_s2"] = -8.0
         dataset = make_dataset(self.root, events, 5_000_000_000)
+        confirm_gps_stops(dataset, (1_000_000_000, 3_000_000_000))
         self.assertAlmostEqual(self.summary(dataset)["roll_deg"], 0, places=5)
         dataset.orientation_config["imu_bias_window_s"] = 0
         self.assertGreater(self.summary(dataset)["roll_deg"], 2)
@@ -443,11 +454,12 @@ class CameraImuTests(unittest.TestCase):
                     self.assertFalse(result["trusted"])
                     self.assertLess(abs(result["pitch_deg"]), bound)
 
-    def test_constant_velocity_recovers_trust_without_stopping(self):
+    def test_constant_velocity_recovers_after_gps_confirmed_initial_stop(self):
         events = [raw_row(1_000_000_000 + j * 10_000_000, [0, 1, 0]) for j in range(1701)]
         for row in events[201:701]:
             row["accel_z_m_s2"] = 2.0
         dataset = make_dataset(self.root, events, 7_000_000_000)
+        confirm_gps_stops(dataset, (1_000_000_000, 3_000_000_000))
         self.assertFalse(self.summary(dataset)["trusted"])
         dataset.timestamps[0]["rgb_device_ts_ns"] = 18_000_000_000
         result = self.summary(dataset)
@@ -471,11 +483,63 @@ class CameraImuTests(unittest.TestCase):
                 expected = final_pitch * min(1.0, (j - 201) / 2000.0)
                 self.assertAlmostEqual(result["pitch_deg"], expected, places=6)
 
+    def test_gyro_bias_cannot_admit_late_acceleration_ramp(self):
+        # Two quiet seconds, then 0.1 deg/s bias. At 90 s acceleration
+        # ramps to 2 m/s^2 over 20 s, on physically level ground throughout.
+        events = []
+        for j in range(12001):
+            rate = math.radians(0.1) if j > 200 else 0.0
+            row = raw_row(1_000_000_000 + j * 10_000_000, [0, 1, 0], (rate, 0, 0))
+            row["accel_z_m_s2"] = 2.0 * min(1.0, max(0.0, (j - 9000) / 2000.0))
+            events.append(row)
+        dataset = make_dataset(self.root, events, 121_000_000_000)
+        self.assertFalse(self.summary(dataset)["trusted"])
+        level = geometry.compute_world_coordinate_for_source(dataset, dataset.frame(0), 320, 240, 4000,
+                                                              "gps-course-level")
+        self.assertEqual(level["status"], "ok")
+        self.assertEqual(level["orientation"]["tilt_source"], "level_assumption")
+
+    def test_acceleration_outage_cannot_reanchor_without_gps_stop(self):
+        events = []
+        for j in range(2701):
+            timestamp = 1_000_000_000 + j * 10_000_000
+            if 12_000_000_000 <= timestamp < 12_210_000_000:
+                continue
+            row = raw_row(timestamp, [0, 1, 0])
+            row["accel_z_m_s2"] = 2.0 * min(1.0, max(0.0, (j - 200) / 2000.0))
+            events.append(row)
+        dataset = make_dataset(self.root, events, 28_000_000_000)
+        confirm_gps_stops(dataset, (1_000_000_000, 2_900_000_000))
+        self.assertFalse(self.summary(dataset)["trusted"])
+
+    def test_uncertainty_expires_until_independent_stop(self):
+        events = [raw_row(1_000_000_000 + j * 10_000_000, [0, 1, 0]) for j in range(1501)]
+        dataset = make_dataset(self.root, events, 7_000_000_000)
+        dataset.orientation_config["imu_gyro_bias_bound_deg_s"] = 1.0
+        self.assertTrue(self.summary(dataset)["trusted"])
+        for timestamp in (9_000_000_000, 16_000_000_000):
+            dataset.timestamps[0]["rgb_device_ts_ns"] = timestamp
+            self.assertFalse(self.summary(dataset)["trusted"])
+        # Rebuild after supplying a later GPS-confirmed stop; quiet IMU alone
+        # above never renewed the reference's age.
+        confirm_gps_stops(dataset, (10_000_000_000, 13_000_000_000))
+        dataset._camera_imu_cache.clear()
+        self.assertTrue(self.summary(dataset)["trusted"])
+
+    def test_gyro_bias_estimation_requires_gps_speed_evidence(self):
+        events = [raw_row(1_000_000_000 + j * 10_000_000, [0, 1, 0], (0, 0, 0.02))
+                  for j in range(401)]
+        for row in events[201:]:
+            row["accel_x_m_s2"] = -8.0
+        dataset = make_dataset(self.root, events, 5_000_000_000)
+        self.assertGreater(self.summary(dataset)["roll_deg"], 2.0)
+
     def test_outage_reinitializes_instead_of_integrating_held_gyro(self):
         events = [raw_row(1_000_000_000 + j * 10_000_000, [0, 1, 0]) for j in range(101)]
         events.append(raw_row(2_010_000_000, [0, 1, 0], (0.2, 0, 0)))
         events.extend(raw_row(12_010_000_000 + j * 10_000_000, [0, 1, 0]) for j in range(101))
         dataset = make_dataset(self.root, events, 12_010_000_000)
+        confirm_gps_stops(dataset, (12_010_000_000, 13_010_000_000))
         result = self.summary(dataset)
         self.assertAlmostEqual(result["pitch_deg"], 0, places=8)
         self.assertFalse(result["trusted"])

@@ -24,11 +24,13 @@ imu_to_camera_rpy_deg: [0.0, 0.0, 0.0] # Native RDF camera fallback rotation
 imu_to_camera_validated: false        # Enable fallback only after physical validation; CLI 0/1
 imu_max_gap_ms: 100.0                 # Reset filter after either sensor has an outage
 imu_accel_innovation_deg: 7.0         # Cumulative bound against gyro-only gravity after initial still period
+imu_gyro_bias_bound_deg_s: 0.1        # Reference uncertainty growth; trust expires at the innovation bound
+imu_still_speed_m_s: 0.2             # GPS speed ceiling for re-anchoring and gyro-bias estimation
 imu_still_duration_s: 0.5             # Required still period before raw tilt becomes trusted
 imu_still_accel_tolerance_m_s2: 0.08   # Startup |a|-g tolerance, separate from correction rejection
 imu_filter_time_constant_s: 1.0
 imu_accel_rejection_m_s2: 1.5          # Correction reaches zero at this |a|-g error
-imu_bias_window_s: 2.0                # Initial gyro-bias window; zero disables bias estimation
+imu_bias_window_s: 2.0                # GPS-confirmed stop window; zero disables bias estimation
 imu_bias_accel_tolerance_m_s2: 0.2
 imu_bias_gyro_threshold_rad_s: 0.05
 

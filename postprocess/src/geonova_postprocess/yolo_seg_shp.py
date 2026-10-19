@@ -480,8 +480,16 @@ def run_dataset(
     print("[YOLO] Loading dataset and model...", flush=True)
     dataset = Dataset(dataset_root)
     dataset.orientation_config = dict(orientation_config or {})
+    if (orientation_config is None and linearization_config is not None
+            and line_config.trajectory_max_hdop != YOLO_DEFAULTS["trajectory_max_hdop"]):
+        # Keep custom full-config calls working. A default line config leaves
+        # dataset values intact; explicit CLI values (even defaults) carry
+        # their provenance in orientation_config.
+        dataset.orientation_config["trajectory_max_hdop"] = line_config.trajectory_max_hdop
     settings = orientation_settings(dataset)
     validate_imu_settings(settings)
+    line_config = replace(line_config, trajectory_max_hdop=settings["trajectory_max_hdop"])
+    validate_linearization_config(line_config)
     if orientation_source is None:
         orientation_source = settings["orientation_source"]
     if orientation_source not in ("gps-course", "gps-course-level"):
@@ -851,6 +859,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         explicit_parser.add_argument(*action.option_strings, dest=key, type=action.type,
                                      nargs=action.nargs, choices=action.choices, default=argparse.SUPPRESS)
     explicit, _ = explicit_parser.parse_known_args(sys.argv[1:] if argv is None else argv)
+    if args.config is not None:
+        args.config = args.config.expanduser().resolve()
     configured = load_yaml(args.config) if args.config is not None else {}
     args.orientation_overrides = {key: getattr(args, key) for key in ORIENTATION_KEYS
                                   if key in vars(explicit) or key in configured}

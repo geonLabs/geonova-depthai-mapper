@@ -26,6 +26,7 @@ IMU_SETTINGS = (
     "imu_bias_accel_tolerance_m_s2", "imu_bias_gyro_threshold_rad_s",
     "imu_to_camera_validated", "imu_max_gap_ms", "imu_accel_innovation_deg",
     "imu_still_duration_s", "imu_still_accel_tolerance_m_s2",
+    "imu_gyro_bias_bound_deg_s", "imu_still_speed_m_s",
 )
 SINGLE_POINT_MOUNT_NOTE = "Single-point calibration solves yaw only; current roll and pitch are unchanged."
 
@@ -141,22 +142,52 @@ def _require_complete_sync(root):
         raise ValueError("Dataset sync is incomplete (sync.incomplete); re-run sync.")
 
 
+def _sync_state(root):
+    incomplete = (root / "sync.incomplete").exists()
+    if incomplete:
+        return True, None
+    path = root / "metadata.sync.json"
+    generation = None
+    if path.exists():
+        with path.open(encoding="utf-8") as file:
+            generation = json.load(file).get("generation")
+    return incomplete, generation
+
+
+def _read_synced_rows(root):
+    # The writer publishes metadata.sync.json last, with the marker held.
+    # Generation catches a complete publication between the two marker checks.
+    for attempt in range(3):
+        before = _sync_state(root)
+        if not before[0]:
+            try:
+                for name in ("timestamps.csv", "imu.csv"):
+                    if not (root / name).exists():
+                        raise ValueError(f"{name} not found in {root}")
+                timestamps = read_csv(root / "timestamps.csv")
+                imu = read_csv(root / "imu.csv")
+            except (OSError, csv.Error, ValueError):
+                if _sync_state(root) == before:
+                    raise
+            else:
+                after = _sync_state(root)
+                if not after[0] and before == after:
+                    return timestamps, imu, after[1]
+        if attempt < 2:
+            time.sleep(0.02)
+    _require_complete_sync(root)
+    raise ValueError("Dataset sync changed while loading; retry after sync completes.")
+
+
 class Dataset:
     def __init__(self, root):
         self.root = root
-        _require_complete_sync(root)
         timestamps_path = root / "timestamps.csv"
-        imu_path = root / "imu.csv"
         metadata_path = root / "metadata.json"
 
-        if not timestamps_path.exists():
-            raise ValueError(f"timestamps.csv not found in {root}")
-        if not imu_path.exists():
-            raise ValueError(f"imu.csv not found in {root}")
-
-        self.timestamps = read_csv(timestamps_path)
+        self.timestamps, imu_rows, self.sync_generation = _read_synced_rows(root)
         self.imu_by_frame = {}
-        for row in read_csv(imu_path):
+        for row in imu_rows:
             frame_index = safe_int(row.get("frame_index"), -1)
             self.imu_by_frame.setdefault(frame_index, []).append(row)
 
@@ -189,7 +220,6 @@ class Dataset:
         self.yolo_by_frame = {}
         self.yolo_results_mtime_ns = None
         self.reload_yolo_results()
-        _require_complete_sync(root)
 
     def _index_gps(self):
         self.valid_course_rows = []
@@ -288,11 +318,11 @@ class Dataset:
 
 def get_dataset(path_text):
     root = resolve_path(path_text)
-    _require_complete_sync(root)
+    incomplete, generation = _sync_state(root)
     key = str(root)
     with CACHE_LOCK:
         cached = DATASET_CACHE.get(key)
-        if cached is not None:
+        if not incomplete and cached is not None and cached.sync_generation == generation:
             DATASET_CACHE.move_to_end(key)
             return cached
 
@@ -487,7 +517,7 @@ def validate_imu_settings(settings):
         elif not np.isfinite(value) or value < 0 or (
             key in ("imu_filter_time_constant_s", "imu_accel_rejection_m_s2",
                     "imu_max_gap_ms", "imu_accel_innovation_deg", "imu_still_duration_s",
-                    "imu_still_accel_tolerance_m_s2") and value == 0
+                    "imu_still_accel_tolerance_m_s2", "imu_gyro_bias_bound_deg_s") and value == 0
         ):
             raise ValueError(f"Invalid {key}.")
     if settings["imu_accel_innovation_deg"] >= 90:
@@ -525,32 +555,39 @@ def _imu_vector(row, prefix, suffix):
     return np.array(values, dtype=float)
 
 
-def _initial_gyro_bias(accels, gyros, settings):
-    duration = settings["imu_bias_window_s"] * 1e9
-    zero = np.zeros(3)
-    if not accels or not gyros or duration <= 0:
-        return zero
-    start = max(accels[0][0], gyros[0][0])
-    end = start + duration
-    if min(accels[-1][0], gyros[-1][0]) < end:
-        return zero
-    a = np.array([v for t, v in accels if start <= t <= end])
-    w = np.array([v for t, v in gyros if start <= t <= end])
-    if len(a) < 2 or len(w) < 2:
-        return zero
-    max_gap = settings["imu_max_gap_ms"] * 1e6
-    for samples in (accels, gyros):
-        times = [t for t, _ in samples if start <= t <= end]
-        if times[0] - start > max_gap or end - times[-1] > max_gap or max(np.diff(times)) > max_gap:
-            return zero
-    tolerance = settings["imu_bias_accel_tolerance_m_s2"]
-    if (
-        np.max(np.abs(np.linalg.norm(a, axis=1) - 9.80665)) > tolerance
-        or np.max(np.linalg.norm(a - np.mean(a, axis=0), axis=1)) > tolerance
-        or np.max(np.linalg.norm(w, axis=1)) > settings["imu_bias_gyro_threshold_rad_s"]
-    ):
-        return zero
-    return np.mean(w, axis=0)
+def _gps_speed_samples(dataset, settings):
+    """Map GPS measurement times onto the IMU/device clock using synced frames."""
+    offsets = []
+    for row in dataset.timestamps:
+        device = safe_int(row.get("rgb_device_ts_ns"), None)
+        host = safe_int(row.get("frame_host_monotonic_ns"), None)
+        if device is not None and host is not None:
+            offsets.append(host - device)
+    if not offsets:
+        return [], []
+    offset = int(np.median(offsets))
+    samples = {}
+    for row in dataset.gps_rows:
+        host = safe_int(row.get("measurement_host_monotonic_ns"),
+                        safe_int(row.get("host_monotonic_ns"), None))
+        speed = safe_float(row.get("speed_knots"))
+        hdop = safe_float(row.get("hdop"))
+        if (host is None or speed is None or speed < 0
+                or safe_bool(row.get("position_valid")) is False
+                or (hdop is not None and hdop > settings["trajectory_max_hdop"])):
+            continue
+        # Conflicting samples at one time must not fabricate a stop.
+        timestamp = host - offset
+        samples[timestamp] = max(samples.get(timestamp, 0), speed * 0.514444)
+    times = sorted(samples)
+    return times, [samples[t] for t in times]
+
+
+def _gps_confirms_still(timestamp, times, speeds, settings):
+    pos = bisect.bisect_right(times, timestamp) - 1
+    # Do not extrapolate a stop through missing GPS reports (allow 1 Hz GPS).
+    return (pos >= 0 and timestamp - times[pos] <= 1_000_000_000
+            and speeds[pos] <= settings["imu_still_speed_m_s"])
 
 
 def _rotate_gravity(gravity, omega, dt):
@@ -592,13 +629,16 @@ def _build_camera_imu_series(dataset, settings):
         return times, np.array([vectors[t] for t in times]), "game_rotation_vector", support
     if not accels or not gyros:
         return [], [], "unavailable", []
-    bias = _initial_gyro_bias(sorted(accels.items()), sorted(gyros.items()), settings)
+    bias = np.zeros(3)
+    gps_times, gps_speeds = _gps_speed_samples(dataset, settings)
     # Combine simultaneous reports before evaluating validity. Each estimate
     # retains both actual sensor timestamps and the filter's outage generation.
     max_gap = settings["imu_max_gap_ms"] * 1e6
     gravity, gyro_gravity, omega, previous_time = None, None, None, None
     last_accel_time, last_gyro_time, still_since = None, None, None
     still_down = None
+    anchor_time, stop_since, stop_down = None, None, None
+    stop_gyro_sum, stop_gyro_count = np.zeros(3), 0
     converged, correction_ok, generation = False, False, 0
     times, directions, support = [], [], []
     for timestamp in sorted(set(accels) | set(gyros)):
@@ -610,6 +650,8 @@ def _build_camera_imu_series(dataset, settings):
         if outage:
             gravity, gyro_gravity, still_since, still_down = None, None, None, None
             converged, correction_ok = False, False
+            anchor_time, stop_since, stop_down = None, None, None
+            stop_gyro_sum, stop_gyro_count = np.zeros(3), 0
             generation += 1
         elif gravity is not None and omega is not None and previous_time is not None:
             dt = (timestamp - previous_time) / 1e9
@@ -628,18 +670,15 @@ def _build_camera_imu_series(dataset, settings):
             weight = max(0.0, 1.0 - error / settings["imu_accel_rejection_m_s2"])
             fresh_gyro = last_gyro_time is not None and timestamp - last_gyro_time <= max_gap
             still = (fresh_gyro and error <= settings["imu_still_accel_tolerance_m_s2"]
-                     and np.linalg.norm(omega) <= settings["imu_bias_gyro_threshold_rad_s"])
+                     and np.linalg.norm(omega + bias) <= settings["imu_bias_gyro_threshold_rad_s"])
             correction_ok = False
             if magnitude > 1e-9 and weight > 0:
                 # Accelerometers measure specific force, opposite physical down.
                 measured = -value / magnitude
-                if gravity is None or (not converged and still):
+                if gravity is None or (generation == 0 and not converged and still):
                     gravity = measured
                     gyro_gravity = measured.copy()
-                # After initial convergence, this reference is gyro-only until
-                # an outage. Quiet accelerometer windows cannot re-anchor it:
-                # a slow acceleration ramp can look quiet in every window.
-                # Innovation therefore includes cumulative disagreement.
+                # Corrections never move the independent gyro reference.
                 innovation = float(np.rad2deg(np.arccos(np.clip(gyro_gravity @ measured, -1.0, 1.0))))
                 correction_ok = innovation <= settings["imu_accel_innovation_deg"]
                 if correction_ok and last_accel_time is not None:
@@ -648,7 +687,7 @@ def _build_camera_imu_series(dataset, settings):
                     gravity = (1.0 - alpha) * gravity + alpha * measured
                     norm = np.linalg.norm(gravity)
                     gravity = gravity / norm if norm > 1e-9 else measured
-            if still and magnitude > 1e-9:
+            if generation == 0 and not converged and still and magnitude > 1e-9:
                 measured = -value / magnitude
                 if (still_down is not None
                         and np.linalg.norm(measured - still_down) * 9.80665
@@ -661,13 +700,44 @@ def _build_camera_imu_series(dataset, settings):
                     converged = True
                     gravity = measured.copy()
                     gyro_gravity = measured.copy()
+                    anchor_time = timestamp
                     correction_ok = True
             else:
                 still_since, still_down = None, None
+
+            # Only GPS-confirmed stops may refresh an anchor or estimate bias.
+            # The initial accel-only anchor gets a limited uncertainty budget;
+            # an outage cannot start that budget over without independent evidence.
+            stopped = (still and error <= settings["imu_bias_accel_tolerance_m_s2"]
+                       and _gps_confirms_still(timestamp, gps_times, gps_speeds, settings))
+            if stopped and magnitude > 1e-9:
+                measured = -value / magnitude
+                if (stop_down is not None and np.linalg.norm(measured - stop_down) * 9.80665
+                        > min(settings["imu_still_accel_tolerance_m_s2"],
+                              settings["imu_bias_accel_tolerance_m_s2"])):
+                    stop_since = None
+                if stop_since is None:
+                    stop_since, stop_down = timestamp, measured.copy()
+                    stop_gyro_sum, stop_gyro_count = np.zeros(3), 0
+                stop_gyro_sum += omega + bias
+                stop_gyro_count += 1
+                duration = (timestamp - stop_since) / 1e9
+                if duration >= settings["imu_still_duration_s"]:
+                    gravity, gyro_gravity = measured.copy(), measured.copy()
+                    anchor_time, converged, correction_ok = timestamp, True, True
+                if settings["imu_bias_window_s"] > 0 and duration >= settings["imu_bias_window_s"]:
+                    raw_omega = omega + bias
+                    bias = stop_gyro_sum / stop_gyro_count
+                    omega = raw_omega - bias
+            else:
+                stop_since, stop_down = None, None
             last_accel_time = timestamp
         fresh = (last_accel_time is not None and last_gyro_time is not None
                  and timestamp - last_accel_time <= max_gap and timestamp - last_gyro_time <= max_gap)
-        valid = gravity is not None and fresh and converged and correction_ok
+        uncertainty = (float("inf") if anchor_time is None else
+                       settings["imu_gyro_bias_bound_deg_s"] * (timestamp - anchor_time) / 1e9)
+        valid = (gravity is not None and fresh and converged and correction_ok
+                 and uncertainty <= settings["imu_accel_innovation_deg"])
         times.append(timestamp)
         directions.append(gravity.copy() if gravity is not None else np.zeros(3))
         support.append((valid, last_accel_time, last_gyro_time, generation))
@@ -679,6 +749,7 @@ def _camera_imu_series(dataset, settings):
     # Only filter settings affect the continuous stream; mount and extrinsics do not.
     key = tuple(settings[name] for name in IMU_SETTINGS
                 if name not in ("imu_to_camera_rpy_deg", "imu_to_camera_validated", "imu_max_delta_ms"))
+    key += (settings["trajectory_max_hdop"],)
     with dataset._camera_imu_lock:
         if key not in dataset._camera_imu_cache:
             dataset._camera_imu_cache[key] = _build_camera_imu_series(dataset, settings)

@@ -105,6 +105,15 @@ class PostprocessConfigTests(unittest.TestCase):
                                                      "imu_accel_innovation_deg": 4.0})
         self.assertEqual(yolo.parse_args([]).orientation_overrides, {})
 
+    def test_config_home_path_expands_for_values_and_provenance(self):
+        config_path = self.root / "review_config.yaml"
+        config_path.write_text("trajectory_max_hdop: 1.1\nimu_gyro_bias_bound_deg_s: 0.2\n", encoding="utf-8")
+        with patch.dict("os.environ", {"HOME": str(self.root), "USERPROFILE": str(self.root)}):
+            args = yolo.parse_args(["--config", "~/review_config.yaml"])
+        self.assertEqual(args.config, config_path.resolve())
+        self.assertEqual(args.orientation_overrides, {"trajectory_max_hdop": 1.1,
+                                                     "imu_gyro_bias_bound_deg_s": 0.2})
+
     def test_orientation_help_explains_precedence(self):
         output = io.StringIO()
         with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as stopped:
@@ -228,6 +237,51 @@ class PostprocessConfigTests(unittest.TestCase):
         self.assertEqual(summary["orientation_source"], "gps-course-level")
         with (output / "points.csv").open(encoding="utf-8-sig", newline="") as file:
             self.assertTrue(all(row["coordinate_quality"] == "approximate" for row in csv.DictReader(file)))
+
+    def test_main_resolves_shared_hdop_for_orientation_and_automatic_linearization(self):
+        with (self.root / "timestamps.csv").open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=["rgb_file", "depth_file"])
+            writer.writeheader()
+            writer.writerows({"rgb_file": "rgb.png", "depth_file": "depth.png"} for _ in range(201))
+        (self.root / "imu.csv").write_text("frame_index\n", encoding="utf-8")
+        (self.root / "metadata.json").write_text(json.dumps({"world_coordinates": {
+            "trajectory_max_hdop": 1.5}}), encoding="utf-8")
+        (self.root / "metadata.overrides.json").write_text(json.dumps({"world_coordinates": {
+            "trajectory_max_hdop": 1.0}}), encoding="utf-8")
+        config_path = self.root / "review.yaml"
+        config_path.write_text("trajectory_max_hdop: 1.2\n", encoding="utf-8")
+        model_path = self.root / "model.pt"
+        model_path.touch()
+        image = np.zeros((32, 32, 3), dtype=np.uint8)
+        result = types.SimpleNamespace(boxes=[types.SimpleNamespace(cls=np.array(0), conf=np.array(0.9))],
+                                       masks=object(), plot=lambda: image)
+        module = types.ModuleType("ultralytics")
+        module.YOLO = lambda _: types.SimpleNamespace(task="segment", names={0: "fence"},
+                                                     predict=lambda **kwargs: [result])
+        world = {"status": "ok", "trusted": False, "longitude_deg": 127, "latitude_deg": 37, "altitude_m": 100}
+        cases = [(None, 1.0), ([], 1.0), (["--config", str(config_path)], 1.2),
+                 (["--trajectory-max-hdop", "2.5"], 2.5),
+                 (["--config", str(config_path), "--trajectory-max-hdop", "1.8"], 1.8)]
+        for flags, expected in cases:
+            with self.subTest(flags=flags), contextlib.ExitStack() as stack:
+                stack.enter_context(patch.dict(sys.modules, {"ultralytics": module}))
+                stack.enter_context(patch.object(yolo, "_binary_masks", return_value=[(0, np.ones((32, 32), dtype=np.uint8))]))
+                stack.enter_context(patch.object(yolo, "get_depth_frame", return_value=np.full((32, 32), 4000, dtype=np.uint16)))
+                stack.enter_context(patch.object(yolo, "_confidence_frame", return_value=None))
+                coordinates = stack.enter_context(patch.object(yolo, "compute_world_coordinate_for_source", return_value=world))
+                stack.enter_context(patch.object(yolo, "_prepare_writer", return_value=Mock()))
+                stack.enter_context(patch.object(yolo, "_write_prj"))
+                stack.enter_context(patch.object(yolo.cv2, "imread", return_value=image))
+                stack.enter_context(patch.object(yolo.cv2, "imwrite", return_value=True))
+                linearize = stack.enter_context(patch.object(yolo, "linearize_fence_points", return_value={}))
+                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                if flags is None:
+                    yolo.run_dataset(self.root, model_path, None, linearization_config=lines.LinearizationConfig())
+                else:
+                    yolo.main(["--dataset", str(self.root), "--model", str(model_path)] + flags)
+                dataset = coordinates.call_args.args[0]
+                self.assertEqual(geometry.orientation_settings(dataset)["trajectory_max_hdop"], expected)
+                self.assertEqual(linearize.call_args.args[3].trajectory_max_hdop, expected)
 
 
 if __name__ == "__main__":
