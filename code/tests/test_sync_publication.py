@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import errno
+import io
 import json
 import os
 import stat
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 from uuid import UUID
@@ -84,6 +86,15 @@ class SyncPublicationTests(unittest.TestCase):
             [fixtures.imu_row(0, 1_000_000_000)],
         )
 
+    def make_complete_capture(self, name="case"):
+        dataset = self.make_raw(name)
+        for directory in ("rgb", "depth_mm"):
+            image_dir = dataset / directory
+            image_dir.mkdir()
+            (image_dir / "0000000.png").write_bytes(b"capture image")
+        fixtures.write_capture_manifest(dataset, "complete")
+        return dataset
+
     def recover(self, dataset):
         with sync.sync_writer_lock(dataset):
             sync.recover_sync_generation(dataset)
@@ -141,10 +152,11 @@ sync.build_synced_dataset(Path(sys.argv[2]), gps_max_delta_ms=25.0)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("Sync writer already active", result.stderr)
                 self.assertEqual(fixtures.file_bytes(dataset), active)
-            separate = self.root / "blocked-output"
-            with self.assertRaisesRegex(RuntimeError, "Sync writer already active"):
-                sync.build_synced_dataset(dataset, output_dir=separate)
-            self.assertFalse(separate.exists())
+            separate = self.root / "separate-output"
+            sync.build_synced_dataset(dataset, output_dir=separate)
+            self.assertTrue((separate / sync.SYNC_LOCK).is_file())
+            self.assertTrue((dataset / sync.SYNC_LOCK).is_file())
+            self.assertEqual(fixtures.file_bytes(dataset), active)
             stdout, stderr = writer.communicate("\n", timeout=15)
             self.assertEqual(writer.returncode, 0, stdout + stderr)
         finally:
@@ -153,6 +165,41 @@ sync.build_synced_dataset(Path(sys.argv[2]), gps_max_delta_ms=25.0)
             writer.communicate()
         self.assertEqual(json.loads((dataset / "metadata.sync.json").read_text())["sync"]["gps_max_delta_ms"], 25.0)
         self.assert_clean(dataset)
+
+    def test_separate_output_leaves_capture_byte_identical_and_locks_output(self):
+        dataset = self.make_complete_capture()
+        before = {
+            path.relative_to(dataset).as_posix(): path.read_bytes()
+            for path in dataset.rglob("*") if path.is_file()
+        }
+        output = self.root / "portable-output"
+
+        with redirect_stdout(io.StringIO()):
+            sync.main(["--dataset", str(dataset), "--output-dir", str(output)])
+
+        after = {
+            path.relative_to(dataset).as_posix(): path.read_bytes()
+            for path in dataset.rglob("*") if path.is_file()
+        }
+        self.assertEqual(after, before)
+        self.assertFalse((dataset / sync.SYNC_LOCK).exists())
+        self.assertTrue((output / sync.SYNC_LOCK).is_file())
+
+    def test_rejected_capture_does_not_create_output_folder_or_lock(self):
+        for state in ("recording", "failed"):
+            with self.subTest(state=state):
+                dataset = self.make_complete_capture(state)
+                fixtures.write_capture_manifest(dataset, state)
+                output = self.root / (state + "-output")
+
+                with redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(ValueError, "not complete"):
+                        sync.main([
+                            "--dataset", str(dataset), "--output-dir", str(output), "--allow-legacy",
+                        ])
+
+                self.assertFalse(output.exists())
+                self.assertFalse((dataset / sync.SYNC_LOCK).exists())
 
     def check_unsafe_links(self, kind):
         names = list(sync.SYNC_OUTPUT_FILES)

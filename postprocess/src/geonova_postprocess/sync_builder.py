@@ -458,21 +458,12 @@ def stats(values):
 def sync_build_session(dataset, output_dir):
     dataset = dataset.expanduser().resolve()
     output = separate_output(dataset, output_dir) if output_dir is not None else dataset
-    validate_sync_paths(dataset)
-    if output == dataset or (dataset / SYNC_INCOMPLETE).exists():
-        check_existing_outputs(dataset, dataset)
-    with sync_writer_lock(dataset):
-        # Repeat the read-only checks after acquiring the lock.
-        validate_sync_paths(dataset)
-        if output == dataset or (dataset / SYNC_INCOMPLETE).exists():
-            check_existing_outputs(dataset, dataset)
-        if output == dataset:
-            yield dataset, output
-        else:
-            output = separate_output(dataset, output)
-            output.mkdir(parents=True, exist_ok=True)
-            with sync_writer_lock(output):
-                yield dataset, output
+    validate_sync_paths(output)
+    check_existing_outputs(dataset, output)
+    if output != dataset:
+        output.mkdir(parents=True, exist_ok=True)
+    with sync_writer_lock(output):
+        yield dataset, output
 
 
 def build_synced_dataset(
@@ -494,8 +485,8 @@ def build_synced_dataset(
 def _build_synced_dataset(dataset, threshold_ms, output_dir, copy_images,
                          rgb_depth_threshold_ms, gps_max_delta_ms):
     """Build within an existing writer session (shared by both CLI adapters)."""
-    if (dataset / SYNC_INCOMPLETE).exists():
-        recover_sync_generation(dataset)
+    if (output_dir / SYNC_INCOMPLETE).exists():
+        recover_sync_generation(output_dir)
 
     check_existing_outputs(dataset, output_dir)
 
@@ -729,9 +720,11 @@ def main(argv=None):
         return path if path.is_absolute() else config_root / path
     dataset = configured_path(args.dataset).resolve()
     output = configured_path(args.output_dir) if args.output_dir else None
+    # A rejected capture must not cause a lock file, output directory, or
+    # recovery write. Validate the complete source before opening a session.
+    validate_sync_paths(dataset)
+    capture = validate_sync_capture(dataset, allow_legacy=args.allow_legacy)
     with sync_build_session(dataset, output) as (dataset, out):
-        # Validate capture paths and inventory before recovery can modify entries.
-        capture = validate_sync_capture(dataset, allow_legacy=args.allow_legacy)
         try:
             out, report = _build_synced_dataset(
                 dataset, args.sync_threshold_ms, out, True, args.rgb_depth_threshold_ms,
