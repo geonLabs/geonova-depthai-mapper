@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared DepthAI v3 camera, timestamp, GPS/NTRIP, and EBIMU runtime helpers."""
+"""Shared DepthAI v3 camera, timestamp, GPS/NTRIP, and OAK IMU runtime helpers."""
 
 import argparse
 import base64
@@ -1839,63 +1839,6 @@ class NmeaParserState:
         return merged
 
 
-def parse_ebimu_line(line):
-    if not line.startswith("*"):
-        return {}
-
-    parts = line[1:].split(",")
-    parsed = {"external_imu_format": "ebimu"}
-
-    try:
-        values = [float(part) for part in parts]
-    except ValueError:
-        return parsed
-
-    # Recommended configure_ebimu.py output:
-    # *qz,qy,qx,qw,gx,gy,gz,ax,ay,az,mx,my,mz,timestamp_ms
-    if len(values) >= 14:
-        parsed.update({
-            "orientation_format": "quaternion",
-            "q_z": values[0],
-            "q_y": values[1],
-            "q_x": values[2],
-            "q_w": values[3],
-            "gyro_x": values[4],
-            "gyro_y": values[5],
-            "gyro_z": values[6],
-            "accel_x": values[7],
-            "accel_y": values[8],
-            "accel_z": values[9],
-            "mag_x": values[10],
-            "mag_y": values[11],
-            "mag_z": values[12],
-            "ebimu_timestamp_ms": int(values[13]),
-        })
-        return parsed
-
-    # Euler check mode:
-    # *roll,pitch,yaw,gx,gy,gz,ax,ay,az,mx,my,mz,timestamp_ms
-    if len(values) >= 13:
-        parsed.update({
-            "orientation_format": "euler",
-            "roll_deg": values[0],
-            "pitch_deg": values[1],
-            "yaw_deg": values[2],
-            "gyro_x": values[3],
-            "gyro_y": values[4],
-            "gyro_z": values[5],
-            "accel_x": values[6],
-            "accel_y": values[7],
-            "accel_z": values[8],
-            "mag_x": values[9],
-            "mag_y": values[10],
-            "mag_z": values[11],
-            "ebimu_timestamp_ms": int(values[12]),
-        })
-
-    return parsed
-
-
 def matrix_to_json(matrix):
     return [[float(value) for value in row] for row in matrix]
 
@@ -2409,16 +2352,6 @@ class SerialRateLimitedReader:
         return text
 
 
-def serial_max_hz_values(args):
-    gps_max_hz = args.gps_max_hz if args.gps_max_hz is not None else args.serial_max_hz
-    external_imu_max_hz = (
-        args.external_imu_max_hz
-        if args.external_imu_max_hz is not None
-        else args.serial_max_hz
-    )
-    return gps_max_hz, external_imu_max_hz
-
-
 def gps_status_text(serial_readers):
     reader = (serial_readers or {}).get("gps")
     return reader.status_text() if reader is not None else "gps=disabled"
@@ -2461,9 +2394,8 @@ def build_rtk_config(args):
 def create_serial_readers(args):
     readers = {}
     gps_selector = getattr(args, "gps_device", "auto")
-    external_imu_selector = getattr(args, "external_imu_device", "auto")
     resolve_serial_devices(args)
-    gps_max_hz, external_imu_max_hz = serial_max_hz_values(args)
+    gps_max_hz = args.gps_max_hz if args.gps_max_hz is not None else args.serial_max_hz
     if args.enable_gps:
         readers["gps"] = SerialRateLimitedReader(
             "gps",
@@ -2473,26 +2405,6 @@ def create_serial_readers(args):
             parser=NmeaParserState(),
             rtk_config=build_rtk_config(args),
             device_resolver=lambda: resolve_serial_device(gps_selector, "gps"),
-        )
-    if args.enable_external_imu:
-        parser = parse_ebimu_line if args.external_imu_format == "ebimu" else None
-
-        def resolve_external_imu():
-            gps_reader = readers.get("gps")
-            excluded = [gps_reader.device] if gps_reader is not None else []
-            return resolve_serial_device(
-                external_imu_selector,
-                "external_imu",
-                exclude_devices=excluded,
-            )
-
-        readers["external_imu"] = SerialRateLimitedReader(
-            "external_imu",
-            args.external_imu_device,
-            args.external_imu_baudrate,
-            external_imu_max_hz,
-            parser=parser,
-            device_resolver=resolve_external_imu,
         )
     return readers
 
@@ -2603,6 +2515,89 @@ def create_mjpeg_output(pipeline, input_output, fps, quality):
     return encoder.bitstream
 
 
+def imu_sensors_for_chip(chip_type):
+    """Return report names supported by a known on-board IMU."""
+    chip = str(chip_type).strip().upper()
+    bno08x = len(chip) == 6 and chip.startswith("BNO08") and chip[-1] in "0123456789X"
+    if not bno08x and chip != "BMI270":
+        return []
+    sensors = ["ACCELEROMETER_RAW", "GYROSCOPE_RAW"]
+    if bno08x:
+        sensors.append("GAME_ROTATION_VECTOR")
+    return sensors
+
+
+def read_imu_metadata(device, args):
+    """Read IMU firmware and the native IMU-to-RGB transform in centimeters."""
+    socket_name = getattr(args, "rgb_socket_name", "CAM_A")
+    extrinsics = {"camera_socket": socket_name, "matrix": None, "source": None}
+    metadata = {
+        "source": "oak",
+        "type": getattr(args, "imu_type", "UNKNOWN"),
+        "firmware_version": None,
+        "sensors": list(getattr(args, "imu_sensors", [])),
+        "rate_hz": int(getattr(args, "imu_rate", 0)),
+        "imu_to_camera": extrinsics,
+    }
+    if device is None:
+        extrinsics["error"] = "IMU metadata unavailable"
+        return metadata
+    try:
+        version = device.getIMUFirmwareVersion()
+        metadata["firmware_version"] = str(version) if version is not None else None
+    except Exception as error:
+        reason = " ".join(str(error).split())[:160] or "unknown error"
+        print(f"OAK IMU firmware unavailable: {reason}")
+    try:
+        if not metadata["sensors"]:
+            raise ValueError(getattr(args, "imu_error", None) or "IMU unavailable")
+        socket = getattr(args, "rgb_socket", None)
+        if socket is None:
+            socket = enum_by_name(dai.CameraBoardSocket, socket_name)
+        calibration = device.readCalibration()
+        matrix = matrix_to_json(calibration.getImuToCameraExtrinsics(socket, True))
+        if len(matrix) != 4 or any(len(row) != 4 for row in matrix):
+            raise ValueError("Invalid IMU extrinsics shape")
+        if not all(math.isfinite(value) for row in matrix for value in row):
+            raise ValueError("Invalid IMU extrinsics values")
+        extrinsics.update({
+            "matrix": matrix,
+            "translation_unit": "cm",
+            "source": "device_calibration",
+        })
+    except Exception as error:
+        extrinsics["error"] = " ".join(str(error).split())[:160] or "IMU extrinsics unavailable"
+        print(f"OAK IMU extrinsics unavailable: {extrinsics['error']}")
+    return metadata
+
+
+def configure_oak_imu(pipeline, args):
+    """Detect once per connection and use the same reports in both pipelines."""
+    device = pipeline.getDefaultDevice()
+    args.imu_error = None
+    try:
+        args.imu_type = str(device.getConnectedIMU())
+    except Exception:
+        args.imu_type = "UNKNOWN"
+        args.imu_error = "IMU detection failed"
+    args.imu_sensors = imu_sensors_for_chip(args.imu_type)
+    args.imu_enabled = bool(args.imu_sensors)
+    imu = None
+    if args.imu_enabled:
+        imu = pipeline.create(dai.node.IMU)
+        imu.enableIMUSensor([getattr(dai.IMUSensor, name) for name in args.imu_sensors], int(args.imu_rate))
+        imu.setBatchReportThreshold(1)
+        imu.setMaxBatchReports(args.imu_batch)
+        print(f"OAK IMU: type={args.imu_type}, sensors={','.join(args.imu_sensors)}, requested_rate={int(args.imu_rate)} Hz")
+    else:
+        args.imu_error = args.imu_error or (
+            "No OAK IMU" if args.imu_type.strip().upper() == "NONE" else "Unsupported OAK IMU"
+        )
+        print(f"OAK IMU disabled: type={args.imu_type}; {args.imu_error}")
+    args.imu_metadata = read_imu_metadata(device, args)
+    return imu
+
+
 def configure_monitor_pipeline(pipeline, args):
     """Build the low-bandwidth RGB + OAK IMU pipeline used by --monitor-only."""
     require_depthai_v3()
@@ -2633,23 +2628,18 @@ def configure_monitor_pipeline(pipeline, args):
         rgb_camera_size,
         rgb_size,
     )
-    imu = pipeline.create(dai.node.IMU)
-    imu.enableIMUSensor(
-        [dai.IMUSensor.ACCELEROMETER_RAW, dai.IMUSensor.GYROSCOPE_RAW],
-        args.imu_rate,
-    )
-    imu.setBatchReportThreshold(1)
-    imu.setMaxBatchReports(args.imu_batch)
+    imu = configure_oak_imu(pipeline, args)
 
     if args.rgb_transport_effective == "mjpeg":
         rgb_output = create_mjpeg_output(
             pipeline, rgb_output, args.fps, args.rgb_transport_quality
         )
+    imu_status = f"{int(args.imu_rate)} Hz" if imu is not None else "disabled"
     print(
         f"Monitor-only camera pipeline: rgb={rgb_size[0]}x{rgb_size[1]} "
-        f"@ {float(args.fps):g} FPS, depth=disabled, imu={int(args.imu_rate)} Hz"
+        f"@ {float(args.fps):g} FPS, depth=disabled, imu={imu_status}"
     )
-    return {"mode": "monitor", "rgb": rgb_output, "imu": imu.out}
+    return {"mode": "monitor", "rgb": rgb_output, "imu": imu.out if imu is not None else None}
 
 
 def configure_pipeline(pipeline, args, sync_imu=True):
@@ -2711,7 +2701,7 @@ def configure_pipeline(pipeline, args, sync_imu=True):
         image_align = pipeline.create(dai.node.ImageAlign)
         if args.save_confidence_map:
             confidence_align = pipeline.create(dai.node.ImageAlign)
-    imu = pipeline.create(dai.node.IMU)
+    imu = configure_oak_imu(pipeline, args)
     sync = pipeline.create(dai.node.Sync) if args.sync_mode == "device" else None
 
     rgb_camera_output = request_camera_output(
@@ -2753,13 +2743,6 @@ def configure_pipeline(pipeline, args, sync_imu=True):
         if confidence_align is not None:
             confidence_align.setOutputSize(*rgb_size)
 
-    imu.enableIMUSensor([
-        dai.IMUSensor.ACCELEROMETER_RAW,
-        dai.IMUSensor.GYROSCOPE_RAW,
-    ], args.imu_rate)
-    imu.setBatchReportThreshold(1)
-    imu.setMaxBatchReports(args.imu_batch)
-
     if sync is not None:
         sync.setSyncThreshold(timedelta(milliseconds=args.sync_threshold_ms))
         sync.setSyncAttempts(args.sync_attempts)
@@ -2800,7 +2783,7 @@ def configure_pipeline(pipeline, args, sync_imu=True):
     if sync is not None:
         rgb_stream_output.link(sync.inputs["rgb"])
         depth_output.link(sync.inputs["depth"])
-        if sync_imu:
+        if sync_imu and imu is not None:
             imu.out.link(sync.inputs["imu"])
 
     if sync is not None:
@@ -2813,6 +2796,6 @@ def configure_pipeline(pipeline, args, sync_imu=True):
         "mode": "host",
         "rgb": rgb_stream_output,
         "depth": depth_output,
-        "imu": imu.out,
+        "imu": imu.out if imu is not None else None,
         "confidence": confidence_output,
     }

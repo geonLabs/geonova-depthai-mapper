@@ -14,11 +14,9 @@ except ImportError:  # pragma: no cover - pyserial normally provides this module
 AUTO_SERIAL_DEVICE_VALUES = {"", "auto", "default"}
 SERIAL_IDENTITY_TOKENS = {
     "gps": ("u-blox", "ublox", "gnss receiver", "gnss_receiver", "gnss", "gps"),
-    "external_imu": ("ebimu", "e2box", "10c4:ea60", "cp2102", "silicon labs", "silicon_labs", "imu"),
 }
 SERIAL_REJECT_TOKENS = {
     "gps": ("samsung", "android", "galaxy", "04e8:6860", "smartphone", "modem"),
-    "external_imu": ("samsung", "android", "04e8:6860", "u-blox", "ublox", "gnss", "gps"),
 }
 
 
@@ -159,8 +157,7 @@ def resolve_serial_device(
 
 
 def resolve_serial_devices(args, by_id_dir="/dev/serial/by-id", port_infos=None):
-    """Resolve enabled recorder roles in-place and prevent cross-role reuse."""
-    used = set()
+    """Resolve the enabled GNSS recorder in-place."""
     if getattr(args, "enable_gps", False):
         args.gps_device = resolve_serial_device(
             getattr(args, "gps_device", "auto"),
@@ -169,20 +166,7 @@ def resolve_serial_devices(args, by_id_dir="/dev/serial/by-id", port_infos=None)
             port_infos=port_infos,
         )
         if args.gps_device:
-            used.add(args.gps_device)
             print(f"Resolved gps serial device: {args.gps_device}")
         else:
             print("GPS serial device unavailable: no safe GNSS identity found")
-    if getattr(args, "enable_external_imu", False):
-        args.external_imu_device = resolve_serial_device(
-            getattr(args, "external_imu_device", "auto"),
-            "external_imu",
-            by_id_dir=by_id_dir,
-            port_infos=port_infos,
-            exclude_devices=used,
-        )
-        if args.external_imu_device:
-            print(f"Resolved external_imu serial device: {args.external_imu_device}")
-        else:
-            print("External IMU serial device unavailable: no safe IMU identity found")
     return args

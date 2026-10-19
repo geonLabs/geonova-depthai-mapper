@@ -4,7 +4,7 @@ The defaults intentionally match the user's latest field command where possible:
 
     python synced_image_recorder.py \
       --output-dir ../data --rgb-format jpg --rotate-180 \
-      --sync-threshold-ms 50 --fps 15 --gps-max-hz 120 --external-imu-max-hz 120
+      --sync-threshold-ms 50 --fps 15 --gps-max-hz 120
 
 The new recorder stores unsynchronised per-stream event manifests first, then a
 post-process step builds the synchronized timestamps.csv used for analysis.
@@ -70,11 +70,6 @@ DEFAULTS = {
     "gps_device": "auto",
     "gps_baudrate": 921600,
     "gps_max_hz": 120.0,
-    "enable_external_imu": True,
-    "external_imu_device": "auto",
-    "external_imu_baudrate": 921600,
-    "external_imu_format": "ebimu",
-    "external_imu_max_hz": 120.0,
     "serial_max_hz": 120.0,
     # Public connection defaults. Credentials must come from environment
     # variables or an ignored *.local.yaml file.

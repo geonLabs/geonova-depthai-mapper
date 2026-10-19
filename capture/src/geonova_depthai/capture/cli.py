@@ -6,6 +6,13 @@ from .defaults import DEFAULTS
 from geonova_common.config_cli import SafeDefaultsHelpFormatter, parse_args_with_yaml
 
 
+# YAML compatibility only: these are no longer CLI options or runtime settings.
+REMOVED_CONFIG_KEYS = (
+    "enable_external_imu", "external_imu_device", "external_imu_baudrate",
+    "external_imu_format", "external_imu_max_hz",
+)
+
+
 def str2bool(value):
     if isinstance(value, bool):
         return value
@@ -118,12 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gps-baudrate", type=int, default=d["gps_baudrate"], help="GPS serial baud rate")
     parser.add_argument("--gps-max-hz", type=nonnegative_float, default=d["gps_max_hz"], help="Maximum GPS rows written per second; 0 keeps all")
     parser.add_argument("--no-gps", dest="enable_gps", action="store_false", default=d["enable_gps"], help="Disable GPS and NTRIP acquisition")
-    parser.add_argument("--external-imu-device", default=d["external_imu_device"], help="External IMU serial device path, COM port, or auto for stable /dev/serial/by-id discovery")
-    parser.add_argument("--external-imu-baudrate", type=int, default=d["external_imu_baudrate"], help="External IMU serial baud rate")
-    parser.add_argument("--external-imu-format", choices=["ebimu", "raw"], default=d["external_imu_format"], help="External IMU line parser")
-    parser.add_argument("--external-imu-max-hz", type=nonnegative_float, default=d["external_imu_max_hz"], help="Maximum external-IMU rows written per second")
     parser.add_argument("--serial-max-hz", type=nonnegative_float, default=d["serial_max_hz"], help="Legacy shared serial write-rate limit")
-    parser.add_argument("--no-external-imu", dest="enable_external_imu", action="store_false", default=d["enable_external_imu"], help="Disable external IMU acquisition")
 
     parser.add_argument("--rtk-ntrip-host", default=os.getenv("NTRIP_HOST", d["rtk_ntrip_host"]), help="NTRIP caster hostname")
     parser.add_argument("--rtk-ntrip-port", type=int, default=int(os.getenv("NTRIP_PORT", d["rtk_ntrip_port"])), help="NTRIP caster TCP port")
@@ -189,5 +191,10 @@ def apply_monitor_only_defaults(args):
 
 def parse_args(argv=None):
     parser = build_parser()
-    args = apply_legacy_compat_defaults(parse_args_with_yaml(parser, argv))
+    args = apply_legacy_compat_defaults(
+        parse_args_with_yaml(
+            parser, argv, ignored_keys=REMOVED_CONFIG_KEYS,
+            ignored_environment_keys=tuple(key.upper() for key in REMOVED_CONFIG_KEYS),
+        )
+    )
     return apply_monitor_only_defaults(args)

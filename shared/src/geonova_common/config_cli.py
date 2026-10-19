@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import os
 import sys
+import warnings
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -109,6 +111,8 @@ def parse_args_with_yaml(
     argv: Sequence[str] | None = None,
     *,
     default_config: Path | None = None,
+    ignored_keys: Sequence[str] = (),
+    ignored_environment_keys: Sequence[str] = (),
 ) -> argparse.Namespace:
     """Apply YAML values as parser defaults, then let explicit CLI options win.
 
@@ -135,6 +139,7 @@ def parse_args_with_yaml(
         write_default_yaml(parser, known.write_default_config)
         parser.exit(0, f"Wrote default YAML: {known.write_default_config}\n")
     config_path = known.config if known.config is not None else default_config
+    ignored = {key for key in ignored_environment_keys if key in os.environ}
     if config_path is not None:
         config_path = Path(config_path).expanduser().resolve()
         try:
@@ -142,6 +147,8 @@ def parse_args_with_yaml(
         except Exception as exc:
             parser.error(f"could not load YAML configuration file {config_path}: {exc}")
         actions = {action.dest: action for action in parser._actions}
+        ignored.update(set(data).intersection(ignored_keys))
+        data = {key: value for key, value in data.items() if key not in ignored_keys}
         unknown = sorted(set(data) - set(actions))
         if unknown:
             parser.error(f"unknown YAML keys: {', '.join(unknown)}")
@@ -156,4 +163,10 @@ def parse_args_with_yaml(
                 action.required = False
         converted["config"] = config_path
         parser.set_defaults(**converted)
+    if ignored:
+        warnings.warn(
+            "Ignoring removed configuration keys: " + ", ".join(sorted(ignored)),
+            UserWarning,
+            stacklevel=2,
+        )
     return parser.parse_args(arguments)

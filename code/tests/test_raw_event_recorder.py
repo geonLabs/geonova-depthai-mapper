@@ -197,7 +197,10 @@ def test_monitor_only_never_creates_dataset_and_releases_resources(monkeypatch) 
         def offer_rgb(self, message):  # pragma: no cover - empty test queue
             raise AssertionError(message)
 
-        def observe_imu(self):  # pragma: no cover - empty test queue
+        def configure_imu(self, enabled, error=None):
+            events.append(("bridge.imu", enabled, error))
+
+        def observe_imu(self, message):  # pragma: no cover - empty test queue
             raise AssertionError
 
     device = FakeDevice(events)
@@ -207,7 +210,6 @@ def test_monitor_only_never_creates_dataset_and_releases_resources(monkeypatch) 
             "--max-runtime-s",
             "0.001",
             "--no-gps",
-            "--no-external-imu",
         ]
     )
     monkeypatch.setattr(raw_event_recorder, "ControllerBridge", Bridge)
@@ -225,11 +227,11 @@ def test_monitor_only_never_creates_dataset_and_releases_resources(monkeypatch) 
     )
     monkeypatch.setattr(raw_event_recorder.runtime, "connect_depthai_device", lambda args: device)
     monkeypatch.setattr(raw_event_recorder.runtime, "resolve_transport_options", lambda args, device: None)
-    monkeypatch.setattr(
-        raw_event_recorder.runtime,
-        "configure_monitor_pipeline",
-        lambda pipeline, args: {"rgb": Output(), "imu": Output()},
-    )
+    def configure_monitor(pipeline, args):
+        args.imu_enabled, args.imu_error = False, "No OAK IMU"
+        return {"rgb": Output(), "imu": None}
+
+    monkeypatch.setattr(raw_event_recorder.runtime, "configure_monitor_pipeline", configure_monitor)
     monkeypatch.setattr(
         raw_event_recorder,
         "RawEventDataset",
@@ -239,6 +241,7 @@ def test_monitor_only_never_creates_dataset_and_releases_resources(monkeypatch) 
 
     raw_event_recorder.record_raw_events(args)
 
+    assert ("bridge.imu", False, "No OAK IMU") in events
     assert "pipeline.start" in events
     assert "pipeline.exit" in events
     assert "readers.stop" in events
@@ -303,3 +306,63 @@ def test_monitor_camera_failure_keeps_serial_bridge_alive_until_runtime_limit(mo
     assert "reader.drain" in events
     assert "reader.stop" in events
     assert ("bridge.close", None) in events
+
+
+def test_capture_without_imu_queue_still_closes_dataset(tmp_path, monkeypatch):
+    events = []
+
+    class EmptyQueue:
+        def tryGet(self):
+            return None
+
+    class Output:
+        def createOutputQueue(self, **kwargs):
+            return EmptyQueue()
+
+    class Pipeline:
+        def __init__(self, device):
+            self.device = device
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            pass
+
+        def getDefaultDevice(self):
+            return self.device
+
+        def start(self):
+            events.append("pipeline.start")
+
+    class ImagePool:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def close(self):
+            events.append("image_pool.close")
+
+    def configure(pipeline, args):
+        args.imu_enabled, args.imu_error, args.imu_type, args.imu_sensors = False, "No OAK IMU", "NONE", []
+        args.imu_metadata = raw_event_recorder.runtime.read_imu_metadata(None, args)
+        return {"rgb": Output(), "depth": Output(), "imu": None}
+
+    device = FakeDevice(events)
+    monkeypatch.setattr(raw_event_recorder.dai, "Pipeline", Pipeline)
+    monkeypatch.setattr(raw_event_recorder, "ImageWritePool", ImagePool)
+    monkeypatch.setattr(raw_event_recorder.runtime, "create_serial_readers", lambda args: {})
+    monkeypatch.setattr(raw_event_recorder.runtime, "connect_depthai_device", lambda args: device)
+    monkeypatch.setattr(raw_event_recorder.runtime, "resolve_transport_options", lambda args, device: None)
+    monkeypatch.setattr(raw_event_recorder.runtime, "configure_pipeline", configure)
+    monkeypatch.setattr(raw_event_recorder.runtime, "read_camera_model_metadata", lambda *args: {})
+    monkeypatch.setattr(raw_event_recorder.runtime, "read_stereo_depth_metadata", lambda *args: {})
+    monkeypatch.setattr(raw_event_recorder, "_stop_requested", False)
+    args = parse_args(["--no-gps", "--no-controller-bridge", "--output-dir", str(tmp_path), "--max-runtime-s", "0.001"])
+    raw_event_recorder.record_raw_events(args)
+    assert "pipeline.start" in events
+    assert "image_pool.close" in events
+    assert "device.close" in events
+    import json
+    root = next(tmp_path.glob("*_raw"))
+    assert json.loads((root / "metadata.json").read_text())["imu"]["type"] == "NONE"
+    assert json.loads((root / "capture_manifest.json").read_text())["state"] == "complete"

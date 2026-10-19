@@ -1,7 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
 
-from geonova_depthai import runtime
 from geonova_depthai import serial_devices
 
 
@@ -27,7 +26,7 @@ def test_gnss_auto_resolution_ignores_samsung_ttyacm0(tmp_path: Path) -> None:
         tmp_path / "dev" / "ttyACM1",
     )
 
-    resolved = runtime.resolve_serial_device(
+    resolved = serial_devices.resolve_serial_device(
         "auto", "gps", by_id_dir=by_id, port_infos=[]
     )
 
@@ -50,7 +49,7 @@ def test_legacy_samsung_ttyacm_path_is_rejected_and_gnss_is_rediscovered(
         tmp_path / "dev" / "ttyACM1",
     )
 
-    resolved = runtime.resolve_serial_device(
+    resolved = serial_devices.resolve_serial_device(
         str(tmp_path / "dev" / "ttyACM0"),
         "gps",
         by_id_dir=by_id,
@@ -58,21 +57,6 @@ def test_legacy_samsung_ttyacm_path_is_rejected_and_gnss_is_rediscovered(
     )
 
     assert resolved == str(gnss)
-
-
-def test_external_imu_uses_stable_cp2102_identity(tmp_path: Path) -> None:
-    by_id = tmp_path / "dev" / "serial" / "by-id"
-    imu = add_by_id(
-        by_id,
-        "usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0",
-        tmp_path / "dev" / "ttyUSB0",
-    )
-
-    resolved = runtime.resolve_serial_device(
-        "auto", "external_imu", by_id_dir=by_id, port_infos=[]
-    )
-
-    assert resolved == str(imu)
 
 
 def test_gnss_resolution_fails_closed_without_a_safe_identity(tmp_path: Path) -> None:
@@ -84,7 +68,7 @@ def test_gnss_resolution_fails_closed_without_a_safe_identity(tmp_path: Path) ->
     )
 
     assert (
-        runtime.resolve_serial_device(
+        serial_devices.resolve_serial_device(
             "auto", "gps", by_id_dir=by_id, port_infos=[]
         )
         is None
@@ -100,7 +84,7 @@ def test_samsung_hard_deny_wins_even_when_identity_contains_gnss(tmp_path: Path)
     )
 
     assert (
-        runtime.resolve_serial_device(
+        serial_devices.resolve_serial_device(
             "auto", "gps", by_id_dir=by_id, port_infos=[]
         )
         is None
@@ -115,7 +99,7 @@ def test_dangling_by_id_link_is_not_selected(tmp_path: Path) -> None:
     )
 
     assert (
-        runtime.resolve_serial_device(
+        serial_devices.resolve_serial_device(
             "auto", "gps", by_id_dir=by_id, port_infos=[]
         )
         is None
@@ -135,7 +119,7 @@ def test_gnss_resolution_fails_closed_when_two_receivers_match(tmp_path: Path) -
     )
 
     assert (
-        runtime.resolve_serial_device(
+        serial_devices.resolve_serial_device(
             "auto", "gps", by_id_dir=by_id, port_infos=[]
         )
         is None
@@ -156,7 +140,7 @@ def test_linux_does_not_fallback_to_numbered_tty_when_by_id_is_missing(
     )
 
     assert (
-        runtime.resolve_serial_device(
+        serial_devices.resolve_serial_device(
             "auto",
             "gps",
             by_id_dir=tmp_path / "missing-by-id",
@@ -164,53 +148,6 @@ def test_linux_does_not_fallback_to_numbered_tty_when_by_id_is_missing(
         )
         is None
     )
-
-
-def test_external_imu_resolution_fails_closed_when_cp2102_is_ambiguous(
-    tmp_path: Path,
-) -> None:
-    by_id = tmp_path / "dev" / "serial" / "by-id"
-    add_by_id(
-        by_id,
-        "usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_A-if00-port0",
-        tmp_path / "dev" / "ttyUSB0",
-    )
-    add_by_id(
-        by_id,
-        "usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_B-if00-port0",
-        tmp_path / "dev" / "ttyUSB1",
-    )
-
-    assert (
-        runtime.resolve_serial_device(
-            "auto", "external_imu", by_id_dir=by_id, port_infos=[]
-        )
-        is None
-    )
-
-
-def test_gnss_and_imu_cannot_resolve_aliases_of_the_same_physical_port(
-    tmp_path: Path,
-) -> None:
-    by_id = tmp_path / "dev" / "serial" / "by-id"
-    target = tmp_path / "dev" / "ttyUSB0"
-    add_by_id(by_id, "usb-u-blox_GNSS_receiver-if00", target)
-    add_by_id(
-        by_id,
-        "usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0",
-        target,
-    )
-    args = SimpleNamespace(
-        enable_gps=True,
-        gps_device="auto",
-        enable_external_imu=True,
-        external_imu_device="auto",
-    )
-
-    runtime.resolve_serial_devices(args, by_id_dir=by_id, port_infos=[])
-
-    assert args.gps_device is not None
-    assert args.external_imu_device is None
 
 
 def test_disabled_serial_roles_are_not_discovered(monkeypatch) -> None:
@@ -223,16 +160,16 @@ def test_disabled_serial_roles_are_not_discovered(monkeypatch) -> None:
     args = SimpleNamespace(
         enable_gps=False,
         gps_device="auto",
-        enable_external_imu=False,
-        external_imu_device="auto",
     )
 
-    runtime.resolve_serial_devices(args, port_infos=[])
+    serial_devices.resolve_serial_devices(args, port_infos=[])
 
     assert calls == []
 
 
 def test_serial_reader_reconnects_and_requests_exclusive_access(monkeypatch) -> None:
+    from geonova_depthai import runtime
+
     calls = []
     resolve_calls = []
     reader = None
@@ -261,12 +198,12 @@ def test_serial_reader_reconnects_and_requests_exclusive_access(monkeypatch) -> 
         resolve_calls.append(True)
         if len(resolve_calls) == 1:
             return None
-        return "/dev/serial/by-id/test-imu"
+        return "/dev/serial/by-id/test-gnss"
 
     monkeypatch.setattr(runtime.serial, "Serial", open_port)
     reader = runtime.SerialRateLimitedReader(
-        "external_imu",
-        "/dev/serial/by-id/test-imu",
+        "gps",
+        "/dev/serial/by-id/test-gnss",
         115200,
         0,
         parser=lambda line: {"line": line},

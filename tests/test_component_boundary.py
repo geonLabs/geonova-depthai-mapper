@@ -138,7 +138,7 @@ def test_cleanup_failure_does_not_publish_complete(tmp_path, monkeypatch):
     from geonova_depthai.capture.cli import parse_args
     from geonova_depthai.capture.raw_writer import RawEventDataset
     from geonova_depthai.capture.raw_event_recorder import _close_recording_resources
-    args = parse_args(["--no-gps", "--no-external-imu"])
+    args = parse_args(["--no-gps"])
     dataset = RawEventDataset(tmp_path, args)
     class BadPool:
         def close(self):
@@ -164,7 +164,7 @@ def fake_record(args):
     finally:
         recorder._close_recording_resources(None, {}, None, dataset, None)
 recorder.record_raw_events = fake_record
-recorder.main(['--no-gps', '--no-external-imu'])
+recorder.main(['--no-gps'])
 '''
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(ROOT / "capture/src"), str(ROOT / "shared/src")])}
     process = subprocess.Popen([sys.executable, "-c", script, str(tmp_path)], env=env,
@@ -188,7 +188,7 @@ recorder.main(['--no-gps', '--no-external-imu'])
 def test_dataset_close_attempts_all_csv_files_after_flush_error(tmp_path):
     from geonova_depthai.capture.cli import parse_args
     from geonova_depthai.capture.raw_writer import RawEventDataset
-    dataset = RawEventDataset(tmp_path, parse_args(["--no-gps", "--no-external-imu"]))
+    dataset = RawEventDataset(tmp_path, parse_args(["--no-gps"]))
     closed = []
     class Writer:
         def __init__(self, name, failure=False):

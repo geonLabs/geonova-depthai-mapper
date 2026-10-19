@@ -84,10 +84,8 @@ class ControllerBridge:
         self.flip = bool(getattr(args, "flip", False))
         self.camera_configured = True
         self.gnss_configured = bool(getattr(args, "enable_gps", False))
-        self.imu_configured = True
-        self.external_imu_configured = bool(
-            getattr(args, "enable_external_imu", False)
-        )
+        self.imu_configured = bool(getattr(args, "imu_enabled", False))
+        self._imu_error = getattr(args, "imu_error", None)
 
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
@@ -149,6 +147,8 @@ class ControllerBridge:
             self._last_camera_monotonic = None
             self._last_camera_epoch_ms = None
             self._last_preview_epoch_ms = None
+            self._last_imu_monotonic = None
+            self._last_imu_epoch_ms = None
             self._pending_rgb = None
             self._condition.notify_all()
 
@@ -187,7 +187,16 @@ class ControllerBridge:
                 self._next_preview_monotonic = now_monotonic + 1.0 / self.preview_fps
                 self._condition.notify_all()
 
-    def observe_imu(self):
+    def configure_imu(self, enabled, error=None):
+        with self._lock:
+            self.imu_configured = bool(enabled)
+            self._imu_error = error
+            self._last_imu_monotonic = None
+            self._last_imu_epoch_ms = None
+
+    def observe_imu(self, message):
+        if not getattr(message, "packets", None):
+            return
         with self._lock:
             self._last_imu_monotonic = time.monotonic()
             self._last_imu_epoch_ms = int(time.time() * 1000)
@@ -276,9 +285,7 @@ class ControllerBridge:
             "error": getattr(reader, "error", None) if reader is not None else None,
         }
 
-    def _imu_state(self, reader, now_epoch_ms, now_monotonic):
-        serial_sample = self._latest_reader_sample(reader)
-        serial_age_s = _sample_age_seconds(serial_sample, int(now_monotonic * 1_000_000_000))
+    def _imu_state(self, now_monotonic):
         with self._lock:
             oak_age_s = (
                 now_monotonic - self._last_imu_monotonic
@@ -286,36 +293,26 @@ class ControllerBridge:
                 else None
             )
             oak_epoch_ms = self._last_imu_epoch_ms
-        oak_active = oak_age_s is not None and oak_age_s <= self.sensor_stale_after_s
-        serial_active = serial_age_s is not None and serial_age_s <= self.sensor_stale_after_s
-        source = None
-        age_s = None
-        last_sample_epoch_ms = None
-        if oak_active and serial_active:
-            source = "oak+external"
-            age_s = min(oak_age_s, serial_age_s)
-            last_sample_epoch_ms = max(
-                oak_epoch_ms or 0,
-                now_epoch_ms - int(serial_age_s * 1000),
-            )
-        elif oak_age_s is not None and (serial_age_s is None or oak_age_s <= serial_age_s):
-            source = "oak"
-            age_s = oak_age_s
-            last_sample_epoch_ms = oak_epoch_ms
-        elif serial_age_s is not None:
-            source = "external"
-            age_s = serial_age_s
-            last_sample_epoch_ms = now_epoch_ms - int(serial_age_s * 1000)
+            configured = self.imu_configured
+            device_connected = self._device_connected
+            error = self._imu_error
+        active = bool(
+            configured and device_connected
+            and oak_age_s is not None and oak_age_s <= self.sensor_stale_after_s
+        )
+        if not device_connected:
+            error = "OAK camera disconnected"
+        elif configured and oak_age_s is None:
+            error = "Waiting for OAK IMU packets"
+        elif configured and not active:
+            error = "OAK IMU packets stale"
         return {
-            "configured": self.imu_configured or self.external_imu_configured,
-            "connected": bool(
-                self._device_connected
-                or (reader and getattr(reader, "started", False) and not getattr(reader, "error", None))
-            ),
-            "active": age_s is not None and age_s <= self.sensor_stale_after_s,
-            "lastSampleAtEpochMillis": last_sample_epoch_ms,
-            "source": source,
-            "error": getattr(reader, "error", None) if reader is not None else None,
+            "configured": configured,
+            "connected": active,
+            "active": active,
+            "lastSampleAtEpochMillis": oak_epoch_ms,
+            "source": "oak",
+            "error": error,
         }
 
     def snapshot(self, serial_readers=None):
@@ -347,9 +344,7 @@ class ControllerBridge:
         gnss = self._gnss_state(
             readers.get("gps"), now_epoch_ms, time.monotonic_ns()
         )
-        imu = self._imu_state(
-            readers.get("external_imu"), now_epoch_ms, now_monotonic
-        )
+        imu = self._imu_state(now_monotonic)
         if not pipeline["active"]:
             camera["connected"] = False
             camera["active"] = False

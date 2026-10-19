@@ -54,7 +54,6 @@ def recorder_args(args: argparse.Namespace) -> SimpleNamespace:
         sync_attempts=-1,
         save_confidence_map=False,
         enable_gps=False,
-        enable_external_imu=False,
         rgb_transport="raw",
         confidence_transport="raw",
         rgb_transport_effective="raw",

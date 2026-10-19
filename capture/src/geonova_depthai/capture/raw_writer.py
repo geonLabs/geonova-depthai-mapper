@@ -39,6 +39,7 @@ IMU_EVENT_FIELDS = [
     "accel_device_ts_ns", "gyro_device_ts_ns",
     "accel_x_m_s2", "accel_y_m_s2", "accel_z_m_s2",
     "gyro_x_rad_s", "gyro_y_rad_s", "gyro_z_rad_s",
+    "rv_device_ts_ns", "rv_i", "rv_j", "rv_k", "rv_real", "rv_accuracy_rad",
 ]
 
 SERIAL_FIELDS = [
@@ -48,9 +49,7 @@ SERIAL_FIELDS = [
     "rtk_corrected", "position_valid", "satellites", "hdop", "status",
     "speed_knots", "course_deg", "geoid_separation_m", "differential_age_s",
     "reference_station_id", "measurement_wall_time_utc", "measurement_host_monotonic_ns",
-    "receive_latency_ms", "external_imu_format", "orientation_format", "q_x", "q_y", "q_z", "q_w",
-    "roll_deg", "pitch_deg", "yaw_deg", "gyro_x", "gyro_y", "gyro_z", "accel_x",
-    "accel_y", "accel_z", "mag_x", "mag_y", "mag_z", "ebimu_timestamp_ms",
+    "receive_latency_ms",
 ]
 
 
@@ -183,9 +182,8 @@ class RawEventDataset:
         self.confidence_events = ThreadSafeCsv(self.root / "confidence_events.csv", CONFIDENCE_EVENT_FIELDS) if args.save_confidence_map else None
         self.imu_events = ThreadSafeCsv(self.root / "imu_events.csv", IMU_EVENT_FIELDS)
         self.gps_events = ThreadSafeCsv(self.root / "gps.csv", SERIAL_FIELDS) if args.enable_gps else None
-        self.external_imu_events = ThreadSafeCsv(self.root / "external_imu.csv", SERIAL_FIELDS) if args.enable_external_imu else None
 
-        self.counters = {"rgb": 0, "depth": 0, "confidence": 0, "imu": 0, "gps": 0, "external_imu": 0}
+        self.counters = {"rgb": 0, "depth": 0, "confidence": 0, "imu": 0, "gps": 0}
         self.counter_lock = threading.Lock()
         self.metadata_lock = threading.Lock()
         self.camera_model_updated_from_rgb = False
@@ -225,6 +223,7 @@ class RawEventDataset:
             },
             "camera_model": camera_model,
             "stereo_depth_model": stereo_depth_model,
+            "imu": getattr(args, "imu_metadata", None) or runtime.read_imu_metadata(None, args),
             "image_size": {"width": width, "height": height},
             "camera_sockets": {
                 "rgb": getattr(args, "rgb_socket_name", "CAM_A"),
@@ -314,7 +313,7 @@ class RawEventDataset:
             "sync": {
                 "mode": "postprocess",
                 "threshold_ms": float(args.sync_threshold_ms),
-                "strategy": "RGB anchored nearest depth/IMU/GPS/external-IMU event",
+                "strategy": "RGB anchored nearest depth/IMU/GPS event",
             },
         }
 
@@ -418,6 +417,13 @@ class RawEventDataset:
         for packet_index, packet in enumerate(packets):
             accel = getattr(packet, "acceleroMeter", None)
             gyro = getattr(packet, "gyroscope", None)
+            # DepthAI 3.1 publishes GAME_ROTATION_VECTOR in rotationVector.
+            # Disabled reports still have default objects on real IMUPackets.
+            rv = None
+            if "GAME_ROTATION_VECTOR" in self.metadata["imu"]["sensors"]:
+                rv = getattr(packet, "rotationVector", None)
+                if rv is not None and not any(getattr(rv, field, 0) for field in ("i", "j", "k", "real")):
+                    rv = None
             self.imu_events.writerow({
                 "message_index": message_index,
                 "packet_index": packet_index,
@@ -436,10 +442,16 @@ class RawEventDataset:
                 "gyro_x_rad_s": getattr(gyro, "x", "") if gyro is not None else "",
                 "gyro_y_rad_s": getattr(gyro, "y", "") if gyro is not None else "",
                 "gyro_z_rad_s": getattr(gyro, "z", "") if gyro is not None else "",
+                "rv_device_ts_ns": runtime.get_device_ts_ns(rv) if rv is not None else "",
+                "rv_i": getattr(rv, "i", "") if rv is not None else "",
+                "rv_j": getattr(rv, "j", "") if rv is not None else "",
+                "rv_k": getattr(rv, "k", "") if rv is not None else "",
+                "rv_real": getattr(rv, "real", "") if rv is not None else "",
+                "rv_accuracy_rad": getattr(rv, "rotationVectorAccuracy", "") if rv is not None else "",
             })
 
     def write_serial_samples(self, name, samples):
-        writer = self.gps_events if name == "gps" else self.external_imu_events
+        writer = self.gps_events if name == "gps" else None
         if writer is None:
             return
         for sample in samples:
@@ -448,7 +460,7 @@ class RawEventDataset:
 
     def close(self):
         first_error = None
-        for writer in [self.rgb_events, self.depth_events, self.confidence_events, self.imu_events, self.gps_events, self.external_imu_events]:
+        for writer in [self.rgb_events, self.depth_events, self.confidence_events, self.imu_events, self.gps_events]:
             if writer is not None:
                 try:
                     writer.close()

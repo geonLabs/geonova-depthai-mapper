@@ -93,7 +93,9 @@ def _monitor_controller_bridge(
 ):
     """Publish live sensor state without creating or writing a dataset."""
     rgb_q = outputs["rgb"].createOutputQueue(maxSize=max(2, args.queue_size), blocking=False)
-    imu_q = outputs["imu"].createOutputQueue(maxSize=max(4, args.queue_size * 2), blocking=False)
+    imu_q = None
+    if outputs.get("imu") is not None:
+        imu_q = outputs["imu"].createOutputQueue(maxSize=max(4, args.queue_size * 2), blocking=False)
     pipeline.start()
 
     last_status = time.monotonic()
@@ -113,11 +115,13 @@ def _monitor_controller_bridge(
         last_rgb = time.monotonic()
         controller_bridge.offer_rgb(message)
 
-    def observe_imu(message):  # noqa: ARG001
+    def observe_imu(message):
         nonlocal last_imu, imu_count
+        if not getattr(message, "packets", None):
+            return
         imu_count += 1
         last_imu = time.monotonic()
-        controller_bridge.observe_imu()
+        controller_bridge.observe_imu(message)
 
     while not _stop_requested:
         drained = 0
@@ -136,7 +140,7 @@ def _monitor_controller_bridge(
             raise RuntimeError(
                 f"OAK RGB stream produced no frames for {device_stale_after_s:.1f}s"
             )
-        if now - last_imu > device_stale_after_s:
+        if imu_q is not None and now - last_imu > device_stale_after_s:
             raise RuntimeError(
                 f"OAK IMU stream produced no messages for {device_stale_after_s:.1f}s"
             )
@@ -175,6 +179,7 @@ def _run_monitor_only(args, controller_bridge, serial_readers):
                 controller_bridge.mark_device_connected()
                 runtime.resolve_transport_options(args, device)
                 outputs = runtime.configure_monitor_pipeline(pipeline, args)
+                controller_bridge.configure_imu(args.imu_enabled, args.imu_error)
                 _monitor_controller_bridge(
                     args,
                     pipeline,
@@ -240,6 +245,7 @@ def record_raw_events(args):
             runtime.resolve_transport_options(args, device)
 
             outputs = runtime.configure_pipeline(pipeline, args)
+            controller_bridge.configure_imu(args.imu_enabled, args.imu_error)
             camera_model = runtime.read_camera_model_metadata(device, args)
             camera_model["image_stream_undistorted"] = True
             stereo_depth_model = runtime.read_stereo_depth_metadata(device, args)
@@ -255,7 +261,9 @@ def record_raw_events(args):
 
             rgb_q = outputs["rgb"].createOutputQueue(maxSize=args.queue_size * 2, blocking=False)
             depth_q = outputs["depth"].createOutputQueue(maxSize=args.queue_size * 2, blocking=False)
-            imu_q = outputs["imu"].createOutputQueue(maxSize=args.queue_size * 4, blocking=False)
+            imu_q = None
+            if outputs.get("imu") is not None:
+                imu_q = outputs["imu"].createOutputQueue(maxSize=args.queue_size * 4, blocking=False)
             confidence_q = None
             if args.save_confidence_map and outputs.get("confidence") is not None:
                 confidence_q = outputs["confidence"].createOutputQueue(maxSize=args.queue_size * 2, blocking=False)
@@ -284,7 +292,7 @@ def record_raw_events(args):
                 drained += _drain_device_queue(rgb_q, lambda msg: submit_image("rgb", msg))
                 drained += _drain_device_queue(depth_q, lambda msg: submit_image("depth", msg))
                 def write_imu(msg):
-                    controller_bridge.observe_imu()
+                    controller_bridge.observe_imu(msg)
                     dataset.write_imu_message(
                         msg,
                         mapper.stamp(runtime.get_device_ts_ns(msg)),
@@ -306,8 +314,7 @@ def record_raw_events(args):
                     print(
                         "raw events "
                         f"rgb={dataset.counters['rgb']} depth={dataset.counters['depth']} "
-                        f"imu_msgs={dataset.counters['imu']} gps={dataset.counters['gps']} "
-                        f"ext_imu={dataset.counters['external_imu']} | {gps_status}"
+                        f"imu_msgs={dataset.counters['imu']} gps={dataset.counters['gps']} | {gps_status}"
                     )
                     last_status = now
                 if drained == 0:

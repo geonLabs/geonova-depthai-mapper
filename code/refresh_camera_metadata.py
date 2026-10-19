@@ -64,7 +64,6 @@ def probe_args(metadata: dict, args: argparse.Namespace) -> SimpleNamespace:
         rgb_transport="raw",
         rgb_transport_effective="raw",
         enable_gps=False,
-        enable_external_imu=False,
     )
     return SimpleNamespace(**values)
 
