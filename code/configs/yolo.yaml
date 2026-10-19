@@ -1,7 +1,7 @@
 # YOLO segmentation, Depth 대표점 생성, 자동 선형화 설정입니다.
-dataset: ../data/<timestamp>_raw        # 필수: timestamps.csv가 있는 동기 데이터셋
-model: ../model/n_model/best.pt         # Git에 포함된 guardrail segmentation 모델
-output_dir: null                       # null이면 <dataset>/yolo_seg에 저장
+dataset: /srv/geonova/processed/REPLACE_RUN_ID/synced        # 필수: timestamps.csv가 있는 동기 데이터셋
+model: /srv/geonova/models/guardrail.pt         # 서버에서 별도로 관리하는 segmentation 모델
+output_dir: /srv/geonova/processed/REPLACE_RUN_ID/yolo
 start_frame: 200                       # 카메라 안정화 이후 시작 프레임. 200 이상 필수
 max_frames: 999999                     # stride 적용 후 최대 처리 프레임 수. 큰 값=끝까지
 stride: 1                              # 1=모든 프레임, 2=두 프레임마다 한 장 처리
@@ -15,11 +15,20 @@ max_depth_mm: 8000                     # 지도 관측점으로 사용할 최대
 fragment_min_samples: 20              # 마스크 안의 최소 유효 Depth 픽셀 수
 fragment_erosion_px: 2                # 배경 혼입을 줄이는 마스크 경계 erosion 반경(px)
 depth_confidence_max: 200             # DepthAI confidence 허용 상한. 낮을수록 신뢰도 높음
-orientation_source: ebimu             # ebimu=운영 권장, gps-course(-level)=진행방향 근사
+orientation_source: gps-course        # GPS yaw and OAK IMU tilt
+trusted_max_hdop: 2.0
+trajectory_max_hdop: 2.5
+imu_max_delta_ms: 20.0
+imu_to_camera_rpy_deg: [0.0, 0.0, 0.0] # Proper IMU-to-camera fallback rotation
+imu_filter_time_constant_s: 1.0
+imu_accel_rejection_m_s2: 1.5          # Correction reaches zero at this |a|-g error
+imu_bias_window_s: 2.0                # Required initial still duration; zero disables bias estimation
+imu_bias_accel_tolerance_m_s2: 0.2
+imu_bias_gyro_threshold_rad_s: 0.05
 
 # YOLO 완료 후 선형화 자동 실행
 no_linearize: false                   # true이면 points.csv까지만 만들고 선형화 생략
-linearization_depth_sample_min: 20    # 선형화에 넘길 최소 Depth 샘플 수
-max_gap_connect_m: 6.0                # 대표점 사이 연결 최대 거리(m)
-max_heading_deg: 35.0                 # GPS 접선과 연결선 사이 최대 허용 각도(도)
-min_line_support: 5                   # 선 하나를 만들 최소 검출 개수
+# Automatic linearization uses all defaults from linearization.yaml.
+
+depth_radius: 5
+classes: null

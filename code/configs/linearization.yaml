@@ -1,7 +1,7 @@
 # 기존 points.csv로 점 보정과 선형화만 재실행하는 설정입니다.
-points: ../data/<timestamp>_raw/yolo_seg/points.csv         # 필수: YOLO 관측점 CSV
-trajectory: ../data/<timestamp>_raw/timestamps.csv          # GPS 궤적 포함 동기 CSV
-output_dir: ../data/<timestamp>_raw/yolo_seg/linearized     # 단계별 CSV/SHP 출력 폴더
+points: /srv/geonova/processed/REPLACE_RUN_ID/yolo/points.csv         # 필수: YOLO 관측점 CSV
+trajectory: /srv/geonova/processed/REPLACE_RUN_ID/synced/timestamps.csv          # GPS 궤적 포함 동기 CSV
+output_dir: /srv/geonova/processed/REPLACE_RUN_ID/linearized     # 단계별 CSV/SHP 출력 폴더
 
 # 관측점 유효성
 depth_sample_min: 20              # 관측점 하나에 필요한 최소 유효 Depth 픽셀 수
@@ -23,3 +23,14 @@ min_line_support: 5               # 선 하나를 내보낼 최소 대표점 개
 # 최종 smoothing spline
 line_sample_spacing_m: 0.5        # 최종 POLYLINEZ vertex 간격(m)
 spline_smoothing: 0.15            # 평활 강도. 크면 부드럽지만 급곡선이 뭉개질 수 있음
+
+# Remaining standalone and automatic linearization settings.
+work_crs: EPSG:5179
+gps_smoothing_window: 11
+gps_savgol_polyorder: 2
+trajectory_max_hdop: 2.5
+lateral_mad_k: 3.0
+residual_window: 9
+residual_mad_k: 3.0
+residual_floor_m: 0.30
+max_lateral_step_m: 2.0

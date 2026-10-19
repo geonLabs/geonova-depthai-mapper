@@ -33,16 +33,14 @@ from geonova_depthai.fence_linearization import (  # noqa: E402
 )
 
 
-def test_default_model_path_prefers_newest_local_model(tmp_path: Path) -> None:
-    nano_model = tmp_path / "model" / "n_model" / "best.pt"
-    nano_model.parent.mkdir(parents=True)
-    nano_model.touch()
-    assert default_model_path(tmp_path) == nano_model
+def test_default_model_path_uses_yaml_even_with_local_models(tmp_path: Path) -> None:
+    from geonova_postprocess.yolo_seg_shp import YOLO_DEFAULTS
 
-    field_model = tmp_path / "model" / "x_model" / "best.pt"
-    field_model.parent.mkdir(parents=True)
-    field_model.touch()
-    assert default_model_path(tmp_path) == field_model
+    for name in ("n_model", "x_model"):
+        model = tmp_path / "model" / name / "best.pt"
+        model.parent.mkdir(parents=True)
+        model.touch()
+    assert default_model_path(tmp_path) == Path(YOLO_DEFAULTS["model"])
 
 
 def test_mask_axis_points() -> None:

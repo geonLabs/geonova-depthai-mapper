@@ -18,7 +18,7 @@ import csv
 import json
 import math
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from statistics import median
 from typing import Iterable, Sequence
@@ -30,39 +30,45 @@ from scipy.interpolate import UnivariateSpline
 from scipy.signal import savgol_filter
 from scipy.spatial import cKDTree
 
-from geonova_common.config_cli import parse_args_with_yaml
+from geonova_common.config_cli import load_yaml, parse_args_with_yaml
 
 
 CRS_WGS84 = "EPSG:4326"
 CRS_WORK = "EPSG:5179"
 ROLES = ("endpoint_a", "midpoint", "endpoint_b")
 ROLE_POSITION = {"endpoint_a": -1.0, "midpoint": 0.0, "endpoint_b": 1.0}
+DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "configs" / "linearization.yaml"
+LINEARIZATION_DEFAULTS = load_yaml(DEFAULT_CONFIG)
+
+
+def _default(name):
+    return LINEARIZATION_DEFAULTS["max_gap_m" if name == "max_gap_connect_m" else name]
 
 
 @dataclass(frozen=True)
 class LinearizationConfig:
-    work_crs: str = CRS_WORK
-    depth_sample_min: int = 20
-    max_observation_depth_mm: int = 8_000
-    gps_smoothing_window: int = 11
-    gps_savgol_polyorder: int = 2
-    gps_max_hdop: float = 2.5
-    side_vote_window: int = 11
-    side_window_m: float = 20.0
-    side_frame_window: int = 100
-    huber_delta_m: float = 0.75
-    max_correction_m: float = 3.0
-    lateral_mad_k: float = 3.0
-    residual_window: int = 9
-    residual_mad_k: float = 3.0
-    residual_floor_m: float = 0.30
-    max_gap_connect_m: float = 6.0
-    max_frame_gap: int = 60
-    max_heading_deg: float = 35.0
-    max_lateral_step_m: float = 2.0
-    min_line_support: int = 5
-    line_sample_spacing_m: float = 0.5
-    spline_smoothing: float = 0.15
+    work_crs: str = _default("work_crs")
+    depth_sample_min: int = _default("depth_sample_min")
+    max_observation_depth_mm: int = _default("max_observation_depth_mm")
+    gps_smoothing_window: int = _default("gps_smoothing_window")
+    gps_savgol_polyorder: int = _default("gps_savgol_polyorder")
+    trajectory_max_hdop: float = _default("trajectory_max_hdop")
+    side_vote_window: int = _default("side_vote_window")
+    side_window_m: float = _default("side_window_m")
+    side_frame_window: int = _default("side_frame_window")
+    huber_delta_m: float = _default("huber_delta_m")
+    max_correction_m: float = _default("max_correction_m")
+    lateral_mad_k: float = _default("lateral_mad_k")
+    residual_window: int = _default("residual_window")
+    residual_mad_k: float = _default("residual_mad_k")
+    residual_floor_m: float = _default("residual_floor_m")
+    max_gap_connect_m: float = _default("max_gap_connect_m")
+    max_frame_gap: int = _default("max_frame_gap")
+    max_heading_deg: float = _default("max_heading_deg")
+    max_lateral_step_m: float = _default("max_lateral_step_m")
+    min_line_support: int = _default("min_line_support")
+    line_sample_spacing_m: float = _default("line_sample_spacing_m")
+    spline_smoothing: float = _default("spline_smoothing")
 
 
 def _float(value, default=None):
@@ -283,7 +289,7 @@ def _trajectory_from_csv(
         if not _bool(row.get("gps_position_valid", row.get("position_valid")), True):
             continue
         hdop = _float(row.get("gps_hdop", row.get("hdop")))
-        if hdop is not None and hdop > config.gps_max_hdop:
+        if hdop is not None and hdop > config.trajectory_max_hdop:
             continue
         epoch = row.get("gps_measurement_host_monotonic_ns") or row.get("measurement_wall_time_utc")
         if epoch and epoch in seen_epochs:
@@ -842,6 +848,7 @@ def linearize_fence_points(
 ) -> dict:
     """Correct YOLO fence points and export audited point/line products."""
     config = config or LinearizationConfig()
+    validate_linearization_config(config)
     points_csv = points_csv.expanduser().resolve()
     output_dir = (output_dir or points_csv.parent / "linearized").expanduser().resolve()
     trajectory_csv = trajectory_csv.expanduser().resolve() if trajectory_csv else None
@@ -926,47 +933,64 @@ def linearize_fence_points(
     return summary
 
 
+def add_linearization_arguments(parser, for_yolo=False):
+    """Expose every setting, using the same YAML defaults in both commands."""
+    for field in fields(LinearizationConfig):
+        name = field.name
+        option = "--" + name.replace("_", "-")
+        dest = name
+        options = [option]
+        if name == "max_gap_connect_m":
+            options = ["--max-gap-connect-m", "--max-gap-m"]
+            dest = "max_gap_connect_m" if for_yolo else "max_gap_m"
+        elif name == "depth_sample_min" and for_yolo:
+            options = ["--linearization-depth-sample-min", option]
+            dest = "linearization_depth_sample_min"
+        parser.add_argument(*options, dest=dest, type=type(_default(name)), default=_default(name),
+                            help="Linearization " + name.replace("_", " "))
+
+
+def linearization_config_from_args(args, for_yolo=False):
+    values = {}
+    for field in fields(LinearizationConfig):
+        name = field.name
+        dest = name
+        if name == "max_gap_connect_m" and not for_yolo:
+            dest = "max_gap_m"
+        elif name == "depth_sample_min" and for_yolo:
+            dest = "linearization_depth_sample_min"
+        values[name] = getattr(args, dest)
+    return LinearizationConfig(**values)
+
+
+def validate_linearization_config(config):
+    for field in fields(config):
+        value = getattr(config, field.name)
+        if field.name == "work_crs":
+            CRS.from_user_input(value)
+        elif not math.isfinite(value) or value < 0:
+            raise ValueError(f"Invalid linearization {field.name}.")
+        elif value == 0 and field.name not in ("spline_smoothing", "gps_savgol_polyorder"):
+            raise ValueError(f"Linearization {field.name} must be positive.")
+    if config.min_line_support < 2:
+        raise ValueError("min_line_support must be at least 2.")
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Correct fence points and generate EPSG:5179 fence lines.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--points", type=Path, required=True, help="YOLO points.csv")
-    parser.add_argument("--trajectory", type=Path, help="timestamps.csv or GPS CSV")
-    parser.add_argument("--output-dir", type=Path, help="Output directory; defaults to a linearized folder beside points.csv")
-    parser.add_argument("--depth-sample-min", type=int, default=20, help="Minimum valid Depth samples for a mapping observation")
-    parser.add_argument("--max-observation-depth-mm", type=int, default=8_000, help="Maximum accepted observation Depth in millimeters")
-    parser.add_argument("--side-vote-window", type=int, default=11, help="Fallback detection-count window for side-sign voting")
-    parser.add_argument("--side-window-m", type=float, default=20.0, help="Chainage radius of the local Huber offset model, in meters")
-    parser.add_argument("--side-frame-window", type=int, default=100, help="Maximum frame distance included in the local offset model")
-    parser.add_argument("--huber-delta-m", type=float, default=0.75, help="Huber loss transition residual, in meters")
-    parser.add_argument("--max-correction-m", type=float, default=3.0, help="Maximum correction displacement before rejecting a point")
-    parser.add_argument("--max-gap-m", type=float, default=6.0, help="Maximum spatial gap between connected representative points")
-    parser.add_argument("--max-frame-gap", type=int, default=60, help="Maximum frame interval between connected detections")
-    parser.add_argument("--max-heading-deg", type=float, default=35.0, help="Maximum link-to-trajectory-tangent angular difference")
-    parser.add_argument("--min-line-support", type=int, default=5, help="Minimum detections required for an exported line")
-    parser.add_argument("--line-sample-spacing-m", type=float, default=0.5, help="Final spline vertex spacing, in meters")
-    parser.add_argument("--spline-smoothing", type=float, default=0.15, help="Smoothing factor per source station")
+    parser.add_argument("--points", type=Path, default=Path(LINEARIZATION_DEFAULTS["points"]), help="YOLO points.csv")
+    parser.add_argument("--trajectory", type=Path, default=Path(LINEARIZATION_DEFAULTS["trajectory"]), help="timestamps.csv or GPS CSV")
+    parser.add_argument("--output-dir", type=Path, default=Path(LINEARIZATION_DEFAULTS["output_dir"]), help="Output directory")
+    add_linearization_arguments(parser)
     return parse_args_with_yaml(parser, argv)
 
 
 def main(argv=None) -> None:
     args = parse_args(argv)
-    config = LinearizationConfig(
-        depth_sample_min=args.depth_sample_min,
-        max_observation_depth_mm=args.max_observation_depth_mm,
-        side_vote_window=args.side_vote_window,
-        side_window_m=args.side_window_m,
-        side_frame_window=args.side_frame_window,
-        huber_delta_m=args.huber_delta_m,
-        max_correction_m=args.max_correction_m,
-        max_gap_connect_m=args.max_gap_m,
-        max_frame_gap=args.max_frame_gap,
-        max_heading_deg=args.max_heading_deg,
-        min_line_support=args.min_line_support,
-        line_sample_spacing_m=args.line_sample_spacing_m,
-        spline_smoothing=args.spline_smoothing,
-    )
+    config = linearization_config_from_args(args)
     summary = linearize_fence_points(args.points, args.output_dir, args.trajectory, config)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

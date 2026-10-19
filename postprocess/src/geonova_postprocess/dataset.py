@@ -13,6 +13,23 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from geonova_common.config_cli import load_yaml
+
+
+ORIENTATION_DEFAULTS = load_yaml(Path(__file__).resolve().parents[2] / "configs" / "yolo.yaml")
+IMU_SETTINGS = (
+    "imu_max_delta_ms", "imu_to_camera_rpy_deg", "imu_filter_time_constant_s",
+    "imu_accel_rejection_m_s2", "imu_bias_window_s",
+    "imu_bias_accel_tolerance_m_s2", "imu_bias_gyro_threshold_rad_s",
+)
+
+
+def orientation_settings(dataset):
+    settings = dict(ORIENTATION_DEFAULTS)
+    settings.update(dataset.metadata.get("world_coordinates") or {})
+    settings.update(getattr(dataset, "orientation_config", {}))
+    return settings
+
 
 HOST = "0.0.0.0"
 DEFAULT_PORT = 8088
@@ -48,13 +65,14 @@ def read_csv(path):
 def safe_int(value, default=0):
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
 def safe_float(value, default=None):
     try:
-        return float(value)
+        result = float(value)
+        return result if np.isfinite(result) else default
     except (TypeError, ValueError):
         return default
 
@@ -108,12 +126,31 @@ class Dataset:
             self.imu_by_frame.setdefault(frame_index, []).append(row)
 
         self.gps_rows = read_csv(root / "gps.csv") if (root / "gps.csv").exists() else []
-        self.external_imu_rows = read_csv(root / "external_imu.csv") if (root / "external_imu.csv").exists() else []
         self.gps_by_sample_index = {
             safe_int(row.get("sample_index"), -1): row
             for row in self.gps_rows
         }
+        self.metadata = {}
+        if metadata_path.exists():
+            with open(metadata_path) as file:
+                self.metadata = json.load(file)
+        self.orientation_config = {}
+        self._camera_imu_cache = {}
+        self._camera_imu_lock = threading.Lock()
+        self._index_gps()
+        self.image_width, self.image_height = metadata_image_size(self.metadata)
+
+        if not self.timestamps:
+            raise ValueError(f"No frames listed in {timestamps_path}")
+
+        self.yolo_by_frame = {}
+        self.yolo_results_mtime_ns = None
+        self.reload_yolo_results()
+
+    def _index_gps(self):
         self.valid_course_rows = []
+        max_hdop = orientation_settings(self)["trajectory_max_hdop"]
+        self._course_max_hdop = max_hdop
         for row in self.gps_rows:
             host_ns = safe_int(row.get("host_monotonic_ns"), None)
             course_deg = safe_float(row.get("course_deg"))
@@ -123,27 +160,19 @@ class Dataset:
                 continue
             if speed_knots * 0.514444 < 2.0:
                 continue
-            if hdop is not None and hdop > 2.5:
+            if hdop is not None and hdop > max_hdop:
                 continue
             self.valid_course_rows.append((host_ns, row))
+        self.valid_course_rows.sort(key=lambda item: item[0])
         self.valid_course_times = [item[0] for item in self.valid_course_rows]
-        self.external_imu_by_sample_index = {
-            safe_int(row.get("sample_index"), -1): row
-            for row in self.external_imu_rows
-        }
-
-        self.metadata = {}
-        if metadata_path.exists():
-            with open(metadata_path) as file:
-                self.metadata = json.load(file)
-        self.image_width, self.image_height = metadata_image_size(self.metadata)
-
-        if not self.timestamps:
-            raise ValueError(f"No frames listed in {timestamps_path}")
-
-        self.yolo_by_frame = {}
-        self.yolo_results_mtime_ns = None
-        self.reload_yolo_results()
+        # Keep the first CSV row at each timestamp and the original-order tie break.
+        altitude_by_time = {}
+        for index, row in enumerate(self.gps_rows):
+            if row.get("altitude_m") not in ("", None):
+                timestamp = safe_int(row.get("host_monotonic_ns"), 0)
+                altitude_by_time.setdefault(timestamp, (timestamp, index, row))
+        self._altitude_rows = sorted(altitude_by_time.values(), key=lambda item: item[0])
+        self._altitude_times = [item[0] for item in self._altitude_rows]
 
     def reload_yolo_results(self):
         results_path = self.root / "yolo_seg" / "detections.jsonl"
@@ -184,10 +213,11 @@ class Dataset:
             "depth_path": self.root / depth_file,
             "imu": self.imu_by_frame.get(index, []),
             "gps": self.gps_by_sample_index.get(safe_int(row.get("gps_sample_index"), -1)),
-            "external_imu": self.external_imu_by_sample_index.get(safe_int(row.get("external_imu_sample_index"), -1)),
         }
 
     def nearest_valid_course(self, host_monotonic_ns, max_delta_ms=5000.0):
+        if self._course_max_hdop != orientation_settings(self)["trajectory_max_hdop"]:
+            self._index_gps()
         if host_monotonic_ns is None or not self.valid_course_rows:
             return None, None
         pos = bisect.bisect_left(self.valid_course_times, host_monotonic_ns)
@@ -205,18 +235,11 @@ class Dataset:
         return best_row, delta_ms
 
     def nearest_gps_altitude(self, host_monotonic_ns):
-        if not self.gps_rows or host_monotonic_ns is None:
+        if not self._altitude_rows or host_monotonic_ns is None:
             return None
-        candidates = [
-            row for row in self.gps_rows
-            if row.get("altitude_m") not in ("", None)
-        ]
-        if not candidates:
-            return None
-        return min(
-            candidates,
-            key=lambda row: abs(safe_int(row.get("host_monotonic_ns"), 0) - host_monotonic_ns),
-        )
+        pos = bisect.bisect_left(self._altitude_times, host_monotonic_ns)
+        candidates = self._altitude_rows[max(0, pos - 1):pos + 1]
+        return min(candidates, key=lambda item: (abs(item[0] - host_monotonic_ns), item[1]))[2]
 
 
 def get_dataset(path_text):
@@ -321,86 +344,6 @@ def summarize_gps(row):
     }
 
 
-def parse_ebimu_row(row):
-    if not row:
-        return None
-
-    qx = safe_float(row.get("q_x"))
-    qy = safe_float(row.get("q_y"))
-    qz = safe_float(row.get("q_z"))
-    qw = safe_float(row.get("q_w"))
-    if all(value is not None for value in (qx, qy, qz, qw)):
-        return {
-            "orientation_format": "quaternion",
-            "q_x": qx,
-            "q_y": qy,
-            "q_z": qz,
-            "q_w": qw,
-            "gyro": {
-                "x": safe_float(row.get("gyro_x")),
-                "y": safe_float(row.get("gyro_y")),
-                "z": safe_float(row.get("gyro_z")),
-            },
-            "accel": {
-                "x": safe_float(row.get("accel_x")),
-                "y": safe_float(row.get("accel_y")),
-                "z": safe_float(row.get("accel_z")),
-            },
-            "mag": {
-                "x": safe_float(row.get("mag_x")),
-                "y": safe_float(row.get("mag_y")),
-                "z": safe_float(row.get("mag_z")),
-            },
-            "timestamp_ms": safe_float(row.get("ebimu_timestamp_ms")),
-        }
-
-    raw = row.get("raw", "")
-    if raw.startswith("*"):
-        parts = raw[1:].split(",")
-        try:
-            values = [float(part) for part in parts]
-        except ValueError:
-            values = []
-        if len(values) >= 14:
-            return {
-                "orientation_format": "quaternion",
-                "q_z": values[0],
-                "q_y": values[1],
-                "q_x": values[2],
-                "q_w": values[3],
-                "gyro": {"x": values[4], "y": values[5], "z": values[6]},
-                "accel": {"x": values[7], "y": values[8], "z": values[9]},
-                "mag": {"x": values[10], "y": values[11], "z": values[12]},
-                "timestamp_ms": values[13],
-            }
-        if len(values) >= 13:
-            return {
-                "orientation_format": "euler",
-                "roll_deg": values[0],
-                "pitch_deg": values[1],
-                "yaw_deg": values[2],
-                "gyro": {"x": values[3], "y": values[4], "z": values[5]},
-                "accel": {"x": values[6], "y": values[7], "z": values[8]},
-                "mag": {"x": values[9], "y": values[10], "z": values[11]},
-                "timestamp_ms": values[12],
-            }
-
-    return None
-
-
-def summarize_external_imu(row):
-    parsed = parse_ebimu_row(row)
-    if not row and not parsed:
-        return None
-    summary = {
-        "sample_index": row.get("sample_index") if row else None,
-        "host_monotonic_ns": safe_int(row.get("host_monotonic_ns"), None) if row else None,
-    }
-    if parsed:
-        summary.update(parsed)
-    return summary
-
-
 def rotation_x(angle_rad):
     c = np.cos(angle_rad)
     s = np.sin(angle_rad)
@@ -428,7 +371,7 @@ def rpy_matrix_deg(roll_deg, pitch_deg, yaw_deg):
 
 def quaternion_to_matrix(qx, qy, qz, qw):
     norm = np.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
-    if norm <= 0:
+    if not np.isfinite(norm) or norm <= 1e-12:
         return None
     qx, qy, qz, qw = qx / norm, qy / norm, qz / norm, qw / norm
     return np.array([
@@ -436,25 +379,6 @@ def quaternion_to_matrix(qx, qy, qz, qw):
         [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
         [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
     ], dtype=float)
-
-
-def orientation_matrix_from_ebimu(parsed):
-    if not parsed:
-        return None
-    if parsed.get("orientation_format") == "quaternion":
-        return quaternion_to_matrix(
-            parsed.get("q_x"),
-            parsed.get("q_y"),
-            parsed.get("q_z"),
-            parsed.get("q_w"),
-        )
-    if parsed.get("orientation_format") == "euler":
-        return rpy_matrix_deg(
-            parsed.get("roll_deg") or 0.0,
-            parsed.get("pitch_deg") or 0.0,
-            parsed.get("yaw_deg") or 0.0,
-        )
-    return None
 
 
 def orientation_matrix_from_gps_course(course_deg, reference_camera_matrix=None):
@@ -503,6 +427,187 @@ def camera_mount_matrix_deg(roll_deg, pitch_deg, yaw_deg):
     pitch = np.deg2rad(pitch_deg)
     yaw = np.deg2rad(yaw_deg)
     return rotation_y(yaw) @ rotation_x(-pitch) @ rotation_z(roll)
+
+
+def validate_imu_settings(settings):
+    for key in IMU_SETTINGS:
+        value = settings[key]
+        if key == "imu_to_camera_rpy_deg":
+            if np.asarray(value).shape != (3,) or not np.all(np.isfinite(value)):
+                raise ValueError("imu_to_camera_rpy_deg must contain three finite angles.")
+        elif not np.isfinite(value) or value < 0 or (
+            key in ("imu_filter_time_constant_s", "imu_accel_rejection_m_s2") and value == 0
+        ):
+            raise ValueError(f"Invalid {key}.")
+    for key in ("trusted_max_hdop", "trajectory_max_hdop"):
+        if not np.isfinite(settings[key]) or settings[key] <= 0:
+            raise ValueError(f"{key} must be positive.")
+
+
+def camera_imu_extrinsics(dataset):
+    """Return only a proper IMU-to-original-camera rotation; translations are cm."""
+    value = ((dataset.metadata.get("imu") or {}).get("imu_to_camera") or {}).get("matrix")
+    try:
+        matrix = np.asarray(value, dtype=float)
+        rotation = matrix[:3, :3]
+        if (
+            matrix.shape in ((3, 3), (4, 4))
+            and np.all(np.isfinite(rotation))
+            and np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-3, rtol=0)
+            and abs(np.linalg.det(rotation) - 1.0) <= 1e-3
+        ):
+            return rotation, "device_calibration"
+    except (TypeError, ValueError, IndexError):
+        pass
+    angles = orientation_settings(dataset)["imu_to_camera_rpy_deg"]
+    return rpy_matrix_deg(*angles), "config_default"
+
+
+def _imu_vector(row, prefix, suffix):
+    values = [safe_float(row.get(f"{prefix}_{axis}_{suffix}")) for axis in "xyz"]
+    if any(value is None for value in values) or not np.all(np.isfinite(values)):
+        return None
+    return np.array(values, dtype=float)
+
+
+def _initial_gyro_bias(accels, gyros, settings):
+    duration = settings["imu_bias_window_s"] * 1e9
+    zero = np.zeros(3)
+    if not accels or not gyros or duration <= 0:
+        return zero
+    start = max(accels[0][0], gyros[0][0])
+    end = start + duration
+    if min(accels[-1][0], gyros[-1][0]) < end:
+        return zero
+    a = np.array([v for t, v in accels if start <= t <= end])
+    w = np.array([v for t, v in gyros if start <= t <= end])
+    if len(a) < 2 or len(w) < 2:
+        return zero
+    tolerance = settings["imu_bias_accel_tolerance_m_s2"]
+    if (
+        np.max(np.abs(np.linalg.norm(a, axis=1) - 9.80665)) > tolerance
+        or np.max(np.linalg.norm(a - np.mean(a, axis=0), axis=1)) > tolerance
+        or np.max(np.linalg.norm(w, axis=1)) > settings["imu_bias_gyro_threshold_rad_s"]
+    ):
+        return zero
+    return np.mean(w, axis=0)
+
+
+def _rotate_gravity(gravity, omega, dt):
+    angle = float(np.linalg.norm(omega)) * dt
+    if angle <= 1e-12:
+        return gravity
+    axis = -omega / np.linalg.norm(omega)
+    return (gravity * np.cos(angle) + np.cross(axis, gravity) * np.sin(angle)
+            + axis * float(axis @ gravity) * (1 - np.cos(angle)))
+
+
+def _build_camera_imu_series(dataset, settings):
+    path = dataset.root / "imu_events.csv"
+    if not path.exists():
+        return [], [], "unavailable"
+    accels, gyros, vectors = {}, {}, {}
+    with path.open(newline="", encoding="utf-8-sig") as file:
+        for row in csv.DictReader(file):
+            for prefix, suffix, target in (("accel", "m_s2", accels), ("gyro", "rad_s", gyros)):
+                timestamp = safe_int(row.get(prefix + "_device_ts_ns"), None)
+                if timestamp is None:
+                    timestamp = safe_int(row.get("message_device_ts_ns"), None)
+                value = _imu_vector(row, prefix, suffix)
+                if timestamp is not None and value is not None:
+                    target[timestamp] = value
+            timestamp = safe_int(row.get("rv_device_ts_ns"), None)
+            q = [safe_float(row.get("rv_" + key)) for key in ("i", "j", "k", "real")]
+            if timestamp is not None and all(value is not None for value in q):
+                rotation = quaternion_to_matrix(*q)
+                if rotation is not None:
+                    # BNO game quaternion: IMU -> world, with world +Z up.
+                    # R.T * down removes its arbitrary/drifting yaw completely.
+                    vectors[timestamp] = -rotation[2, :]
+    if vectors:
+        times = sorted(vectors)
+        return times, np.array([vectors[t] for t in times]), "game_rotation_vector"
+    accels, gyros = sorted(accels.items()), sorted(gyros.items())
+    if not accels or not gyros:
+        return [], [], "unavailable"
+    bias = _initial_gyro_bias(accels, gyros, settings)
+    # Merge independently timestamped sensors; repeated packet reports are deduplicated.
+    events = sorted([(t, 0, v) for t, v in gyros] + [(t, 1, v) for t, v in accels], key=lambda e: e[:2])
+    gravity, omega, previous_time, last_accel_time = None, None, None, None
+    times, directions = [], []
+    for timestamp, kind, value in events:
+        if gravity is not None and omega is not None and previous_time is not None:
+            gravity = _rotate_gravity(gravity, omega, (timestamp - previous_time) / 1e9)
+        previous_time = timestamp
+        if kind == 0:
+            omega = value - bias
+        else:
+            magnitude = float(np.linalg.norm(value))
+            error = abs(magnitude - 9.80665)
+            weight = max(0.0, 1.0 - error / settings["imu_accel_rejection_m_s2"])
+            if magnitude > 1e-9 and weight > 0:
+                # Accelerometers measure specific force, opposite physical down.
+                measured = -value / magnitude
+                if gravity is None:
+                    gravity = measured
+                elif last_accel_time is not None:
+                    dt = (timestamp - last_accel_time) / 1e9
+                    alpha = 1.0 - np.exp(-weight * dt / settings["imu_filter_time_constant_s"])
+                    gravity = (1.0 - alpha) * gravity + alpha * measured
+                    norm = np.linalg.norm(gravity)
+                    gravity = gravity / norm if norm > 1e-9 else measured
+            last_accel_time = timestamp
+        if gravity is not None and omega is not None:
+            if times and times[-1] == timestamp:
+                directions[-1] = gravity.copy()
+            else:
+                times.append(timestamp)
+                directions.append(gravity.copy())
+    return times, np.array(directions), "complementary_filter" if times else "unavailable"
+
+
+def _camera_imu_series(dataset, settings):
+    # Only filter settings affect the continuous stream; mount and extrinsics do not.
+    key = tuple(settings[name] for name in IMU_SETTINGS
+                if name not in ("imu_to_camera_rpy_deg", "imu_max_delta_ms"))
+    with dataset._camera_imu_lock:
+        if key not in dataset._camera_imu_cache:
+            dataset._camera_imu_cache[key] = _build_camera_imu_series(dataset, settings)
+        return dataset._camera_imu_cache[key]
+
+
+def summarize_camera_imu(dataset, frame):
+    settings = orientation_settings(dataset)
+    validate_imu_settings(settings)
+    rotation, extrinsics_source = camera_imu_extrinsics(dataset)
+    summary = {
+        "source": "oak", "imu_type": (dataset.metadata.get("imu") or {}).get("type") or "unknown",
+        "roll_deg": None, "pitch_deg": None, "sample_delta_ms": None,
+        "tilt_method": "unavailable", "extrinsics_source": extrinsics_source, "trusted": False,
+    }
+    timestamp = safe_int(frame["row"].get("rgb_device_ts_ns"), None)
+    times, directions, method = _camera_imu_series(dataset, settings)
+    if timestamp is None or not times:
+        return summary
+    pos = bisect.bisect_left(times, timestamp)
+    nearest = min(range(max(0, pos - 1), min(len(times), pos + 1)), key=lambda i: abs(times[i] - timestamp))
+    delta_ms = (times[nearest] - timestamp) / 1e6
+    gravity = directions[nearest]
+    if 0 < pos < len(times):
+        fraction = (timestamp - times[pos - 1]) / float(times[pos] - times[pos - 1])
+        gravity = (1.0 - fraction) * directions[pos - 1] + fraction * directions[pos]
+    norm = np.linalg.norm(gravity)
+    if norm <= 1e-9:
+        return summary
+    gravity = original_camera_vector_to_saved_frame(rotation @ (gravity / norm), dataset.metadata)
+    # Camera axes: right/down/forward. Positive roll is clockwise, pitch is down.
+    summary.update({
+        "roll_deg": float(np.rad2deg(np.arctan2(gravity[0], gravity[1]))),
+        "pitch_deg": float(np.rad2deg(np.arctan2(gravity[2], np.hypot(gravity[0], gravity[1])))),
+        "sample_delta_ms": delta_ms, "tilt_method": method,
+        "trusted": bool(abs(delta_ms) <= settings["imu_max_delta_ms"]),
+    })
+    return summary
 
 
 def enu_to_llh(lat_deg, lon_deg, alt_m, east_m, north_m, up_m):
@@ -626,11 +731,13 @@ def unproject_saved_pixel(dataset, x, y, depth_m):
 
 
 def compute_world_coordinate(dataset, frame, x, y, depth_mm):
-    return compute_world_coordinate_for_source(dataset, frame, x, y, depth_mm, "ebimu")
+    return compute_world_coordinate_for_source(dataset, frame, x, y, depth_mm, "gps-course")
 
 
 def compute_world_coordinate_for_source(dataset, frame, x, y, depth_mm, orientation_source):
-    if depth_mm <= 0:
+    if orientation_source not in ("gps-course", "gps-course-level"):
+        raise ValueError(f"Unknown orientation_source: {orientation_source!r}.")
+    if not np.isfinite(depth_mm) or depth_mm <= 0:
         return {"status": "unavailable", "reason": "invalid depth"}
 
     camera_model = dataset.metadata.get("camera_model") or {}
@@ -653,14 +760,12 @@ def compute_world_coordinate_for_source(dataset, frame, x, y, depth_mm, orientat
 
     if gps_alt is None:
         alt_row = dataset.nearest_gps_altitude(frame_host_ns)
-        gps_alt = safe_float(alt_row.get("altitude_m")) if alt_row else 0.0
+        gps_alt = safe_float(alt_row.get("altitude_m"), 0.0) if alt_row else 0.0
 
     if gps_lat is None or gps_lon is None:
         return {"status": "unavailable", "reason": "GPS latitude/longitude missing"}
 
-    ebimu = parse_ebimu_row(frame.get("external_imu"))
     world_cfg = dataset.metadata.get("world_coordinates") or {}
-    imu_from_camera = world_cfg.get("imu_from_camera_rpy_deg") or [0.0, 0.0, 0.0]
     camera_mount_rpy = normalized_rpy(world_cfg.get("camera_mount_rpy_deg") or world_cfg.get("vehicle_to_camera_rpy_deg"))
     gps_to_camera = world_cfg.get("gps_to_camera_enu_m") or [0.0, 0.0, 0.0]
     gps_to_camera_camera = world_cfg.get("gps_to_camera_camera_m")
@@ -669,19 +774,6 @@ def compute_world_coordinate_for_source(dataset, frame, x, y, depth_mm, orientat
         gps_to_camera_camera = [-float(value) for value in gps_from_camera_camera]
     if gps_to_camera_camera is None:
         gps_to_camera_camera = [0.0, 0.0, 0.0]
-    external_imu_from_camera_camera = world_cfg.get("external_imu_from_camera_camera_m")
-    camera_from_external_imu_camera = world_cfg.get("camera_from_external_imu_camera_m")
-    if camera_from_external_imu_camera is None and external_imu_from_camera_camera is not None:
-        camera_from_external_imu_camera = [-float(value) for value in external_imu_from_camera_camera]
-    if external_imu_from_camera_camera is None:
-        external_imu_from_camera_camera = [0.0, 0.0, 0.0]
-    if camera_from_external_imu_camera is None:
-        camera_from_external_imu_camera = [0.0, 0.0, 0.0]
-    declination_deg = float(world_cfg.get("magnetic_declination_deg") or 0.0)
-
-    r_imu_from_camera = rpy_matrix_deg(*[float(value) for value in imu_from_camera])
-    r_declination = rotation_z(np.deg2rad(declination_deg))
-
     z_m = depth_mm / 1000.0
     try:
         point_camera, unprojection = unproject_saved_pixel(dataset, x, y, z_m)
@@ -702,7 +794,7 @@ def compute_world_coordinate_for_source(dataset, frame, x, y, depth_mm, orientat
     )
     gps_frame_delta_ms = safe_float(row.get("gps_frame_delta_ms"))
     rtk_max_correction_age_s = float(world_cfg.get("rtk_max_correction_age_s") or 2.0)
-    rtk_max_hdop = float(world_cfg.get("rtk_max_hdop") or 2.0)
+    trusted_max_hdop = float(orientation_settings(dataset)["trusted_max_hdop"])
     gps_hdop = safe_float(row.get("gps_hdop"), safe_float((gps_row or {}).get("hdop")))
     position_quality_reasons = []
     if gps_fix_quality != "4":
@@ -727,8 +819,8 @@ def compute_world_coordinate_for_source(dataset, frame, x, y, depth_mm, orientat
     if gps_hdop is None:
         assumptions.append("GPS HDOP is missing")
         position_quality_reasons.append("hdop_missing")
-    elif gps_hdop > rtk_max_hdop:
-        assumptions.append(f"GPS HDOP {gps_hdop:.2f} exceeds the trusted {rtk_max_hdop:.2f} limit")
+    elif gps_hdop > trusted_max_hdop:
+        assumptions.append(f"GPS HDOP {gps_hdop:.2f} exceeds the trusted {trusted_max_hdop:.2f} limit")
         position_quality_reasons.append("hdop_too_high")
     position_quality = {
         "trusted": not position_quality_reasons,
@@ -739,71 +831,43 @@ def compute_world_coordinate_for_source(dataset, frame, x, y, depth_mm, orientat
         "maximum_differential_age_s": rtk_max_correction_age_s,
         "frame_delta_ms": gps_frame_delta_ms,
         "hdop": gps_hdop,
-        "maximum_hdop": rtk_max_hdop,
+        "maximum_hdop": trusted_max_hdop,
     }
-    orientation_details = {"source": orientation_source}
-    if orientation_source in ("gps-course", "gps-course-level"):
-        course = resolve_course_for_frame(dataset, frame)
-        course_row = course["row"]
-        course_source = course["source"]
-        course_delta_ms = course["delta_ms"]
-        gps_course_deg = course["course_deg"]
-        gps_speed_m_s = course["speed_m_s"]
-        gps_hdop = course["hdop"]
-        if gps_course_deg is None:
-            return {"status": "unavailable", "reason": "GPS course_deg missing"}
-        reference_camera_matrix = None
-        tilt_source = "level_assumption"
-        if orientation_source == "gps-course":
-            r_enu_from_imu = orientation_matrix_from_ebimu(ebimu)
-            if r_enu_from_imu is not None:
-                reference_camera_matrix = r_declination @ r_enu_from_imu @ r_imu_from_camera
-                tilt_source = "ebimu"
-        if orientation_source == "gps-course-level":
-            r_enu_from_vehicle = orientation_matrix_from_gps_course(gps_course_deg, None)
-            r_vehicle_from_camera = camera_mount_matrix_deg(*[float(value) for value in camera_mount_rpy])
-            r_enu_from_camera = r_enu_from_vehicle @ r_vehicle_from_camera
-        else:
-            effective_course_deg = gps_course_deg + float(camera_mount_rpy[2])
-            r_enu_from_camera = orientation_matrix_from_gps_course(effective_course_deg, reference_camera_matrix)
-        orientation_details.update({
-            "course_deg": gps_course_deg,
-            "effective_course_deg": (
-                gps_course_deg + float(camera_mount_rpy[2])
-                if orientation_source == "gps-course"
-                else None
-            ),
-            "speed_m_s": gps_speed_m_s,
-            "hdop": gps_hdop,
-            "course_source": course_source,
-            "course_sample_index": course_row.get("sample_index") if course_row else None,
-            "course_frame_delta_ms": course_delta_ms,
-            "tilt_source": tilt_source,
-            "camera_mount_rpy_deg": camera_mount_rpy,
-        })
-        if orientation_source == "gps-course-level":
-            assumptions.append("GPS course supplies yaw; camera is assumed level")
-        else:
-            assumptions.append("GPS course supplies yaw; pitch/roll are kept from EBIMU when available")
-        assumptions.append("GPS course is movement direction, not optical heading while stopped or reversing")
-        if course_source == "nearest_moving_gps":
-            assumptions.append("GPS course was taken from nearest moving sample because the frame sample was weak")
-        if gps_speed_m_s is not None and gps_speed_m_s < 2.0:
-            assumptions.append("GPS speed is below 2 m/s; course may be noisy")
-        if gps_hdop is not None and gps_hdop >= 2.0:
-            assumptions.append("GPS HDOP is >= 2; position/course confidence is lower")
+    course = resolve_course_for_frame(dataset, frame)
+    if course["course_deg"] is None:
+        return {"status": "unavailable", "trusted": False, "reason": "GPS course_deg missing"}
+    camera_imu = summarize_camera_imu(dataset, frame)
+    tilt = np.eye(3)
+    if orientation_source == "gps-course":
+        if camera_imu["tilt_method"] == "unavailable":
+            return {"status": "unavailable", "trusted": False,
+                    "reason": "OAK IMU tilt unavailable", "camera_imu": camera_imu}
+        tilt = camera_mount_matrix_deg(camera_imu["roll_deg"], camera_imu["pitch_deg"], 0.0)
+        if not camera_imu["trusted"]:
+            assumptions.append("OAK IMU sample exceeds the trusted time limit")
+        assumptions.append("GPS course supplies yaw; OAK IMU supplies pitch/roll")
     else:
-        r_enu_from_imu = orientation_matrix_from_ebimu(ebimu)
-        if r_enu_from_imu is None:
-            return {"status": "unavailable", "reason": "EBIMU quaternion/euler sample missing"}
-        r_enu_from_camera = r_declination @ r_enu_from_imu @ r_imu_from_camera
-        orientation_details.update({
-            "frame_delta_ms": safe_float(row.get("external_imu_frame_delta_ms")),
-            "sample_index": row.get("external_imu_sample_index"),
-            "orientation_format": ebimu.get("orientation_format") if ebimu else None,
-            "timestamp_ms": ebimu.get("timestamp_ms") if ebimu else None,
-        })
-        assumptions.append("EBIMU quaternion is treated as IMU/body to local ENU rotation")
+        assumptions.append("GPS course supplies yaw; camera is assumed level")
+    r_enu_from_camera = (orientation_matrix_from_gps_course(course["course_deg"], None)
+                         @ tilt @ camera_mount_matrix_deg(*camera_mount_rpy))
+    course_trusted = (course["speed_m_s"] is not None and course["speed_m_s"] >= 2.0
+                      and (course["hdop"] is None or course["hdop"] <= orientation_settings(dataset)["trajectory_max_hdop"]))
+    trusted = bool(position_quality["trusted"] and course_trusted
+                   and orientation_source == "gps-course" and camera_imu["trusted"])
+    orientation_details = {
+        "source": orientation_source, "course_deg": course["course_deg"],
+        "effective_course_deg": course["course_deg"] + float(camera_mount_rpy[2]),
+        "speed_m_s": course["speed_m_s"], "hdop": course["hdop"],
+        "course_source": course["source"],
+        "course_sample_index": course["row"].get("sample_index") if course["row"] else None,
+        "course_frame_delta_ms": course["delta_ms"],
+        "tilt_source": "oak" if orientation_source == "gps-course" else "level_assumption",
+        "camera_mount_rpy_deg": camera_mount_rpy, "trusted": trusted,
+        "camera_imu": camera_imu,
+    }
+    assumptions.append("GPS course is movement direction, not optical heading while stopped or reversing")
+    if course["source"] == "nearest_moving_gps":
+        assumptions.append("GPS course was taken from nearest moving sample because the frame sample was weak")
 
     forward_axis = r_enu_from_camera[:, 2]
     optical_heading_deg = float(np.rad2deg(np.arctan2(forward_axis[0], forward_axis[1])) % 360.0)
@@ -814,7 +878,7 @@ def compute_world_coordinate_for_source(dataset, frame, x, y, depth_mm, orientat
         "camera_down_up_component": float(r_enu_from_camera[2, 1]),
     })
     if abs(optical_elevation_deg) > 45.0:
-        assumptions.append("camera optical axis elevation exceeds 45 deg; check imu_from_camera_rpy_deg/extrinsics")
+        assumptions.append("camera optical axis elevation exceeds 45 deg; check IMU-to-camera extrinsics")
 
     gps_to_camera_enu_vec = np.array([float(value) for value in gps_to_camera], dtype=float)
     gps_to_camera_camera_vec = np.array([float(value) for value in gps_to_camera_camera], dtype=float)
@@ -822,8 +886,6 @@ def compute_world_coordinate_for_source(dataset, frame, x, y, depth_mm, orientat
     point_enu = camera_position_enu + (r_enu_from_camera @ point_camera)
     llh = enu_to_llh(gps_lat, gps_lon, gps_alt, point_enu[0], point_enu[1], point_enu[2])
 
-    if imu_from_camera == [0.0, 0.0, 0.0]:
-        assumptions.append("imu_from_camera_rpy_deg is default [0,0,0]")
     if gps_to_camera == [0.0, 0.0, 0.0]:
         assumptions.append("gps_to_camera_enu_m is default [0,0,0]")
     if gps_to_camera_camera == [0.0, 0.0, 0.0]:
@@ -847,23 +909,15 @@ def compute_world_coordinate_for_source(dataset, frame, x, y, depth_mm, orientat
             "position_quality": position_quality,
         },
         "orientation": orientation_details,
-        "external_imu": orientation_details if not orientation_source.startswith("gps-course") else {
-            "frame_delta_ms": safe_float(row.get("external_imu_frame_delta_ms")),
-            "sample_index": row.get("external_imu_sample_index"),
-            "orientation_format": ebimu.get("orientation_format") if ebimu else None,
-            "timestamp_ms": ebimu.get("timestamp_ms") if ebimu else None,
-        },
+        "camera_imu": camera_imu,
+        "trusted": trusted,
         "config": {
-            "imu_from_camera_rpy_deg": imu_from_camera,
             "camera_mount_rpy_deg": camera_mount_rpy,
             "gps_to_camera_enu_m": gps_to_camera,
             "gps_to_camera_camera_m": gps_to_camera_camera,
             "gps_from_camera_camera_m": gps_from_camera_camera,
-            "external_imu_from_camera_camera_m": external_imu_from_camera_camera,
-            "camera_from_external_imu_camera_m": camera_from_external_imu_camera,
-            "magnetic_declination_deg": declination_deg,
             "rtk_max_correction_age_s": rtk_max_correction_age_s,
-            "rtk_max_hdop": rtk_max_hdop,
+            "trusted_max_hdop": trusted_max_hdop,
             "unprojection": unprojection,
         },
         "assumptions": assumptions,
@@ -955,7 +1009,7 @@ def resolve_course_for_frame(dataset, frame):
         course_deg is None
         or speed_m_s is None
         or speed_m_s < 2.0
-        or (hdop is not None and hdop > 2.5)
+        or (hdop is not None and hdop > orientation_settings(dataset)["trajectory_max_hdop"])
     )
     if weak:
         replacement_row, replacement_delta_ms = dataset.nearest_valid_course(frame_host_ns)
@@ -1044,7 +1098,13 @@ def solve_camera_mount_from_point(dataset, frame, x, y, depth_mm, actual_lat, ac
     target_enu = llh_to_enu(gps_lat, gps_lon, gps_alt, actual_lat, actual_lon, actual_alt)
     target_from_origin = target_enu - gps_to_camera_enu
     camera_vector = point_camera + gps_to_camera_camera
-    r_enu_from_vehicle = orientation_matrix_from_gps_course(course["course_deg"], None)
+    camera_imu = summarize_camera_imu(dataset, frame)
+    if camera_imu["tilt_method"] == "unavailable":
+        raise ValueError("OAK IMU tilt unavailable.")
+    if not camera_imu["trusted"]:
+        raise ValueError("OAK IMU sample exceeds the trusted time limit.")
+    tilt = camera_mount_matrix_deg(camera_imu["roll_deg"], camera_imu["pitch_deg"], 0.0)
+    r_enu_from_vehicle = orientation_matrix_from_gps_course(course["course_deg"], None) @ tilt
 
     roll = current_rpy[0]
 

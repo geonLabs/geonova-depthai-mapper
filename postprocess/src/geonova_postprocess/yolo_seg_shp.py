@@ -15,7 +15,7 @@ import math
 import shutil
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable
 
@@ -27,27 +27,25 @@ from .dataset import (
     Dataset,
     compute_world_coordinate_for_source,
     get_depth_frame,
+    IMU_SETTINGS,
+    ORIENTATION_DEFAULTS,
+    validate_imu_settings,
 )
-from .fence_linearization import LinearizationConfig, linearize_fence_points
+from .fence_linearization import (
+    LinearizationConfig, linearize_fence_points, add_linearization_arguments,
+    linearization_config_from_args, validate_linearization_config,
+)
 from geonova_common.config_cli import parse_args_with_yaml
 
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-if (REPOSITORY_ROOT.parent / "model").is_dir():
-    REPOSITORY_ROOT = REPOSITORY_ROOT.parent
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "configs" / "yolo.yaml"
+YOLO_DEFAULTS = ORIENTATION_DEFAULTS
 
 
 def default_model_path(repository_root: Path = REPOSITORY_ROOT) -> Path:
-    candidates = (
-        repository_root / "model" / "x_model" / "best.pt",
-        repository_root / "model" / "n_model" / "best.pt",
-        repository_root / "code" / "best.pt",
-        Path("best.pt"),
-    )
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    return candidates[1]
+    # Retain the shim's public helper; local files never change the configured model.
+    return Path(YOLO_DEFAULTS["model"])
 
 
 DEFAULT_MODEL = default_model_path()
@@ -177,7 +175,7 @@ def median_depth_mm(
     x: int,
     y: int,
     radius: int = 5,
-    max_depth_mm: int = 8_000,
+    max_depth_mm: int = YOLO_DEFAULTS["max_depth_mm"],
 ) -> tuple[int, int]:
     """Return a robust local depth and the number of valid samples used."""
     if radius < 0:
@@ -215,7 +213,7 @@ def mask_depth_observation(
     depth: np.ndarray,
     detection_confidence: float = 1.0,
     confidence_map: np.ndarray | None = None,
-    max_depth_mm: int = 8_000,
+    max_depth_mm: int = YOLO_DEFAULTS["max_depth_mm"],
     min_samples: int = 20,
     erosion_px: int = 2,
     confidence_max: int = 200,
@@ -395,28 +393,39 @@ def run_dataset(
     dataset_root: Path,
     model_path: Path,
     output_dir: Path | None = None,
-    start_frame: int = 200,
-    max_frames: int = 100,
-    stride: int = 1,
-    confidence: float = 0.25,
-    batch_size: int = 4,
-    image_size: int = 1280,
-    device: str | None = None,
+    start_frame: int = YOLO_DEFAULTS["start_frame"],
+    max_frames: int = YOLO_DEFAULTS["max_frames"],
+    stride: int = YOLO_DEFAULTS["stride"],
+    confidence: float = YOLO_DEFAULTS["confidence"],
+    batch_size: int = YOLO_DEFAULTS["batch_size"],
+    image_size: int = YOLO_DEFAULTS["image_size"],
+    device: str | None = YOLO_DEFAULTS["device"],
     classes: list[int] | None = None,
-    depth_radius: int = 5,
-    max_depth_mm: int = 8_000,
-    fragment_min_samples: int = 20,
-    fragment_erosion_px: int = 2,
-    depth_confidence_max: int = 200,
-    orientation_source: str = "gps-course-level",
-    linearize: bool = True,
-    linearization_depth_sample_min: int = 20,
-    max_gap_connect_m: float = 6.0,
-    max_heading_deg: float = 35.0,
-    min_line_support: int = 5,
+    depth_radius: int = YOLO_DEFAULTS["depth_radius"],
+    max_depth_mm: int = YOLO_DEFAULTS["max_depth_mm"],
+    fragment_min_samples: int = YOLO_DEFAULTS["fragment_min_samples"],
+    fragment_erosion_px: int = YOLO_DEFAULTS["fragment_erosion_px"],
+    depth_confidence_max: int = YOLO_DEFAULTS["depth_confidence_max"],
+    orientation_source: str = YOLO_DEFAULTS["orientation_source"],
+    linearize: bool = not YOLO_DEFAULTS["no_linearize"],
+    linearization_depth_sample_min: int | None = None,
+    max_gap_connect_m: float | None = None,
+    max_heading_deg: float | None = None,
+    min_line_support: int | None = None,
+    linearization_config: LinearizationConfig | None = None,
+    orientation_config: dict | None = None,
 ) -> dict:
     dataset_root = dataset_root.expanduser().resolve()
     model_path = model_path.expanduser().resolve()
+    integer_settings = {
+        "start_frame": start_frame, "max_frames": max_frames, "stride": stride,
+        "batch_size": batch_size, "image_size": image_size, "depth_radius": depth_radius,
+        "max_depth_mm": max_depth_mm, "fragment_min_samples": fragment_min_samples,
+        "fragment_erosion_px": fragment_erosion_px, "depth_confidence_max": depth_confidence_max,
+    }
+    for key, value in integer_settings.items():
+        if not isinstance(value, (int, np.integer)):
+            raise ValueError(f"{key} must be an integer.")
     if max_frames <= 0 or stride <= 0 or batch_size <= 0:
         raise ValueError("max_frames, stride, and batch_size must be positive.")
     if max_depth_mm <= 0:
@@ -430,27 +439,56 @@ def run_dataset(
     if not 0.0 <= confidence <= 1.0:
         raise ValueError("confidence must be between 0.0 and 1.0.")
 
-    output_dir = (output_dir or dataset_root / "yolo_seg").expanduser().resolve()
-    from ultralytics import YOLO
-
-    detected_plot_dir = output_dir / "detected_plot"
-    shutil.rmtree(detected_plot_dir, ignore_errors=True)
-    detected_plot_dir.mkdir(parents=True, exist_ok=True)
-    shutil.rmtree(output_dir / "detected_rgb", ignore_errors=True)
-    # Remove overlays produced by older versions; current output keeps the
-    # original RGB only for frames where a detection exists.
-    shutil.rmtree(output_dir / "overlays", ignore_errors=True)
-
-    print("[YOLO] Loading dataset and model...", flush=True)
-    dataset = Dataset(dataset_root)
     if start_frame < 200:
         raise ValueError("start_frame must be at least 200 for post-warm-up comparison.")
+    if image_size <= 0:
+        raise ValueError("image_size must be positive.")
+    if not 0 <= depth_confidence_max <= 255:
+        raise ValueError("depth_confidence_max must be between 0 and 255.")
+    if classes is not None and any(not isinstance(value, int) or value < 0 for value in classes):
+        raise ValueError("classes must contain nonnegative integers.")
+    if orientation_source not in ("gps-course", "gps-course-level"):
+        raise ValueError(f"Unknown orientation_source: {orientation_source!r}.")
+    settings = {key: YOLO_DEFAULTS[key] for key in IMU_SETTINGS + ("trusted_max_hdop", "trajectory_max_hdop")}
+    settings.update(orientation_config or {})
+    validate_imu_settings(settings)
+    line_config = linearization_config or LinearizationConfig()
+    overrides = {
+        "depth_sample_min": linearization_depth_sample_min,
+        "max_gap_connect_m": max_gap_connect_m,
+        "max_heading_deg": max_heading_deg,
+        "min_line_support": min_line_support,
+    }
+    line_config = replace(line_config, **{key: value for key, value in overrides.items() if value is not None})
+    validate_linearization_config(line_config)
+
+    output_dir = (output_dir or dataset_root / "yolo_seg").expanduser().resolve()
+    print("[YOLO] Loading dataset and model...", flush=True)
+    dataset = Dataset(dataset_root)
+    dataset.orientation_config = dict(orientation_config or {})
+    validate_imu_settings({**settings, **(dataset.metadata.get("world_coordinates") or {}),
+                           **dataset.orientation_config})
+    dataset._index_gps()
     if start_frame >= dataset.frame_count:
         raise ValueError(f"start_frame {start_frame} exceeds {dataset.frame_count} frames.")
+    if not model_path.is_file():
+        raise ValueError(f"Model not found: {model_path}")
+    from ultralytics import YOLO
 
     model = YOLO(str(model_path))
     if model.task != "segment":
         raise ValueError(f"Expected a YOLO segmentation model, got task={model.task!r}.")
+
+    # All arguments, dataset bounds, and model task are valid before replacing outputs.
+    cleanup_paths = [output_dir / name for name in ("detected_plot", "detected_rgb", "overlays")]
+    for path in cleanup_paths:
+        resolved = path.resolve()
+        if resolved.parent != output_dir:
+            raise ValueError(f"Output directory escapes output root: {path}")
+    for path in cleanup_paths:
+        shutil.rmtree(path, ignore_errors=True)
+    detected_plot_dir = output_dir / "detected_plot"
+    detected_plot_dir.mkdir(parents=True, exist_ok=True)
 
     pixel_writer = _prepare_writer(output_dir / "yolo_seg_points_pixels", shapefile.POINT)
     world_writer = _prepare_writer(output_dir / "yolo_seg_points_wgs84", shapefile.POINTZ)
@@ -577,7 +615,7 @@ def run_dataset(
                 )
                 quality = "unavailable"
                 if world.get("status") == "ok":
-                    trusted = world.get("gps", {}).get("position_quality", {}).get("trusted", False)
+                    trusted = world.get("trusted", False)
                     quality = "trusted" if trusted else "approximate"
                 position_quality = world.get("gps", {}).get("position_quality", {})
                 orientation = world.get("orientation", {})
@@ -689,13 +727,7 @@ def run_dataset(
             output_dir / "points.csv",
             output_dir / "linearized",
             dataset_root / "timestamps.csv",
-            LinearizationConfig(
-                depth_sample_min=linearization_depth_sample_min,
-                max_observation_depth_mm=max_depth_mm,
-                max_gap_connect_m=max_gap_connect_m,
-                max_heading_deg=max_heading_deg,
-                min_line_support=min_line_support,
-            ),
+            line_config,
         )
 
     summary = {
@@ -745,30 +777,28 @@ def parse_args(argv=None) -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--dataset", type=Path, required=True, help="Synchronized dataset directory containing timestamps.csv and images")
-    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL, help="Ultralytics YOLO segmentation model")
+    parser.add_argument("--model", type=Path, help="Ultralytics YOLO segmentation model")
     parser.add_argument("--output-dir", type=Path, help="Output directory; defaults to <dataset>/yolo_seg")
-    parser.add_argument("--start-frame", type=int, default=200, help="First dataset frame; values below 200 are rejected")
-    parser.add_argument("--max-frames", type=int, default=100, help="Maximum number of frames selected after stride")
-    parser.add_argument("--stride", type=int, default=1, help="Process every Nth frame")
-    parser.add_argument("--confidence", "--conf", dest="confidence", type=float, default=0.25, help="YOLO detection confidence threshold")
-    parser.add_argument("--batch-size", "--batch", dest="batch_size", type=int, default=4, help="Images per YOLO inference batch")
-    parser.add_argument("--image-size", type=int, default=1280, help="YOLO inference image size in pixels")
+    parser.add_argument("--start-frame", type=int, help="First dataset frame; values below 200 are rejected")
+    parser.add_argument("--max-frames", type=int, help="Maximum number of frames selected after stride")
+    parser.add_argument("--stride", type=int, help="Process every Nth frame")
+    parser.add_argument("--confidence", "--conf", dest="confidence", type=float, help="YOLO detection confidence threshold")
+    parser.add_argument("--batch-size", "--batch", dest="batch_size", type=int, help="Images per YOLO inference batch")
+    parser.add_argument("--image-size", type=int, help="YOLO inference image size in pixels")
     parser.add_argument("--device", help="Ultralytics device, for example 0, 0,1, cpu, or mps")
     parser.add_argument("--classes", type=int, nargs="+", help="Optional YOLO class IDs to retain")
-    parser.add_argument("--depth-radius", type=int, default=5, help="Pixel radius for axis-feature median Depth")
+    parser.add_argument("--depth-radius", type=int, help="Pixel radius for axis-feature median Depth")
     parser.add_argument(
         "--max-depth-mm",
         type=int,
-        default=8_000,
         help="Reject a detection when its confidence-qualified mask median exceeds this Depth in millimeters",
     )
-    parser.add_argument("--fragment-min-samples", type=int, default=20, help="Minimum valid Depth pixels required in a mask fragment")
-    parser.add_argument("--fragment-erosion-px", type=int, default=2, help="Mask erosion radius used to reduce background Depth mixing")
-    parser.add_argument("--depth-confidence-max", type=int, default=200, help="Maximum accepted DepthAI confidence-map value; lower is better")
+    parser.add_argument("--fragment-min-samples", type=int, help="Minimum valid Depth pixels required in a mask fragment")
+    parser.add_argument("--fragment-erosion-px", type=int, help="Mask erosion radius used to reduce background Depth mixing")
+    parser.add_argument("--depth-confidence-max", type=int, help="Maximum accepted DepthAI confidence-map value; lower is better")
     parser.add_argument(
         "--orientation-source",
-        choices=("gps-course-level", "gps-course", "ebimu"),
-        default="gps-course-level",
+        choices=("gps-course", "gps-course-level"),
         help="Pose source used for camera-to-world transformation",
     )
     parser.add_argument(
@@ -776,10 +806,20 @@ def parse_args(argv=None) -> argparse.Namespace:
         action="store_true",
         help="Skip EPSG:5179 correction and fence-line generation.",
     )
-    parser.add_argument("--linearization-depth-sample-min", type=int, default=20, help="Minimum Depth samples accepted by automatic linearization")
-    parser.add_argument("--max-gap-connect-m", type=float, default=6.0, help="Maximum spatial gap between connected detections, in meters")
-    parser.add_argument("--max-heading-deg", type=float, default=35.0, help="Maximum link-to-GPS-tangent angle, in degrees")
-    parser.add_argument("--min-line-support", type=int, default=5, help="Minimum detections required to export a line segment")
+    add_linearization_arguments(parser, for_yolo=True)
+    for key in IMU_SETTINGS + ("trusted_max_hdop",):
+        if key == "imu_to_camera_rpy_deg":
+            parser.add_argument("--imu-to-camera-rpy-deg", type=float, nargs=3)
+        else:
+            parser.add_argument("--" + key.replace("_", "-"), type=float)
+    # trajectory_max_hdop is shared with the linearization options above.
+    actions = {action.dest: action for action in parser._actions}
+    for key, value in YOLO_DEFAULTS.items():
+        action = actions[key]
+        if action.type is not None and value is not None and not isinstance(value, list):
+            value = action.type(value)
+        parser.set_defaults(**{key: value})
+        action.required = False
     return parse_args_with_yaml(parser, argv)
 
 
@@ -804,10 +844,8 @@ def main(argv=None) -> None:
         depth_confidence_max=args.depth_confidence_max,
         orientation_source=args.orientation_source,
         linearize=not args.no_linearize,
-        linearization_depth_sample_min=args.linearization_depth_sample_min,
-        max_gap_connect_m=args.max_gap_connect_m,
-        max_heading_deg=args.max_heading_deg,
-        min_line_support=args.min_line_support,
+        linearization_config=linearization_config_from_args(args, for_yolo=True),
+        orientation_config={key: getattr(args, key) for key in IMU_SETTINGS + ("trusted_max_hdop", "trajectory_max_hdop")},
     )
 
 

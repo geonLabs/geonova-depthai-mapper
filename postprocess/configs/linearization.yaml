@@ -23,3 +23,14 @@ min_line_support: 5               # 선 하나를 내보낼 최소 대표점 개
 # 최종 smoothing spline
 line_sample_spacing_m: 0.5        # 최종 POLYLINEZ vertex 간격(m)
 spline_smoothing: 0.15            # 평활 강도. 크면 부드럽지만 급곡선이 뭉개질 수 있음
+
+# Remaining standalone and automatic linearization settings.
+work_crs: EPSG:5179
+gps_smoothing_window: 11
+gps_savgol_polyorder: 2
+trajectory_max_hdop: 2.5
+lateral_mad_k: 3.0
+residual_window: 9
+residual_mad_k: 3.0
+residual_floor_m: 0.30
+max_lateral_step_m: 2.0
