@@ -42,7 +42,7 @@ Controller가 전달한 `JETSON_PIPELINE_RESULTS_DIR`, `JETSON_PIPELINE_SENSOR_B
 .venv/bin/python capture/src/geonova_depthai/capture/depth_density.py results/<timestamp>_raw --band 0.55,0.70
 ```
 
-`--band`는 노면 띠의 세로 범위(영상 높이 비율)입니다. 행별 유효 비율과 중앙 깊이를 출력하고, 화면 아래쪽에서 1.2 m보다 가까운 행은 차체로 표시합니다.
+`--band`는 노면 띠의 세로 범위(영상 높이 비율)입니다. 행별 유효 비율과 중앙 깊이를 출력하고, 화면 아래쪽에서 1.2 m보다 가까운 행은 차체로 표시합니다. `gps.csv`가 있으면 GGA fix 품질별 개수와 RTK fixed 비율도 함께 보여 줍니다.
 
 ## OAK 온보드 IMU와 USB
 

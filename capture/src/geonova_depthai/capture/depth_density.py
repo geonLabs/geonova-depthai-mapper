@@ -130,6 +130,25 @@ def depth_coverage(run, rows, band, row_step):
     }
 
 
+def gnss_fix_summary(run):
+    """Count GGA fix qualities so a test run shows whether RTK was fixed."""
+    path = run / "gps.csv"
+    if not path.is_file():
+        return None
+    counts = {}
+    with path.open(newline="", encoding="utf-8") as stream:
+        for row in csv.DictReader(stream):
+            if row.get("nmea_type") == "GGA":
+                name = row.get("fix_quality_name") or row.get("fix_quality") or "unknown"
+                counts[name] = counts.get(name, 0) + 1
+    total = sum(counts.values())
+    return {
+        "gga_rows": total,
+        "fix_quality": counts,
+        "rtk_fixed_ratio": round(counts.get("RTK fixed", 0) / total, 3) if total else None,
+    }
+
+
 def summarise_run(run, band=(0.55, 0.70), samples=60, row_step=50):
     run = Path(run).resolve()
     metadata = json.loads((run / "metadata.json").read_text(encoding="utf-8"))
@@ -139,6 +158,7 @@ def summarise_run(run, band=(0.55, 0.70), samples=60, row_step=50):
         "device": (metadata.get("depthai_device") or {}).get("name"),
         "stereo_config": metadata.get("stereo_config"),
         "depth_cadence": depth_cadence(events),
+        "gnss": gnss_fix_summary(run),
     }
     report.update(depth_coverage(run, evenly_spaced(events, samples), band, row_step))
     return report
@@ -158,6 +178,9 @@ def format_report(report):
         f"median={ratio['band_median']} p10={ratio['band_p10']} min={ratio['band_min']} "
         f"({report['sampled_frames']} frames)",
     ]
+    gnss = report.get("gnss")
+    if gnss is not None:
+        lines.append(f"gnss GGA={gnss['gga_rows']} rtk_fixed_ratio={gnss['rtk_fixed_ratio']} {gnss['fix_quality']}")
     if report["near_rows_from"] is not None:
         lines.append(
             f"rows from y={report['near_rows_from']} to the bottom are closer than "

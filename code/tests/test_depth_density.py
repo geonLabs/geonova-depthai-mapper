@@ -92,6 +92,24 @@ def test_events_outside_the_run_are_refused(tmp_path):
         depth_density.summarise_run(run, samples=0)
 
 
+def test_gnss_summary_counts_rtk_fixed_gga(tmp_path):
+    run = write_run(tmp_path / "run_raw", [road_frame(10)], [0.0])
+    with (run / "gps.csv").open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=["raw", "nmea_type", "fix_quality", "fix_quality_name"])
+        writer.writeheader()
+        writer.writerow({"raw": "$GNGGA,a,b", "nmea_type": "GGA", "fix_quality": "4", "fix_quality_name": "RTK fixed"})
+        writer.writerow({"raw": "$GNGGA,a,b", "nmea_type": "GGA", "fix_quality": "5", "fix_quality_name": "RTK float"})
+        writer.writerow({"raw": "$GNRMC,a,b", "nmea_type": "RMC", "fix_quality": "", "fix_quality_name": ""})
+
+    report = depth_density.summarise_run(run, samples=0)
+
+    assert report["gnss"] == {
+        "gga_rows": 2,
+        "fix_quality": {"RTK fixed": 1, "RTK float": 1},
+        "rtk_fixed_ratio": 0.5,
+    }
+
+
 def test_cli_writes_json(tmp_path, capsys):
     run = write_run(tmp_path / "run_raw", [road_frame(10), road_frame(10)], [0.0, 66.7])
     output = tmp_path / "report.json"
