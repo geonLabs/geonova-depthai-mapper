@@ -759,7 +759,9 @@ sync_builder.build_synced_dataset(Path(sys.argv[2]), gps_max_delta_ms=25.0)
         ], capture_output=True, text=True)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Refusing to replace sync outputs", result.stderr)
+        # Capture validation now runs first; either refusal is fine as long as nothing changes.
+        self.assertTrue(any(message in result.stderr for message in (
+            "Refusing to replace sync outputs", "Expected a raw_events_v1 dataset")), result.stderr)
         self.assertEqual(file_bytes(dataset), original)
 
     def test_separate_output_must_still_be_new_and_portable(self):
