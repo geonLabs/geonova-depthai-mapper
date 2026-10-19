@@ -4,7 +4,7 @@ Jetson의 **원본 수집**과 서버의 **데이터 후처리**를 분리한 �
 
 | 구성 | 위치 | 역할 |
 |---|---|---|
-| Jetson 수집 | `main.py`, `config.yaml`, `capture/` | OAK RGB-D·IMU, GNSS/NTRIP, EBIMU, 앱 프리뷰·센서 상태 |
+| Jetson 수집 | `main.py`, `config.yaml`, `capture/` | OAK RGB-D·온보드 IMU, GNSS/NTRIP, 앱 프리뷰·센서 상태 |
 | 서버 후처리 | `postprocess/` | 이벤트 동기화, YOLO, Depth 대표점, 좌표 변환, SHP, 선형화, 확인 화면 |
 | 공유 계약 | `shared/` | YAML 파서, 수집 완료 표시, 파일 전달 검증 |
 | 기존 명령 호환 | `code/` | 이전 import/CLI 어댑터, 하드웨어 진단 도구와 기존 개발용 설치기 |
@@ -63,4 +63,4 @@ python -m pip install -r postprocess/requirements.lock depthai==3.1.0 pyserial==
 PYTHONPATH=code python -m pytest -q tests code/tests
 ```
 
-실제 센서 수집과 모델 추론 정확도 검증은 Jetson·카메라·GNSS·EBIMU 및 현장 데이터로 별도 수행합니다.
+실제 센서 수집과 모델 추론 정확도 검증은 Jetson·카메라·GNSS 및 현장 데이터로 별도 수행합니다.

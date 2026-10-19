@@ -1,6 +1,6 @@
 # Geonova Capture — Jetson 수집 전용
 
-OAK RGB·Depth·IMU, GNSS/NTRIP, EBIMU 원본을 수집하고 GEO& 앱에 센서 상태와 JPEG 프리뷰를 게시합니다. YOLO·SHP·동기화·선형화는 후처리 서버가 실행합니다.
+OAK RGB·Depth와 온보드 IMU, GNSS/NTRIP 원본을 수집하고 GEO& 앱에 센서 상태와 JPEG 프리뷰를 게시합니다. YOLO·SHP·동기화·선형화는 후처리 서버가 실행합니다.
 
 ## 실행
 
@@ -23,6 +23,12 @@ Controller가 전달한 `JETSON_PIPELINE_RESULTS_DIR`, `JETSON_PIPELINE_SENSOR_B
 `results/<timestamp>_raw/` 전체를 전송합니다. 기존 파일명과 이미지/CSV 형식을 유지합니다. 폴더의 `capture_manifest.json`이 `state: complete`인 경우만 새 서버 CLI가 처리합니다. `recording` 또는 `failed`는 자동 처리하지 않습니다. 수집 중 폴더를 전송하기 시작했다면 전송 종료 후 서버 검증까지 수행해야 합니다.
 
 원본에는 `rgb/`, `depth_mm/`, 선택적 `confidence/`, 이벤트 CSV, 센서 CSV, 카메라 보정정보가 있는 `metadata.json`이 포함됩니다. 파일 크기와 CSV/JSON 체크섬으로 불완전한 전송을 검사합니다. 이미지 전체 해시는 계산하지 않으므로 같은 크기의 이미지 손상까지 검출하는 기능은 아닙니다.
+
+## OAK 온보드 IMU와 USB
+
+연결 시 OAK IMU 칩을 감지합니다. 지원 칩(BNO086 등 BNO08x 계열 또는 BMI270)의 raw 가속도와 자이로는 항상 `imu_events.csv`에 기록합니다. BNO08x에서는 game rotation vector도 `rv_*` 열에 기록합니다. `metadata.json`의 `imu` 블록에는 칩 이름(`type`), 센서 목록(`sensors`), 속도(`rate_hz`), IMU-to-camera extrinsics(`imu_to_camera`)가 기록됩니다.
+
+`--allow-usb2`를 켜면 USB 3 연결 시작에 실패했을 때 `usb3_retries` 횟수만큼 USB 3 재시도한 뒤 USB 2 연결을 한 번 시도합니다. 기본 `usb3_retries`는 2입니다.
 
 NTRIP 계정은 `NTRIP_USERNAME`, `NTRIP_PASSWORD` 환경변수로 주입합니다. 앱의 모바일 RTK relay 플래그 자체를 새로운 TCP endpoint로 해석하지 않습니다. 기존 네트워크/NTRIP 구성과 Controller 센서 인계 설정을 사용하고 실기에서 확인합니다.
 

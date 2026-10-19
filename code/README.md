@@ -2,7 +2,7 @@
 
 # DepthAI RGB-D·RTK 방호울타리 선형화
 
-OAK RGB-D 카메라, GPS/RTK, 내장 IMU와 외부 EBIMU를 동기 수집하고 YOLO
+OAK RGB-D 카메라의 온보드 IMU와 GPS/RTK를 수집하고 YOLO
 segmentation 결과를 지도 좌표의 방호울타리 선형으로 만드는 오프라인
 파이프라인입니다. 최종 공간 연산과 길이 계산은 미터 단위 `EPSG:5179`에서
 수행합니다.
@@ -15,7 +15,7 @@ segmentation 결과를 지도 좌표의 방호울타리 선형으로 만드는 �
 
 ```text
 센서 수집
-  RGB + RGB 정렬 Depth + IMU + GPS/RTK + EBIMU
+  RGB + RGB 정렬 Depth + OAK IMU + GPS/RTK
         ↓
 후처리 동기화
   RGB 프레임 기준 device timestamp nearest matching
@@ -84,7 +84,6 @@ YAML에 없는 값은 기본값을 사용하며 CLI 옵션이 `configs/setup.yam
 ```bash
 python tests/test_depthai_rgbd.py --config configs/rgbd_test.yaml
 python tests/test_gps_ntrip.py --config configs/gps_ntrip_test.yaml
-python tests/test_ebimu.py --config configs/ebimu_test.yaml
 ```
 
 카메라 내부표정과 RGB–Depth 정렬을 확인해야 할 때는 체커보드 도구를 사용합니다.
@@ -153,18 +152,16 @@ python synced_image_recorder.py --config configs/capture.yaml
 python synced_image_recorder.py --config configs/capture.yaml --monitor-only
 ```
 
-`--monitor-only`는 연결된 컬러 센서에서 지원하는 최대 캡처 RGB 크기
-(`1920x1200`/`1920x1080`/`1280x720` 후보 중 센서 비율에 맞는 크기)를 선택하고
-최대 5 FPS로 제한합니다. depth/confidence 저장 파이프라인을 만들지 않으며,
-USB2 급 연결에서는 MJPEG 장치 전송을 사용해 원본 raw frame의 대역폭 급증을
-막습니다. RGB 프리뷰, OAK IMU,
-GNSS/NTRIP, 외부 IMU 상태는 종료 신호를 받을 때까지 계속 게시됩니다. 이 모드에서는
+`--monitor-only`는 RGB 프리뷰를 고정 `1920x1200` 크기로 최대 15 FPS 게시합니다.
+depth/confidence 저장 파이프라인을 만들지 않으며, USB2 급 연결에서는 MJPEG 장치
+전송을 사용해 원본 raw frame의 대역폭 급증을 막습니다. RGB 프리뷰, OAK IMU,
+GNSS/NTRIP 상태는 종료 신호를 받을 때까지 계속 게시됩니다. 이 모드에서는
 타임스탬프 데이터셋 디렉터리가 생성되지 않습니다.
 
-Linux 직렬 장치 기본값 `auto`는 `/dev/serial/by-id`의 u-blox GNSS 및 EBIMU
-USB-UART ID를 사용합니다. `ttyACM0` 같은 번호 포트는 Android 휴대폰이 먼저 차지할
-수 있으므로 GNSS로 자동 선택하지 않습니다. 필요한 경우 `--gps-device`와
-`--external-imu-device`에 명시적인 안정 경로 또는 Windows COM 포트를 지정합니다.
+Linux GNSS 직렬 장치 기본값 `auto`는 `/dev/serial/by-id`의 u-blox GNSS ID를
+사용합니다. `ttyACM0` 같은 번호 포트는 Android 휴대폰이 먼저 차지할 수 있으므로
+GNSS로 자동 선택하지 않습니다. 필요한 경우 `--gps-device`에 안정 경로 또는 Windows
+COM 포트를 지정합니다. 자세 센서는 OAK 온보드 IMU를 사용합니다.
 
 ### Jetson Controller 앱 연동
 
@@ -264,7 +261,7 @@ stereo intrinsics/extrinsics를 다시 플래시해야 합니다.
 두어 post-processing 영향을 줄이고 stereo calibration 상태를 먼저 봅니다.
 
 수집 폴더에는 스트림별 이벤트 CSV와 `rgb/`, `depth_mm/` 이미지가 생성됩니다.
-GPS/NTRIP/EBIMU 장치 및 보정 서버 설정은 다음으로 확인합니다.
+GPS/NTRIP 및 OAK IMU 설정은 다음으로 확인합니다.
 
 ```bash
 python synced_image_recorder.py --help
@@ -296,7 +293,8 @@ GNSS 수신기가 정수 모호성을 다시 계산하면서 RTK FIX가 잠시 F
 
 ## 3. 데이터 동기화
 
-원본 폴더 안에 `timestamps.csv`, `imu.csv`와 품질 보고서를 생성합니다.
+수집 원본을 보존하고 `--output-dir`에 이미지와 `timestamps.csv`, `imu.csv`, 품질
+보고서를 복사해 동기화 데이터셋을 만듭니다.
 
 ```bash
 python build_synced_dataset.py --config configs/sync.yaml
@@ -304,10 +302,14 @@ python build_synced_dataset.py --config configs/sync.yaml
 
 RGB와 aligned depth는 `rgb_depth_threshold_ms`로 따로 제한합니다. 기본값 `10ms`는
 30 FPS에서 이전/다음 depth 프레임이 잘못 붙는 `±33ms` 매칭을 버리기 위한 값입니다.
-IMU 매칭은 기존 `sync_threshold_ms`를 사용합니다.
+IMU 매칭은 `sync_threshold_ms`를 사용합니다. GPS는 RGB 캡처 시각 기준 가장 가까운
+샘플을 찾고 `gps_max_delta_ms`로 허용 시간 차이를 제한합니다. 기본값은 `200ms`입니다.
+device timestamp가 없는 RGB 행은 버리고 `quality_report.json`의 `no_device_ts`에
+개수를 기록합니다.
 
-별도 폴더를 만들려면 `--output-dir`을 지정합니다. 같은 파일시스템에서는 이미지
-symlink를 사용하며, 실제 파일 복사가 필요하면 `--copy-images`를 추가합니다.
+동기화 메타데이터는 `metadata.sync.json`에 저장하며, 캡처 원본 `metadata.json`은
+수정하지 않습니다. 동기화 산출물은 이미 파일이 있으면 덮어쓰지 않습니다. 재동기화는
+새 출력 폴더를 지정해 실행합니다.
 
 ```bash
 python build_synced_dataset.py --config configs/sync.yaml --copy-images
@@ -319,11 +321,17 @@ python build_synced_dataset.py --config configs/sync.yaml --copy-images
 timestamps.csv
 imu.csv
 gps.csv                  # GPS를 사용한 경우
-external_imu.csv         # EBIMU를 사용한 경우
-metadata.json
+metadata.json            # 원본 캡처 메타데이터 복사본
+metadata.sync.json       # 동기화 설정·품질 보고서
 rgb/
 depth_mm/
 ```
+
+연결 때 감지한 OAK IMU(BNO086 등 BNO08x 계열 또는 BMI270)의 raw 가속도와 자이로는
+`imu_events.csv`에 항상 기록됩니다. BNO08x에서는 `rv_device_ts_ns`, `rv_i`,
+`rv_j`, `rv_k`, `rv_real`, `rv_accuracy_rad` game rotation vector 열도 기록합니다.
+`metadata.json`의 `imu` 블록에는 칩 이름(`type`), 센서(`sensors`), 속도(`rate_hz`),
+IMU-to-camera extrinsics(`imu_to_camera`)가 포함됩니다.
 
 ## 4. YOLO 검출과 선형화 일괄 실행
 
@@ -334,10 +342,14 @@ depth_mm/
 python tests/test_yolo_seg_shp.py --config configs/yolo.yaml
 ```
 
-`--orientation-source ebimu`는 보정된 EBIMU/외부표정을 사용하는 운영 모드입니다.
-`gps-course-level`은 GPS course를 yaw로 쓰고 카메라를 수평으로 가정하므로
-초기 확인용 근사 모드입니다. 정밀 산출 전 `metadata.json`의 카메라 장착각과
-GPS–카메라 lever-arm을 실제 측정값으로 설정해야 합니다.
+기본 `--orientation-source gps-course`는 GPS course를 yaw로, OAK IMU를 카메라
+roll/pitch로 사용합니다. `imu_max_delta_ms` 이내에 있는 IMU 기울기 샘플만 시간상
+신뢰하며, 이 한계를 넘으면 결과를 신뢰 불가로 표시합니다. 유효한 장치 보정
+IMU-to-camera extrinsics가 없으면 `imu_to_camera_rpy_deg` 설정을 대체 회전으로
+사용합니다. `gps-course-level`은 GPS course yaw와 수평 카메라 가정을 사용하는
+근사 모드입니다. `trusted_max_hdop`는 GPS 위치 신뢰 상한이고,
+`trajectory_max_hdop`는 course/궤적에 쓸 GPS 표본의 HDOP 상한입니다. 정밀 산출 전
+카메라 장착각, IMU 장착 회전 대체값, GPS–카메라 lever-arm을 실측값으로 설정해야 합니다.
 
 YOLO 실행이 끝나면 선형화가 자동 실행됩니다. YOLO 결과만 만들려면
 `--no-linearize`를 추가합니다.
@@ -463,12 +475,16 @@ python -m geonova_depthai.debug_ui --config configs/debug_ui.yaml
 ```
 
 브라우저에서 `http://127.0.0.1:8088`을 열어 RGB, Depth, GPS/IMU 동기화,
-YOLO 관측점과 세계좌표 품질을 확인합니다.
+YOLO 관측점과 세계좌표 품질을 확인합니다. 기본 bind는 `127.0.0.1`입니다.
+`--host 0.0.0.0`을 지정하면 네트워크에서 접근 가능하다는 경고를 출력합니다.
+조회는 GET, 변경은 POST 요청만 허용하며, 데이터셋 경로는 설정한 `dataset_root`
+아래로 제한합니다.
 
 ## CLI 도움말
 
-모든 실행 파일은 YAML을 지원합니다. `--config`에 없는 키는 기존 기본값을
-유지하고, 명시적인 CLI 옵션은 YAML 값을 덮어씁니다. 전체 기본 설정 파일은
+모든 실행 파일은 YAML을 지원합니다. CLI 기본값은 각 YAML 설정 파일에 정의된 값을
+따르며, 명시적인 CLI 옵션은 YAML 값을 덮어씁니다. YOLO의 자동 선형화는 독립
+`linearize` 실행과 같은 `linearization.yaml` 설정을 사용합니다. 전체 기본 설정 파일은
 각 명령의 `--write-default-config`로 생성할 수 있습니다.
 
 YAML 키는 CLI의 `--max-gap-m`을 `max_gap_m`으로 적는 식으로 하이픈을
@@ -492,7 +508,6 @@ python -m geonova_depthai.fence_linearization --help
 python -m geonova_depthai.debug_ui --help
 python tests/test_depthai_rgbd.py --help
 python tests/test_gps_ntrip.py --help
-python tests/test_ebimu.py --help
 python tests/test_checkerboard_calibration.py --help
 python tests/test_rgb_depth_checkerboard.py --help
 ```
@@ -507,11 +522,10 @@ build_synced_dataset.py              후처리 동기화 진입점
 geonova_depthai/capture/             수집 CLI와 raw writer
 geonova_depthai/controller_bridge.py 앱용 센서 상태와 카메라 프리뷰 게시
 geonova_depthai/postprocess/         이벤트 동기화
-geonova_depthai/runtime.py           DepthAI·GPS·NTRIP·EBIMU runtime
+geonova_depthai/runtime.py           DepthAI·온보드 IMU·GPS/NTRIP runtime
 geonova_depthai/debug_ui.py          데이터셋 확인과 좌표 변환
 geonova_depthai/yolo_seg_shp.py      YOLO·Depth fragment·WGS84 관측점
 geonova_depthai/fence_linearization.py EPSG:5179 보정·spline·SHP·QA
 ../model/n_model/best.pt            기본 guardrail segmentation 모델
-tools/configure_ebimu.py            EBIMU 출력 설정·보정 도구
 tests/                               센서/캘리브레이션/회귀 검증
 ```

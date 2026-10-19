@@ -33,7 +33,7 @@ postprocess/.venv/bin/python postprocess/main.py yolo \
   --dataset /srv/geonova/processed/RUN_ID/synced \
   --model /srv/geonova/models/guardrail.pt \
   --output-dir /srv/geonova/processed/RUN_ID/yolo \
-  --start-frame 200 --max-frames 999999 --orientation-source ebimu --device 0
+  --start-frame 200 --max-frames 999999 --device 0
 
 postprocess/.venv/bin/python postprocess/main.py linearize \
   --points /srv/geonova/processed/RUN_ID/yolo/points.csv \
@@ -43,9 +43,13 @@ postprocess/.venv/bin/python postprocess/main.py linearize \
 
 YOLO는 기본적으로 선형화도 실행합니다. 세 번째 명령은 설정을 바꿔 선형화만 다시 실행할 때 사용합니다. 기존 알고리즘의 프레임 200 이후 시작·Depth 8m 조건을 유지했습니다. 새 장치/지역에 맞는 값은 실측 데이터로 검증해야 합니다.
 
-각 명령은 `--config configs/<명령>.yaml`도 지원합니다. 예시의 `REPLACE_RUN_ID`와 모델 경로를 수정합니다. `sync`의 상대경로는 YAML 기준이며, 기존 yolo/linearize CLI의 상대경로는 실행 디렉터리 기준입니다. 운영 설정에서는 예시처럼 절대경로를 사용합니다.
+각 명령은 `--config configs/<명령>.yaml`도 지원합니다. CLI 기본값은 각 YAML 설정과 같은 값을 사용하고, 명시한 CLI 옵션이 YAML보다 우선합니다. YOLO가 자동 실행하는 선형화도 `linearization.yaml`의 같은 설정을 사용합니다. `trusted_max_hdop`는 GPS 위치 신뢰 판정의 HDOP 상한이고, `trajectory_max_hdop`는 진행방향과 궤적에 사용할 GPS 샘플의 HDOP 상한입니다. 예시의 `REPLACE_RUN_ID`와 모델 경로를 수정합니다. `sync`의 상대경로는 YAML 기준이며, 기존 yolo/linearize CLI의 상대경로는 실행 디렉터리 기준입니다. 운영 설정에서는 예시처럼 절대경로를 사용합니다.
 
-새 `sync` CLI는 원본과 분리된 새/빈 출력 폴더가 필수이고 이미지도 복사합니다. 원본 파일을 덮어쓰거나 이미지 링크로 원본 서버에 종속되지 않습니다. 같은 출력 폴더 재사용은 거부하므로 재처리는 다른 job 폴더를 지정합니다. 결과 복사에 원본 이미지 크기만큼 공간이 필요합니다. 동기화 실패/0프레임은 실패 상태로 남고 재실행은 새 출력 폴더에서 합니다.
+`sync`는 원본과 분리된 출력 폴더에 이미지와 동기화 결과를 복사합니다. GPS는 RGB 캡처 시각에서 가장 가까운 샘플을 찾고, 기본 `gps_max_delta_ms: 200` ms를 넘으면 해당 프레임의 GPS를 연결하지 않습니다. `quality_report.json`에는 device timestamp가 없는 RGB 행의 `no_device_ts` 개수도 기록됩니다. 수집 원본의 `metadata.json`은 그대로 복사되며, 동기화 설정과 품질 정보는 `metadata.sync.json`에 따로 저장됩니다.
+
+동기화 출력 파일이 이미 있으면 덮어쓰지 않고 중단합니다. 재동기화하려면 비어 있는 새 출력 디렉터리를 지정하고, 결과 복사에 원본 이미지 크기만큼 공간을 확보합니다. 동기화 실패/0프레임은 실패 상태로 남고 재실행도 새 출력 디렉터리에서 합니다.
+
+자세 기본값 `gps-course`는 GPS course를 yaw로, OAK IMU의 roll/pitch를 기울기로 사용합니다. IMU 시각 차이가 `imu_max_delta_ms` 이내일 때만 기울기 샘플을 신뢰하며, 장치 보정 extrinsics가 없거나 유효하지 않으면 `imu_to_camera_rpy_deg` 설정을 대체값으로 사용합니다. `gps-course-level`은 카메라가 수평이라고 보는 근사 모드입니다.
 
 이전 수집본은 manifest가 없으므로, 수집이 완전히 종료된 `raw_events_v1` 원본에만 `--allow-legacy`를 명시합니다. 이 옵션도 `recording`/`failed` 표시가 있는 수집본을 허용하지 않습니다.
 
@@ -55,4 +59,4 @@ YOLO는 기본적으로 선형화도 실행합니다. 세 번째 명령은 설�
 postprocess/.venv/bin/python postprocess/main.py inspect --config postprocess/configs/debug_ui.yaml
 ```
 
-화면은 기본 배치 처리에서 시작하지 않습니다. 예시 설정은 127.0.0.1:8088이며, 원격 확인은 서버 접근 정책/SSH 터널을 사용합니다. 이 기존 도구는 인증을 갖춘 업로드 API나 작업 대기열이 아닙니다. 자동 전송, 서버 인증, 작업 큐, DB, 결과 API, 재시도 운영은 실제 후처리 서버 이전 단계에서 연결합니다.
+화면은 기본 배치 처리에서 시작하지 않습니다. 기본 bind는 `127.0.0.1:8088`입니다. `--host 0.0.0.0`으로 네트워크에 공개할 수 있으며, 이 경우 UI가 네트워크에서 접근 가능하다는 경고를 출력합니다. 읽기 요청은 GET, 변경 요청은 POST만 허용합니다. UI가 여는 데이터셋 경로는 `--dataset-root` 아래로 제한됩니다. 원격 확인은 서버 접근 정책/SSH 터널을 사용합니다. 이 도구는 인증을 갖춘 업로드 API나 작업 대기열이 아닙니다. 자동 전송, 서버 인증, 작업 큐, DB, 결과 API, 재시도 운영은 실제 후처리 서버 이전 단계에서 연결합니다.

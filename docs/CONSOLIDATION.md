@@ -10,7 +10,7 @@ Legacy:    dbparkJ/geo_multifusion_sensors
 ```
 
 `geo_multifusion_sensors`에 있던 DepthAI 코드 사본은 더 이상 독립 원본으로 취급하지
-않습니다. 수집, 동기화, GPS/RTK, 외부 IMU, Controller bridge, YOLO/SHP 및
+않습니다. 수집, 동기화, GPS/RTK, OAK 온보드 IMU, Controller bridge, YOLO/SHP 및
 방호울타리 선형화 변경은 모두 기준 저장소에서만 진행합니다.
 
 ## 기준 저장소를 선택한 이유
@@ -20,7 +20,8 @@ Legacy:    dbparkJ/geo_multifusion_sensors
 
 - 데이터셋을 만들지 않는 `--monitor-only` 센서 모니터링
 - OAK 카메라 장애 시 GPS/IMU 상태를 유지한 재연결
-- `/dev/serial/by-id` 기반 GNSS/EBIMU 안전 자동 탐색
+- OAK IMU 칩 감지와 raw 가속도/자이로 기록, 지원 칩의 회전 벡터 기록
+- `/dev/serial/by-id` 기반 GNSS 안전 자동 탐색
 - Android `ttyACM` 장치를 GNSS로 오인하지 않는 fail-closed 처리
 - 이동 중 NTRIP 기준국 재선택과 make-before-break RTCM 전환
 - 동일 초 재시작 시 기존 수집 폴더를 덮어쓰지 않는 원자적 디렉터리 예약

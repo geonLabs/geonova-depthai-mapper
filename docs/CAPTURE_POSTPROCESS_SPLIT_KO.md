@@ -38,6 +38,8 @@
 
 기존 `raw_events_v1` 이미지/CSV 구조와 카메라 내부표정, 이미지 변환, 깊이 단위(mm)를 유지한다. 폴더명은 기존 로컬 timestamp 형식을 유지하고 manifest의 상태 시각은 명시적 UTC다. run_id는 수집 폴더명이다.
 
+`imu_events.csv`에는 OAK 온보드 IMU의 raw 가속도와 자이로를 기록하며, BNO08x는 game rotation vector 열도 기록한다. `metadata.json`의 `imu` 블록에는 감지 칩, 센서 목록, 속도와 IMU-to-camera extrinsics가 포함된다.
+
 새 파일 `capture_manifest.json`:
 
 ```json
@@ -95,13 +97,13 @@ export는 대상 폴더 덮어쓰기를 거부한다. `source_revision.json`에 
 실기에서는 다음을 확인한다.
 
 - 앱 등록과 재등록, 시작/중지/재시작, 부팅 센서 모니터 인계.
-- OAK RGB·Depth·IMU 및 GNSS/EBIMU 수집량, 저장 속도, 프리뷰, 신규 GPS 샘플 시각.
+- OAK RGB·Depth·온보드 IMU 및 GNSS 수집량, 저장 속도, 프리뷰, 신규 GPS 샘플 시각.
 - 모바일 데이터와 NTRIP RTCM 지속 수신, RTK fix, 장치 해제 후 포트 반환.
 - 디스크 부족·케이블 분리·종료 시 failed/complete 상태와 결과 파일.
 - 수집 폴더 전체 전송 후 동기화 QA와 기존 결과 비교.
 - 동일 모델/설정/데이터의 YOLO·대표점·SHP·선형화 결과와 공간 오차.
 
-이 환경에는 실제 Jetson·OAK·GNSS·EBIMU가 연결되지 않았고 서버 모델 추론도 실측하지 않았다. 실기 검증 전 자동으로 main 병합하거나 운영 장치 설정을 바꾸지 않는다.
+이 환경에는 실제 Jetson·OAK·GNSS가 연결되지 않았고 서버 모델 추론도 실측하지 않았다. 실기 검증 전 자동으로 main 병합하거나 운영 장치 설정을 바꾸지 않는다.
 
 ## 이번 작업의 확인 결과
 
