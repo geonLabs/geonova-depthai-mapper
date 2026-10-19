@@ -3,14 +3,16 @@ import bisect
 import csv
 import json
 import math
+import os
 import shutil
+import tempfile
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from geonova_common.config_cli import parse_args_with_yaml
-from geonova_common.run_contract import atomic_json, separate_output, validate_capture, utc_now
+from geonova_common.run_contract import atomic_json, relative_file, separate_output, validate_capture, utc_now
 
 
 TIMESTAMP_FIELDS = [
@@ -36,7 +38,9 @@ SYNCED_IMU_FIELDS = [
 
 DEFAULT_SYNC_THRESHOLD_MS = 50.0
 DEFAULT_RGB_DEPTH_THRESHOLD_MS = 10.0
-DEFAULT_GPS_MAX_DELTA_MS = 200.0
+DEFAULT_GPS_MAX_DELTA_MS = 150.0
+SYNC_OUTPUT_FILES = ("timestamps.csv", "imu.csv", "metadata.sync.json", "quality_report.json")
+RAW_EVENT_FORMATS = ("raw_events_v1", "synced_from_raw_events_v1")
 
 
 def validate_thresholds(*values):
@@ -92,12 +96,83 @@ def count_order_inversions(rows: List[Dict[str, str]], key: str) -> int:
     return inversions
 
 
-def write_csv(path: Path, fieldnames: List[str], rows: Iterable[Dict[str, object]]):
-    with open(path, "x", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({key: row.get(key, "") for key in fieldnames})
+def write_csv(file, fieldnames: List[str], rows: Iterable[Dict[str, object]]):
+    writer = csv.DictWriter(file, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+
+def write_sync_outputs(output_dir, timestamp_rows, synced_imu_rows, metadata):
+    """Stage the complete result before replacing any existing output file."""
+    payloads = (
+        ("timestamps.csv", TIMESTAMP_FIELDS, timestamp_rows),
+        ("imu.csv", SYNCED_IMU_FIELDS, synced_imu_rows),
+        ("metadata.sync.json", None, metadata),
+        ("quality_report.json", None, metadata["quality_report"]),
+    )
+    staged = []
+    try:
+        for filename, fieldnames, payload in payloads:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", newline="", dir=str(output_dir),
+                prefix="." + filename + ".", suffix=".tmp", delete=False,
+            ) as file:
+                temporary = Path(file.name)
+                staged.append((temporary, output_dir / filename))
+                if fieldnames is None:
+                    json.dump(payload, file, indent=2, ensure_ascii=False, allow_nan=False)
+                    file.write("\n")
+                else:
+                    write_csv(file, fieldnames, payload)
+                file.flush()
+                os.fsync(file.fileno())
+        for temporary, path in staged:
+            os.replace(temporary, path)
+    finally:
+        for temporary, _ in staged:
+            temporary.unlink(missing_ok=True)
+
+
+def check_existing_outputs(dataset, output_dir):
+    existing = [output_dir / name for name in SYNC_OUTPUT_FILES
+                if (output_dir / name).exists() or (output_dir / name).is_symlink()]
+    if not existing:
+        return
+    if output_dir == dataset:
+        try:
+            metadata = json.loads((dataset / "metadata.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            metadata = None
+        if isinstance(metadata, dict) and metadata.get("format_version") in RAW_EVENT_FORMATS:
+            return
+    raise FileExistsError(
+        "Refusing to replace sync outputs: metadata.json must identify a "
+        "raw_events_v1 or synced_from_raw_events_v1 capture; use a new output directory"
+    )
+
+
+def validate_sync_capture(dataset, allow_legacy=False):
+    """Also accept the historical format marker rewritten by in-place sync."""
+    try:
+        return validate_capture(dataset, allow_legacy=allow_legacy)
+    except ValueError as error:
+        # The shared validator checks completion, inventory and checksums before
+        # rejecting this old marker. Finish its remaining path checks below.
+        if str(error) != "Expected a raw_events_v1 dataset":
+            raise
+        metadata = json.loads((dataset / "metadata.json").read_text(encoding="utf-8"))
+        if metadata.get("format_version") != "synced_from_raw_events_v1":
+            raise
+    for name in ("rgb_events.csv", "depth_events.csv", "confidence_events.csv"):
+        if (dataset / name).exists():
+            for row in read_csv(relative_file(dataset, name)):
+                relative_file(dataset, row.get("file", ""))
+    for path in dataset.rglob("*"):
+        if path.is_symlink():
+            raise ValueError(f"Dataset symlink is not portable: {path}")
+    manifest_path = dataset / "capture_manifest.json"
+    return json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else None
 
 
 class NearestIndex:
@@ -169,7 +244,7 @@ def build_synced_dataset(
     rgb_depth_threshold_ms: float = DEFAULT_RGB_DEPTH_THRESHOLD_MS,
     gps_max_delta_ms: float = DEFAULT_GPS_MAX_DELTA_MS,
 ):
-    """Create sync outputs once; leave capture metadata and raw streams intact."""
+    """Build or replace sync outputs; leave capture metadata and streams intact."""
     validate_thresholds(threshold_ms, rgb_depth_threshold_ms, gps_max_delta_ms)
     dataset = dataset.expanduser().resolve()
     if output_dir is None:
@@ -178,12 +253,7 @@ def build_synced_dataset(
         output_dir = separate_output(dataset, output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Legacy captures may already contain these names. Never truncate them,
-    # even when no capture manifest is available to establish their origin.
-    for filename in ("timestamps.csv", "imu.csv", "metadata.sync.json", "quality_report.json"):
-        path = output_dir / filename
-        if path.exists() or path.is_symlink():
-            raise FileExistsError(f"Sync output already exists: {path}; use a new output directory")
+    check_existing_outputs(dataset, output_dir)
 
     rgb_rows = read_csv(dataset / "rgb_events.csv")
     depth_rows = read_csv(dataset / "depth_events.csv")
@@ -213,7 +283,8 @@ def build_synced_dataset(
 
     timestamp_rows = []
     synced_imu_rows = []
-    dropped = {"no_device_ts": 0, "no_depth": 0, "no_imu": 0}
+    dropped = {"no_device_ts": 0, "no_depth": 0}
+    no_imu_match = 0
     no_gps_within_threshold = 0
     deltas = {"rgb_depth_ms": [], "rgb_imu_ms": [], "gps_frame_ms": [], "depth_confidence_ms": []}
 
@@ -230,8 +301,7 @@ def build_synced_dataset(
             continue
         imu, rgb_imu_delta_ms = imu_index.nearest(rgb_device_ns, threshold_ms)
         if imu is None:
-            dropped["no_imu"] += 1
-            continue
+            no_imu_match += 1
 
         confidence = None
         depth_conf_delta_ms = ""
@@ -245,8 +315,8 @@ def build_synced_dataset(
             no_gps_within_threshold += 1
 
         stem = f"sync-frame{frame_index:07d}"
-        imu_message_index = imu.get("message_index") or imu.get("_message_index") or ""
-        selected_imu_packets = imu_by_message.get(imu_message_index, [])
+        imu_message_index = (imu.get("message_index") or imu.get("_message_index") or "") if imu else None
+        selected_imu_packets = imu_by_message.get(imu_message_index, []) if imu else []
         for packet in selected_imu_packets:
             synced_imu_rows.append({
                 "frame_index": frame_index,
@@ -284,12 +354,12 @@ def build_synced_dataset(
             "rgb_device_ts_ns": rgb.get("device_ts_ns", ""),
             "depth_device_ts_ns": depth.get("device_ts_ns", ""),
             "confidence_device_ts_ns": confidence.get("device_ts_ns", "") if confidence else "",
-            "imu_message_device_ts_ns": imu.get("message_device_ts_ns", ""),
+            "imu_message_device_ts_ns": imu.get("message_device_ts_ns", "") if imu else "",
             "rgb_depth_delta_ms": rgb_depth_delta_ms,
             "depth_confidence_delta_ms": depth_conf_delta_ms,
-            "rgb_imu_delta_ms": rgb_imu_delta_ms,
+            "rgb_imu_delta_ms": rgb_imu_delta_ms if imu else "",
             "depth_imu_delta_ms": (safe_int(imu.get("message_device_ts_ns"), 0) - safe_int(depth.get("device_ts_ns"), 0)) / 1_000_000.0 if imu and depth else "",
-            "imu_packets": len(selected_imu_packets),
+            "imu_packets": len(selected_imu_packets) if imu else "",
         }
 
         if gps:
@@ -316,7 +386,8 @@ def build_synced_dataset(
             })
             deltas["gps_frame_ms"].append(gps_delta_ms)
         deltas["rgb_depth_ms"].append(rgb_depth_delta_ms)
-        deltas["rgb_imu_ms"].append(rgb_imu_delta_ms)
+        if imu is not None:
+            deltas["rgb_imu_ms"].append(rgb_imu_delta_ms)
         timestamp_rows.append(row)
         frame_index += 1
 
@@ -340,9 +411,6 @@ def build_synced_dataset(
             if src.exists():
                 shutil.copy2(src, output_dir / filename)
 
-    write_csv(output_dir / "timestamps.csv", TIMESTAMP_FIELDS, timestamp_rows)
-    write_csv(output_dir / "imu.csv", SYNCED_IMU_FIELDS, synced_imu_rows)
-
     # Sync owns only this sidecar. metadata.json remains the exact capture
     # document, including its format_version, IMU calibration and sync settings.
     metadata = {}
@@ -357,6 +425,7 @@ def build_synced_dataset(
         "source_dataset": str(dataset),
         "kept_frame_count": len(timestamp_rows),
         "dropped": dropped,
+        "no_imu_match": no_imu_match,
     })
     metadata["quality_report"] = {
         "raw_counts": {
@@ -369,6 +438,7 @@ def build_synced_dataset(
         },
         "kept_frame_count": len(timestamp_rows),
         "dropped": dropped,
+        "no_imu_match": no_imu_match,
         "gps_max_delta_ms": gps_max_delta_ms,
         "no_gps_within_threshold": no_gps_within_threshold,
         "order_inversions": {
@@ -377,10 +447,7 @@ def build_synced_dataset(
         },
         "deltas_ms": {name: stats(values) for name, values in deltas.items()},
     }
-    with open(output_dir / "metadata.sync.json", "x", encoding="utf-8") as file:
-        json.dump(metadata, file, indent=2, ensure_ascii=False)
-    with open(output_dir / "quality_report.json", "x", encoding="utf-8") as file:
-        json.dump(metadata["quality_report"], file, indent=2, ensure_ascii=False)
+    write_sync_outputs(output_dir, timestamp_rows, synced_imu_rows, metadata)
 
     return output_dir, metadata["quality_report"]
 
@@ -391,8 +458,8 @@ def build_parser():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--dataset", required=True, help="Raw event dataset directory")
-    parser.add_argument("--output-dir", required=True, help="New or empty output directory separate from the raw input")
-    parser.add_argument("--allow-legacy", action="store_true", help="Accept a stopped historical raw_events_v1 run without capture_manifest.json")
+    parser.add_argument("--output-dir", default="", help="Empty writes sync outputs into the capture; otherwise use a new or empty separate directory")
+    parser.add_argument("--allow-legacy", action="store_true", help="Accept a stopped historical raw-event run without capture_manifest.json")
     parser.add_argument("--sync-threshold-ms", type=float, default=DEFAULT_SYNC_THRESHOLD_MS, help="Maximum absolute device-time difference used for IMU pairing, in milliseconds")
     parser.add_argument("--rgb-depth-threshold-ms", type=float, default=DEFAULT_RGB_DEPTH_THRESHOLD_MS, help="Maximum absolute device-time difference used for RGB/depth pairing, in milliseconds")
     parser.add_argument("--gps-max-delta-ms", type=float, default=DEFAULT_GPS_MAX_DELTA_MS, help="Maximum absolute host-time difference used for RGB/GPS pairing, in milliseconds")
@@ -408,8 +475,9 @@ def main(argv=None):
         path = Path(value).expanduser()
         return path if path.is_absolute() else config_root / path
     dataset = configured_path(args.dataset).resolve()
-    output = separate_output(dataset, configured_path(args.output_dir))
-    capture = validate_capture(dataset, allow_legacy=args.allow_legacy)
+    output = separate_output(dataset, configured_path(args.output_dir)) if args.output_dir else None
+    check_existing_outputs(dataset, output if output is not None else dataset)
+    capture = validate_sync_capture(dataset, allow_legacy=args.allow_legacy)
     try:
         out, report = build_synced_dataset(
             dataset, args.sync_threshold_ms, output, True, args.rgb_depth_threshold_ms,
@@ -418,18 +486,19 @@ def main(argv=None):
         if not report["kept_frame_count"]:
             raise ValueError("No synchronized frames survived; inspect quality_report.json")
     except BaseException as error:
-        if output.is_dir():
+        if output is not None and output.is_dir():
             atomic_json(output / "processing_manifest.json", {
                 "schema": "geonova.processing-run/v1", "state": "failed", "stage": "sync",
                 "source_run_id": capture["run_id"] if capture else dataset.name,
                 "updated_at_utc": utc_now(), "error_type": type(error).__name__,
             })
         raise
-    atomic_json(out / "processing_manifest.json", {
-        "schema": "geonova.processing-run/v1", "state": "complete", "stage": "sync",
-        "source_run_id": capture["run_id"] if capture else dataset.name,
-        "source_capture": capture, "updated_at_utc": utc_now(),
-    })
+    if output is not None:
+        atomic_json(out / "processing_manifest.json", {
+            "schema": "geonova.processing-run/v1", "state": "complete", "stage": "sync",
+            "source_run_id": capture["run_id"] if capture else dataset.name,
+            "source_capture": capture, "updated_at_utc": utc_now(),
+        })
     print(f"Synced dataset ready: {out}")
     print(json.dumps(report, indent=2, ensure_ascii=False))
 

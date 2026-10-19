@@ -45,9 +45,9 @@ YOLO는 기본적으로 선형화도 실행합니다. 세 번째 명령은 설�
 
 각 명령은 `--config configs/<명령>.yaml`도 지원합니다. CLI 기본값은 각 YAML 설정과 같은 값을 사용하고, 명시한 CLI 옵션이 YAML보다 우선합니다. YOLO가 자동 실행하는 선형화도 `linearization.yaml`의 같은 설정을 사용합니다. `trusted_max_hdop`는 GPS 위치 신뢰 판정의 HDOP 상한이고, `trajectory_max_hdop`는 진행방향과 궤적에 사용할 GPS 샘플의 HDOP 상한입니다. 예시의 `REPLACE_RUN_ID`와 모델 경로를 수정합니다. `sync`의 상대경로는 YAML 기준이며, 기존 yolo/linearize CLI의 상대경로는 실행 디렉터리 기준입니다. 운영 설정에서는 예시처럼 절대경로를 사용합니다.
 
-`sync`는 원본과 분리된 출력 폴더에 이미지와 동기화 결과를 복사합니다. GPS는 RGB 캡처 시각에서 가장 가까운 샘플을 찾고, 기본 `gps_max_delta_ms: 200` ms를 넘으면 해당 프레임의 GPS를 연결하지 않습니다. `quality_report.json`에는 device timestamp가 없는 RGB 행의 `no_device_ts` 개수도 기록됩니다. 수집 원본의 `metadata.json`은 그대로 복사되며, 동기화 설정과 품질 정보는 `metadata.sync.json`에 따로 저장됩니다.
+`sync`는 기본값인 빈 `output_dir`에서 수집 폴더에 `timestamps.csv`, `imu.csv`, `metadata.sync.json`, `quality_report.json`을 저장합니다. 별도의 `--output-dir`를 지정하면 비어 있는 새 출력 폴더에 이미지와 동기화 결과를 복사합니다. GPS는 RGB 캡처 시각에서 가장 가까운 샘플을 찾고, 기본 `gps_max_delta_ms: 150` ms를 넘으면 해당 프레임의 GPS를 연결하지 않습니다. IMU 매칭이 없는 프레임은 IMU 필드를 비워 유지하고 `quality_report.json`의 `no_imu_match`에 개수를 기록합니다. device timestamp가 없는 RGB 행은 기존처럼 버리고 `no_device_ts`에 개수를 기록합니다. 수집 원본의 `metadata.json`은 수정하지 않으며, 동기화 설정과 품질 정보는 `metadata.sync.json`에 따로 저장됩니다.
 
-동기화 출력 파일이 이미 있으면 덮어쓰지 않고 중단합니다. 재동기화하려면 비어 있는 새 출력 디렉터리를 지정하고, 결과 복사에 원본 이미지 크기만큼 공간을 확보합니다. 동기화 실패/0프레임은 실패 상태로 남고 재실행도 새 출력 디렉터리에서 합니다.
+수집 폴더에서 재동기화하면 `metadata.json`의 `format_version`이 `raw_events_v1` 또는 `synced_from_raw_events_v1`인 경우에만 위 네 산출물을 교체합니다. 각 파일은 같은 폴더의 임시 파일을 완성한 뒤 원자적으로 교체하며, 캡처 파일은 바이트 그대로 보존합니다. 다른 형식의 기존 파일은 덮어쓰지 않습니다. 별도의 `--output-dir`는 계속 비어 있는 새 폴더를 사용합니다.
 
 자세 기본값 `gps-course`는 GPS course를 yaw로, OAK IMU의 roll/pitch를 기울기로 사용합니다. IMU 시각 차이가 `imu_max_delta_ms` 이내일 때만 기울기 샘플을 신뢰하며, 장치 보정 extrinsics가 없거나 유효하지 않으면 `imu_to_camera_rpy_deg` 설정을 대체값으로 사용합니다. `gps-course-level`은 카메라가 수평이라고 보는 근사 모드입니다.
 

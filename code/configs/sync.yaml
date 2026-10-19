@@ -1,8 +1,7 @@
-# Legacy CLI adapter config. Prefer postprocess/main.py sync.
-dataset: ../../data/REPLACE_RUN_ID_raw
-output_dir: ../../data/processed/REPLACE_RUN_ID/synced
+# Paths are relative to this YAML; CLI paths can be absolute.
+dataset: /srv/geonova/raw/REPLACE_RUN_ID
+output_dir: ""
 sync_threshold_ms: 50.0
 rgb_depth_threshold_ms: 10.0
-gps_max_delta_ms: 200.0
-copy_images: true
+gps_max_delta_ms: 150.0
 allow_legacy: false

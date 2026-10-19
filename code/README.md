@@ -293,8 +293,9 @@ GNSS 수신기가 정수 모호성을 다시 계산하면서 RTK FIX가 잠시 F
 
 ## 3. 데이터 동기화
 
-수집 원본을 보존하고 `--output-dir`에 이미지와 `timestamps.csv`, `imu.csv`, 품질
-보고서를 복사해 동기화 데이터셋을 만듭니다.
+기본값인 빈 `output_dir`는 수집 폴더에 `timestamps.csv`, `imu.csv`,
+`metadata.sync.json`, `quality_report.json`을 저장합니다. 별도의 `--output-dir`를
+지정하면 비어 있는 새 폴더에 이미지와 동기화 결과를 복사합니다.
 
 ```bash
 python build_synced_dataset.py --config configs/sync.yaml
@@ -303,13 +304,16 @@ python build_synced_dataset.py --config configs/sync.yaml
 RGB와 aligned depth는 `rgb_depth_threshold_ms`로 따로 제한합니다. 기본값 `10ms`는
 30 FPS에서 이전/다음 depth 프레임이 잘못 붙는 `±33ms` 매칭을 버리기 위한 값입니다.
 IMU 매칭은 `sync_threshold_ms`를 사용합니다. GPS는 RGB 캡처 시각 기준 가장 가까운
-샘플을 찾고 `gps_max_delta_ms`로 허용 시간 차이를 제한합니다. 기본값은 `200ms`입니다.
+샘플을 찾고 `gps_max_delta_ms`로 허용 시간 차이를 제한합니다. 기본값은 `150ms`입니다.
+IMU 매칭이 없는 프레임은 IMU 필드를 비워 유지하고 `no_imu_match`에 개수를 기록합니다.
 device timestamp가 없는 RGB 행은 버리고 `quality_report.json`의 `no_device_ts`에
 개수를 기록합니다.
 
 동기화 메타데이터는 `metadata.sync.json`에 저장하며, 캡처 원본 `metadata.json`은
-수정하지 않습니다. 동기화 산출물은 이미 파일이 있으면 덮어쓰지 않습니다. 재동기화는
-새 출력 폴더를 지정해 실행합니다.
+수정하지 않습니다. 수집 폴더에서 재동기화하면 `metadata.json`의 `format_version`이
+`raw_events_v1` 또는 `synced_from_raw_events_v1`인 경우에만 위 네 산출물을 교체합니다.
+각 파일은 같은 폴더의 임시 파일을 완성한 뒤 원자적으로 교체하며, 다른 형식의 기존
+파일은 덮어쓰지 않습니다. 캡처 파일은 재동기화에서도 바이트 그대로 보존합니다.
 
 ```bash
 python build_synced_dataset.py --config configs/sync.yaml --copy-images
