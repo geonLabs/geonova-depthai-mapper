@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 
 import bisect
+import copy
 import csv
 import json
+import os
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -21,6 +24,8 @@ IMU_SETTINGS = (
     "imu_max_delta_ms", "imu_to_camera_rpy_deg", "imu_filter_time_constant_s",
     "imu_accel_rejection_m_s2", "imu_bias_window_s",
     "imu_bias_accel_tolerance_m_s2", "imu_bias_gyro_threshold_rad_s",
+    "imu_to_camera_validated", "imu_max_gap_ms", "imu_accel_innovation_deg",
+    "imu_still_duration_s", "imu_still_accel_tolerance_m_s2",
 )
 
 
@@ -107,6 +112,29 @@ def metadata_image_size(metadata):
     return max(1, width), max(1, height)
 
 
+def _merge_metadata(base, overrides):
+    """Merge JSON objects recursively without mutating capture metadata."""
+    merged = copy.deepcopy(base)
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_metadata(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _metadata_overrides(base, current):
+    overrides = {}
+    for key, value in current.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            nested = _metadata_overrides(base[key], value)
+            if nested:
+                overrides[key] = nested
+        elif key not in base or value != base[key]:
+            overrides[key] = copy.deepcopy(value)
+    return overrides
+
+
 class Dataset:
     def __init__(self, root):
         self.root = root
@@ -130,10 +158,18 @@ class Dataset:
             safe_int(row.get("sample_index"), -1): row
             for row in self.gps_rows
         }
-        self.metadata = {}
+        self._capture_metadata = {}
         if metadata_path.exists():
-            with open(metadata_path) as file:
-                self.metadata = json.load(file)
+            with metadata_path.open(encoding="utf-8") as file:
+                self._capture_metadata = json.load(file)
+        overrides = {}
+        overrides_path = root / "metadata.overrides.json"
+        if overrides_path.exists():
+            with overrides_path.open(encoding="utf-8") as file:
+                overrides = json.load(file)
+        if not isinstance(self._capture_metadata, dict) or not isinstance(overrides, dict):
+            raise ValueError("Metadata must be a JSON object.")
+        self.metadata = _merge_metadata(self._capture_metadata, overrides)
         self.orientation_config = {}
         self._camera_imu_cache = {}
         self._camera_imu_lock = threading.Lock()
@@ -435,10 +471,18 @@ def validate_imu_settings(settings):
         if key == "imu_to_camera_rpy_deg":
             if np.asarray(value).shape != (3,) or not np.all(np.isfinite(value)):
                 raise ValueError("imu_to_camera_rpy_deg must contain three finite angles.")
+        elif key == "imu_to_camera_validated":
+            # The shared CLI exposes numeric IMU options; accept only 0/1 there.
+            if value not in (False, True):
+                raise ValueError("imu_to_camera_validated must be false or true (0 or 1).")
         elif not np.isfinite(value) or value < 0 or (
-            key in ("imu_filter_time_constant_s", "imu_accel_rejection_m_s2") and value == 0
+            key in ("imu_filter_time_constant_s", "imu_accel_rejection_m_s2",
+                    "imu_max_gap_ms", "imu_accel_innovation_deg", "imu_still_duration_s",
+                    "imu_still_accel_tolerance_m_s2") and value == 0
         ):
             raise ValueError(f"Invalid {key}.")
+    if settings["imu_accel_innovation_deg"] >= 90:
+        raise ValueError("imu_accel_innovation_deg must be below 90.")
     for key in ("trusted_max_hdop", "trajectory_max_hdop"):
         if not np.isfinite(settings[key]) or settings[key] <= 0:
             raise ValueError(f"{key} must be positive.")
@@ -459,8 +503,10 @@ def camera_imu_extrinsics(dataset):
             return rotation, "device_calibration"
     except (TypeError, ValueError, IndexError):
         pass
-    angles = orientation_settings(dataset)["imu_to_camera_rpy_deg"]
-    return rpy_matrix_deg(*angles), "config_default"
+    settings = orientation_settings(dataset)
+    if settings["imu_to_camera_validated"]:
+        return rpy_matrix_deg(*settings["imu_to_camera_rpy_deg"]), "config_validated"
+    return None, "unavailable"
 
 
 def _imu_vector(row, prefix, suffix):
@@ -483,6 +529,11 @@ def _initial_gyro_bias(accels, gyros, settings):
     w = np.array([v for t, v in gyros if start <= t <= end])
     if len(a) < 2 or len(w) < 2:
         return zero
+    max_gap = settings["imu_max_gap_ms"] * 1e6
+    for samples in (accels, gyros):
+        times = [t for t, _ in samples if start <= t <= end]
+        if times[0] - start > max_gap or end - times[-1] > max_gap or max(np.diff(times)) > max_gap:
+            return zero
     tolerance = settings["imu_bias_accel_tolerance_m_s2"]
     if (
         np.max(np.abs(np.linalg.norm(a, axis=1) - 9.80665)) > tolerance
@@ -505,7 +556,7 @@ def _rotate_gravity(gravity, omega, dt):
 def _build_camera_imu_series(dataset, settings):
     path = dataset.root / "imu_events.csv"
     if not path.exists():
-        return [], [], "unavailable"
+        return [], [], "unavailable", []
     accels, gyros, vectors = {}, {}, {}
     with path.open(newline="", encoding="utf-8-sig") as file:
         for row in csv.DictReader(file):
@@ -526,50 +577,99 @@ def _build_camera_imu_series(dataset, settings):
                     vectors[timestamp] = -rotation[2, :]
     if vectors:
         times = sorted(vectors)
-        return times, np.array([vectors[t] for t in times]), "game_rotation_vector"
-    accels, gyros = sorted(accels.items()), sorted(gyros.items())
+        # Rotation vectors are complete device-filter estimates, not integrations
+        # of our held gyro rate. Their timestamp is their freshness support.
+        support = [(True, t, t, 0) for t in times]
+        return times, np.array([vectors[t] for t in times]), "game_rotation_vector", support
     if not accels or not gyros:
-        return [], [], "unavailable"
-    bias = _initial_gyro_bias(accels, gyros, settings)
-    # Merge independently timestamped sensors; repeated packet reports are deduplicated.
-    events = sorted([(t, 0, v) for t, v in gyros] + [(t, 1, v) for t, v in accels], key=lambda e: e[:2])
-    gravity, omega, previous_time, last_accel_time = None, None, None, None
-    times, directions = [], []
-    for timestamp, kind, value in events:
-        if gravity is not None and omega is not None and previous_time is not None:
-            gravity = _rotate_gravity(gravity, omega, (timestamp - previous_time) / 1e9)
-        previous_time = timestamp
-        if kind == 0:
-            omega = value - bias
-        else:
+        return [], [], "unavailable", []
+    bias = _initial_gyro_bias(sorted(accels.items()), sorted(gyros.items()), settings)
+    # Combine simultaneous reports before evaluating validity. Each estimate
+    # retains both actual sensor timestamps and the filter's outage generation.
+    max_gap = settings["imu_max_gap_ms"] * 1e6
+    gravity, gyro_gravity, omega, previous_time = None, None, None, None
+    last_accel_time, last_gyro_time, still_since = None, None, None
+    still_down = None
+    converged, correction_ok, generation = False, False, 0
+    times, directions, support = [], [], []
+    for timestamp in sorted(set(accels) | set(gyros)):
+        outage = previous_time is not None and (
+            timestamp - previous_time > max_gap
+            or (last_accel_time is not None and timestamp - last_accel_time > max_gap)
+            or (last_gyro_time is not None and timestamp - last_gyro_time > max_gap)
+        )
+        if outage:
+            gravity, gyro_gravity, still_since, still_down = None, None, None, None
+            converged, correction_ok = False, False
+            generation += 1
+        elif gravity is not None and omega is not None and previous_time is not None:
+            dt = (timestamp - previous_time) / 1e9
+            gravity = _rotate_gravity(gravity, omega, dt)
+            gyro_gravity = _rotate_gravity(gyro_gravity, omega, dt)
+            if still_down is not None:
+                still_down = _rotate_gravity(still_down, omega, dt)
+
+        if timestamp in gyros:
+            omega = gyros[timestamp] - bias
+            last_gyro_time = timestamp
+        if timestamp in accels:
+            value = accels[timestamp]
             magnitude = float(np.linalg.norm(value))
             error = abs(magnitude - 9.80665)
             weight = max(0.0, 1.0 - error / settings["imu_accel_rejection_m_s2"])
+            fresh_gyro = last_gyro_time is not None and timestamp - last_gyro_time <= max_gap
+            still = (fresh_gyro and error <= settings["imu_still_accel_tolerance_m_s2"]
+                     and np.linalg.norm(omega) <= settings["imu_bias_gyro_threshold_rad_s"])
+            correction_ok = False
             if magnitude > 1e-9 and weight > 0:
                 # Accelerometers measure specific force, opposite physical down.
                 measured = -value / magnitude
-                if gravity is None:
+                if gravity is None or (not converged and still):
                     gravity = measured
-                elif last_accel_time is not None:
-                    dt = (timestamp - last_accel_time) / 1e9
+                    gyro_gravity = measured.copy()
+                # Keep a gyro-only prediction between still periods. Comparing
+                # only against the corrected state lets a slow acceleration
+                # ramp drag both the estimate and its own rejection reference.
+                innovation = float(np.rad2deg(np.arccos(np.clip(gyro_gravity @ measured, -1.0, 1.0))))
+                correction_ok = innovation <= settings["imu_accel_innovation_deg"]
+                if correction_ok and last_accel_time is not None:
+                    dt = min(timestamp - last_accel_time, max_gap) / 1e9
                     alpha = 1.0 - np.exp(-weight * dt / settings["imu_filter_time_constant_s"])
                     gravity = (1.0 - alpha) * gravity + alpha * measured
                     norm = np.linalg.norm(gravity)
                     gravity = gravity / norm if norm > 1e-9 else measured
-            last_accel_time = timestamp
-        if gravity is not None and omega is not None:
-            if times and times[-1] == timestamp:
-                directions[-1] = gravity.copy()
+            if still and magnitude > 1e-9:
+                measured = -value / magnitude
+                if (still_down is not None
+                        and np.linalg.norm(measured - still_down) * 9.80665
+                        > settings["imu_still_accel_tolerance_m_s2"]):
+                    still_since = None
+                if still_since is None:
+                    still_since = timestamp
+                    still_down = measured.copy()
+                if timestamp - still_since >= settings["imu_still_duration_s"] * 1e9:
+                    converged = True
+                    if not correction_ok:
+                        gravity = measured
+                        correction_ok = True
+                    gyro_gravity = gravity.copy()
             else:
-                times.append(timestamp)
-                directions.append(gravity.copy())
-    return times, np.array(directions), "complementary_filter" if times else "unavailable"
+                still_since, still_down = None, None
+            last_accel_time = timestamp
+        fresh = (last_accel_time is not None and last_gyro_time is not None
+                 and timestamp - last_accel_time <= max_gap and timestamp - last_gyro_time <= max_gap)
+        valid = gravity is not None and fresh and converged and correction_ok
+        times.append(timestamp)
+        directions.append(gravity.copy() if gravity is not None else np.zeros(3))
+        support.append((valid, last_accel_time, last_gyro_time, generation))
+        previous_time = timestamp
+    return times, np.array(directions), "complementary_filter", support
 
 
 def _camera_imu_series(dataset, settings):
     # Only filter settings affect the continuous stream; mount and extrinsics do not.
     key = tuple(settings[name] for name in IMU_SETTINGS
-                if name not in ("imu_to_camera_rpy_deg", "imu_max_delta_ms"))
+                if name not in ("imu_to_camera_rpy_deg", "imu_to_camera_validated", "imu_max_delta_ms"))
     with dataset._camera_imu_lock:
         if key not in dataset._camera_imu_cache:
             dataset._camera_imu_cache[key] = _build_camera_imu_series(dataset, settings)
@@ -577,6 +677,7 @@ def _camera_imu_series(dataset, settings):
 
 
 def summarize_camera_imu(dataset, frame):
+    """Native RDF camera tilt; yaw is intentionally absent. Preserve UI keys."""
     settings = orientation_settings(dataset)
     validate_imu_settings(settings)
     rotation, extrinsics_source = camera_imu_extrinsics(dataset)
@@ -585,29 +686,55 @@ def summarize_camera_imu(dataset, frame):
         "roll_deg": None, "pitch_deg": None, "sample_delta_ms": None,
         "tilt_method": "unavailable", "extrinsics_source": extrinsics_source, "trusted": False,
     }
-    timestamp = safe_int(frame["row"].get("rgb_device_ts_ns"), None)
-    times, directions, method = _camera_imu_series(dataset, settings)
+    row = frame["row"]
+    if (rotation is None or str(summary["imu_type"]).upper() == "NONE"
+            or ("imu_message_device_ts_ns" in row
+                and safe_int(row.get("imu_message_device_ts_ns"), None) is None)
+            or ("imu_packets" in row and safe_int(row.get("imu_packets"), 0) <= 0)):
+        return summary
+    timestamp = safe_int(row.get("rgb_device_ts_ns"), None)
+    times, directions, method, support = _camera_imu_series(dataset, settings)
     if timestamp is None or not times:
         return summary
     pos = bisect.bisect_left(times, timestamp)
     nearest = min(range(max(0, pos - 1), min(len(times), pos + 1)), key=lambda i: abs(times[i] - timestamp))
     delta_ms = (times[nearest] - timestamp) / 1e6
     gravity = directions[nearest]
-    if 0 < pos < len(times):
+    used = [nearest]
+    if 0 < pos < len(times) and times[pos] != timestamp:
+        used = [pos - 1, pos]
+        if (times[pos] - times[pos - 1] > settings["imu_max_gap_ms"] * 1e6
+                or support[pos - 1][3] != support[pos][3]):
+            return summary
         fraction = (timestamp - times[pos - 1]) / float(times[pos] - times[pos - 1])
         gravity = (1.0 - fraction) * directions[pos - 1] + fraction * directions[pos]
     norm = np.linalg.norm(gravity)
     if norm <= 1e-9:
         return summary
-    gravity = original_camera_vector_to_saved_frame(rotation @ (gravity / norm), dataset.metadata)
+    gravity = rotation @ (gravity / norm)
+    valid = all(support[i][0] for i in used)
+    # A fresh packet from one sensor must not hide the other sensor's age.
+    sensor_delta_ms = max(abs(timestamp - t) / 1e6 for i in used for t in support[i][1:3]
+                          if t is not None)
     # Camera axes: right/down/forward. Positive roll is clockwise, pitch is down.
     summary.update({
         "roll_deg": float(np.rad2deg(np.arctan2(gravity[0], gravity[1]))),
         "pitch_deg": float(np.rad2deg(np.arctan2(gravity[2], np.hypot(gravity[0], gravity[1])))),
         "sample_delta_ms": delta_ms, "tilt_method": method,
-        "trusted": bool(abs(delta_ms) <= settings["imu_max_delta_ms"]),
+        "trusted": bool(valid and sensor_delta_ms <= settings["imu_max_delta_ms"]),
     })
     return summary
+
+
+def _camera_pose_from_imu(course_deg, mount_rpy, camera_imu):
+    mount = camera_mount_matrix_deg(*mount_rpy)
+    roll, pitch = np.deg2rad([camera_imu["roll_deg"], camera_imu["pitch_deg"]])
+    camera_down = np.array([np.sin(roll) * np.cos(pitch), np.cos(roll) * np.cos(pitch), np.sin(pitch)])
+    vehicle_down = mount @ camera_down
+    vehicle_roll = np.rad2deg(np.arctan2(vehicle_down[0], vehicle_down[1]))
+    vehicle_pitch = np.rad2deg(np.arctan2(vehicle_down[2], np.hypot(vehicle_down[0], vehicle_down[1])))
+    return (orientation_matrix_from_gps_course(course_deg)
+            @ camera_mount_matrix_deg(vehicle_roll, vehicle_pitch, 0.0) @ mount)
 
 
 def enu_to_llh(lat_deg, lon_deg, alt_m, east_m, north_m, up_m):
@@ -711,8 +838,7 @@ def unproject_saved_pixel(dataset, x, y, depth_m):
                 float(normalized[0, 0, 1]),
                 1.0,
             ])
-            saved_vector = original_camera_vector_to_saved_frame(raw_vector, dataset.metadata)
-            return saved_vector * depth_m, "distortion_corrected"
+            return raw_vector * depth_m, "distortion_corrected"
         except Exception:
             pass
 
@@ -723,11 +849,15 @@ def unproject_saved_pixel(dataset, x, y, depth_m):
     fy = float(saved_intrinsics[1][1])
     cx = float(saved_intrinsics[0][2])
     cy = float(saved_intrinsics[1][2])
-    return np.array([
+    saved_vector = np.array([
         (x - cx) * depth_m / fx,
         (y - cy) * depth_m / fy,
         depth_m,
-    ], dtype=float), "pinhole_undistorted" if stream_is_undistorted else "pinhole"
+    ], dtype=float)
+    # Axis sign changes are self-inverse. Only pixel rays use this reflection;
+    # attitude and physical lever arms always stay in the native RDF frame.
+    native_vector = original_camera_vector_to_saved_frame(saved_vector, dataset.metadata)
+    return native_vector, "pinhole_undistorted" if stream_is_undistorted else "pinhole"
 
 
 def compute_world_coordinate(dataset, frame, x, y, depth_mm):
@@ -837,19 +967,18 @@ def compute_world_coordinate_for_source(dataset, frame, x, y, depth_mm, orientat
     if course["course_deg"] is None:
         return {"status": "unavailable", "trusted": False, "reason": "GPS course_deg missing"}
     camera_imu = summarize_camera_imu(dataset, frame)
-    tilt = np.eye(3)
     if orientation_source == "gps-course":
         if camera_imu["tilt_method"] == "unavailable":
             return {"status": "unavailable", "trusted": False,
                     "reason": "OAK IMU tilt unavailable", "camera_imu": camera_imu}
-        tilt = camera_mount_matrix_deg(camera_imu["roll_deg"], camera_imu["pitch_deg"], 0.0)
+        r_enu_from_camera = _camera_pose_from_imu(course["course_deg"], camera_mount_rpy, camera_imu)
         if not camera_imu["trusted"]:
-            assumptions.append("OAK IMU sample exceeds the trusted time limit")
+            assumptions.append("OAK IMU timing or filter validity is outside trusted limits")
         assumptions.append("GPS course supplies yaw; OAK IMU supplies pitch/roll")
     else:
-        assumptions.append("GPS course supplies yaw; camera is assumed level")
-    r_enu_from_camera = (orientation_matrix_from_gps_course(course["course_deg"], None)
-                         @ tilt @ camera_mount_matrix_deg(*camera_mount_rpy))
+        assumptions.append("GPS course supplies yaw; vehicle is assumed level")
+        r_enu_from_camera = (orientation_matrix_from_gps_course(course["course_deg"])
+                             @ camera_mount_matrix_deg(*camera_mount_rpy))
     course_trusted = (course["speed_m_s"] is not None and course["speed_m_s"] >= 2.0
                       and (course["hdop"] is None or course["hdop"] <= orientation_settings(dataset)["trajectory_max_hdop"]))
     trusted = bool(position_quality["trusted"] and course_trusted
@@ -1032,10 +1161,22 @@ def resolve_course_for_frame(dataset, frame):
 
 
 def save_dataset_metadata(dataset):
-    metadata_path = dataset.root / "metadata.json"
-    with metadata_path.open("w", encoding="utf-8") as file:
-        json.dump(dataset.metadata, file, ensure_ascii=False, indent=2)
-        file.write("\n")
+    """Persist processing overrides atomically; capture files are immutable."""
+    overrides = _metadata_overrides(dataset._capture_metadata, dataset.metadata)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=str(dataset.root),
+                                         prefix=".metadata.overrides-", suffix=".tmp", delete=False) as file:
+            temporary_path = Path(file.name)
+            json.dump(overrides, file, ensure_ascii=False, indent=2, allow_nan=False)
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(str(temporary_path), str(dataset.root / "metadata.overrides.json"))
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+    dataset.metadata = _merge_metadata(dataset._capture_metadata, overrides)
 
 
 def set_camera_mount_rpy(dataset, roll, pitch, yaw, save=False, calibration=None):
@@ -1043,7 +1184,7 @@ def set_camera_mount_rpy(dataset, roll, pitch, yaw, save=False, calibration=None
     rpy = [float(roll), float(pitch), float(yaw)]
     world_cfg["camera_mount_rpy_deg"] = rpy
     world_cfg["camera_mount_frame"] = (
-        "vehicle frame to saved camera frame convention; roll +clockwise, "
+        "native RDF camera to vehicle frame; roll +clockwise, "
         "pitch +down, yaw +right from vehicle forward"
     )
     if calibration is not None:
@@ -1102,15 +1243,15 @@ def solve_camera_mount_from_point(dataset, frame, x, y, depth_mm, actual_lat, ac
     if camera_imu["tilt_method"] == "unavailable":
         raise ValueError("OAK IMU tilt unavailable.")
     if not camera_imu["trusted"]:
-        raise ValueError("OAK IMU sample exceeds the trusted time limit.")
-    tilt = camera_mount_matrix_deg(camera_imu["roll_deg"], camera_imu["pitch_deg"], 0.0)
-    r_enu_from_vehicle = orientation_matrix_from_gps_course(course["course_deg"], None) @ tilt
+        raise ValueError("OAK IMU timing or filter validity is outside trusted limits.")
 
     roll = current_rpy[0]
 
     def predict(rpy):
-        r_vehicle_from_camera = camera_mount_matrix_deg(*rpy)
-        return gps_to_camera_enu + (r_enu_from_vehicle @ r_vehicle_from_camera @ camera_vector)
+        # Each candidate changes camera -> vehicle gravity, so vehicle tilt must
+        # be re-derived for every candidate exactly as it is during export.
+        rotation = _camera_pose_from_imu(course["course_deg"], rpy, camera_imu)
+        return gps_to_camera_enu + (rotation @ camera_vector)
 
     def error_for(pitch, yaw):
         pred = predict([roll, pitch, yaw]) - gps_to_camera_enu
