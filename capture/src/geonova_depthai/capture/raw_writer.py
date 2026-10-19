@@ -319,10 +319,23 @@ class RawEventDataset:
                 "threshold_ms": float(args.sync_threshold_ms),
                 "strategy": "RGB anchored nearest depth/IMU/GPS event",
             },
+            "exposure_settle": {
+                "seconds": float(getattr(args, "exposure_settle_s", 0.0) or 0.0),
+                "dropped_frames": None,
+            },
         }
 
     def write_metadata(self, metadata):
         atomic_json(self.root / "metadata.json", metadata)
+
+    def record_exposure_settle(self, seconds, dropped_frames):
+        """Record how many camera frames were dropped before saving began."""
+        with self.metadata_lock:
+            self.metadata["exposure_settle"] = {
+                "seconds": float(seconds),
+                "dropped_frames": dict(dropped_frames),
+            }
+            self.write_metadata(self.metadata)
 
     def update_camera_model_from_rgb_frame(self, msg):
         if self.camera_model_updated_from_rgb:

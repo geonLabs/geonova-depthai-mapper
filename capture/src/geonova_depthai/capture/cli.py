@@ -82,6 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--queue-size", type=int, default=d["queue_size"], help="Maximum pending writer tasks before capture backpressure")
     parser.add_argument("--writer-threads", type=int, default=d["writer_threads"], help="Background image encoder/writer workers")
     parser.add_argument("--max-runtime-s", type=nonnegative_float, default=d["max_runtime_s"], help="0 means record until Ctrl-C")
+    parser.add_argument("--exposure-settle-s", type=nonnegative_float, default=d["exposure_settle_s"], help="Seconds of camera frames dropped after the camera starts so saved frames begin with settled auto exposure; IMU and GNSS keep recording")
     parser.add_argument(
         "--monitor-only",
         action="store_true",

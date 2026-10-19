@@ -7,6 +7,7 @@ depth_fps: 15.0
 rgb_width: 1920
 rgb_height: 1200
 max_runtime_s: 0.0
+exposure_settle_s: 3.0         # 시작 직후 과다노출 프레임을 저장하지 않음(9월 녹화는 처음 29~39프레임이 절반 이상 흰색). IMU·GNSS는 계속 기록
 monitor_only: false
 
 controller_bridge_enabled: true

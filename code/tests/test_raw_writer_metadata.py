@@ -76,6 +76,7 @@ def test_raw_metadata_records_versions_and_stereo_config(tmp_path) -> None:
         "width": 1280,
         "height": 800,
     }
+    assert metadata["exposure_settle"] == {"seconds": 0.0, "dropped_frames": None}
 
 
 def test_raw_metadata_records_effective_stereo_tuning(tmp_path) -> None:

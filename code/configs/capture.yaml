@@ -6,6 +6,7 @@ depth_fps: 15                  # RGB와 같은 cadence로 요청해 인접 프�
 rgb_width: 1920                # OAK-D Pro W RGB 및 RGB 정렬 Depth 저장 폭
 rgb_height: 1200               # 저장 RGB와 aligned Depth가 동일한 픽셀 geometry 사용
 max_runtime_s: 0               # 최대 수집 시간(초). 0이면 Ctrl-C까지 계속 수집
+exposure_settle_s: 3.0         # 카메라 시작 후 이 시간 동안 영상 프레임을 저장하지 않음(자동노출 수렴). IMU·GNSS는 계속 기록
 monitor_only: false            # true면 데이터셋 없이 저대역폭 센서 상태/프리뷰만 계속 게시
 controller_bridge_enabled: true # 앱용 센서 상태 JSON과 카메라 프리뷰 생성
 controller_bridge_dir: /var/lib/jetson-sensors

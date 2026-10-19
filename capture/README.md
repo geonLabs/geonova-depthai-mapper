@@ -34,6 +34,7 @@ Controller가 전달한 `JETSON_PIPELINE_RESULTS_DIR`, `JETSON_PIPELINE_SENSOR_B
 - `stereo_speckle_filter`, `stereo_spatial_filter`: 장치에서 작은 오정합 제거와 가로 방향 구멍 메움. false면 프리셋 선택을 유지합니다. 켜면 장치 SHAVE를 쓰므로 30초 시험 녹화로 depth 15 FPS를 확인한 뒤 사용합니다. FPS가 떨어지면 `stereo_postprocessing_shaves`·`stereo_postprocessing_memory_slices`를 함께 3으로 둡니다.
 - `stereo_ae_max_exposure_us`: 두 스테레오 카메라의 자동노출 상한(µs). 기본 자동노출은 약 프레임 시간까지 길어져 주행 중 노면이 흐려질 수 있습니다.
 - `stereo_ae_region`: 노출을 잴 영역. 저장 영상 기준 `x0,y0,x1,y1`(0~1)이며 `flip`·`rotate_180`을 반영해 센서 좌표로 바꿉니다.
+- `exposure_settle_s`: 카메라를 시작한 뒤 이 시간 동안 RGB·Depth 프레임을 저장하지 않습니다. 새로 시작한 Pro W는 처음 2~3초가 과다노출이라 루트 설정은 3초입니다. 그동안에도 앱 미리보기, IMU, GNSS는 계속 기록되고, 버린 프레임 수는 `metadata.json`의 `exposure_settle`에 남습니다.
 
 실제로 적용된 값은 `metadata.json`의 `stereo_config`에 기록됩니다. 녹화 폴더의 깊이 밀도와 depth FPS는 다음으로 확인합니다. 폴더는 읽기만 합니다.
 

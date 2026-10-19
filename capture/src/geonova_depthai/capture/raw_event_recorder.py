@@ -40,6 +40,40 @@ def _drain_device_queue(q, handler, max_per_loop=256):
     return count
 
 
+def _drop_frames_until_exposure_settles(
+    settle_s, frame_queues, imu_q, write_imu, controller_bridge, serial_readers, dataset
+):
+    """Drop camera frames for the first seconds so saved frames start with settled exposure.
+
+    A freshly started OAK-D Pro W pipeline is heavily overexposed: in the
+    September 2026 runs the first 29-39 RGB frames were more than half white.
+    The preview, IMU and GNSS keep running and recording meanwhile.
+    """
+    dropped = {stream: 0 for stream in frame_queues}
+    if settle_s <= 0:
+        return dropped
+    print(f"Dropping camera frames for {settle_s:g} s while auto exposure settles.")
+
+    def drop(stream):
+        def handler(msg):
+            dropped[stream] += 1
+            if stream == "rgb":
+                controller_bridge.offer_rgb(msg)
+        return handler
+
+    deadline = time.monotonic() + settle_s
+    while not _stop_requested and time.monotonic() < deadline:
+        drained = sum(_drain_device_queue(q, drop(stream)) for stream, q in frame_queues.items())
+        drained += _drain_device_queue(imu_q, write_imu)
+        for name, reader in serial_readers.items():
+            dataset.write_serial_samples(name, reader.drain())
+        controller_bridge.publish(serial_readers)
+        if drained == 0:
+            time.sleep(0.002)
+    print("Auto-exposure settle dropped " + ", ".join(f"{k}={v}" for k, v in dropped.items()))
+    return dropped
+
+
 def _close_recording_resources(
     controller_bridge,
     serial_readers,
@@ -270,6 +304,22 @@ def record_raw_events(args):
 
             pipeline.start()
 
+            def write_imu(msg):
+                controller_bridge.observe_imu(msg)
+                dataset.write_imu_message(
+                    msg,
+                    mapper.stamp(runtime.get_device_ts_ns(msg)),
+                )
+
+            frame_queues = {"rgb": rgb_q, "depth": depth_q}
+            if confidence_q is not None:
+                frame_queues["confidence"] = confidence_q
+            settle_s = float(getattr(args, "exposure_settle_s", 0.0) or 0.0)
+            dropped = _drop_frames_until_exposure_settles(
+                settle_s, frame_queues, imu_q, write_imu, controller_bridge, serial_readers, dataset
+            )
+            dataset.record_exposure_settle(settle_s, dropped)
+
             started = time.monotonic()
             last_status = started
             print(f"Recording raw event dataset to: {dataset.root}")
@@ -291,13 +341,6 @@ def record_raw_events(args):
                 drained = 0
                 drained += _drain_device_queue(rgb_q, lambda msg: submit_image("rgb", msg))
                 drained += _drain_device_queue(depth_q, lambda msg: submit_image("depth", msg))
-                def write_imu(msg):
-                    controller_bridge.observe_imu(msg)
-                    dataset.write_imu_message(
-                        msg,
-                        mapper.stamp(runtime.get_device_ts_ns(msg)),
-                    )
-
                 drained += _drain_device_queue(imu_q, write_imu)
                 if confidence_q is not None:
                     drained += _drain_device_queue(confidence_q, lambda msg: submit_image("confidence", msg))

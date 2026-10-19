@@ -24,6 +24,7 @@ DEFAULTS = {
     "queue_size": 16,
     "writer_threads": 4,
     "max_runtime_s": 0.0,
+    "exposure_settle_s": 0.0,
     "monitor_only": False,
     "controller_bridge_enabled": True,
     "controller_bridge_dir": "/var/lib/jetson-sensors",

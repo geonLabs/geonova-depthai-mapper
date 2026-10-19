@@ -366,3 +366,92 @@ def test_capture_without_imu_queue_still_closes_dataset(tmp_path, monkeypatch):
     root = next(tmp_path.glob("*_raw"))
     assert json.loads((root / "metadata.json").read_text())["imu"]["type"] == "NONE"
     assert json.loads((root / "capture_manifest.json").read_text())["state"] == "complete"
+
+
+def test_frames_before_exposure_settles_are_not_saved(tmp_path, monkeypatch):
+    import json
+
+    class Queue:
+        def __init__(self, count):
+            self.left = count
+
+        def tryGet(self):
+            if not self.left:
+                return None
+            self.left -= 1
+            return object()
+
+    queues = {"rgb": Queue(3), "depth": Queue(2)}
+
+    class Output:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def createOutputQueue(self, **kwargs):
+            return queues[self.stream]
+
+    class Pipeline:
+        def __init__(self, device):
+            self.device = device
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            pass
+
+        def getDefaultDevice(self):
+            return self.device
+
+        def start(self):
+            pass
+
+    submitted = []
+
+    class ImagePool:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def submit(self, job):
+            submitted.append(job["stream"])
+
+        def close(self):
+            pass
+
+    def configure(pipeline, args):
+        args.imu_enabled, args.imu_error, args.imu_type, args.imu_sensors = False, "No OAK IMU", "NONE", []
+        args.imu_metadata = raw_event_recorder.runtime.read_imu_metadata(None, args)
+        return {"rgb": Output("rgb"), "depth": Output("depth"), "imu": None}
+
+    monkeypatch.setattr(raw_event_recorder.dai, "Pipeline", Pipeline)
+    monkeypatch.setattr(raw_event_recorder, "ImageWritePool", ImagePool)
+    monkeypatch.setattr(raw_event_recorder.runtime, "create_serial_readers", lambda args: {})
+    monkeypatch.setattr(raw_event_recorder.runtime, "connect_depthai_device", lambda args: FakeDevice([]))
+    monkeypatch.setattr(raw_event_recorder.runtime, "resolve_transport_options", lambda args, device: None)
+    monkeypatch.setattr(raw_event_recorder.runtime, "configure_pipeline", configure)
+    monkeypatch.setattr(raw_event_recorder.runtime, "read_camera_model_metadata", lambda *args: {})
+    monkeypatch.setattr(raw_event_recorder.runtime, "read_stereo_depth_metadata", lambda *args: {})
+    monkeypatch.setattr(raw_event_recorder, "_stop_requested", False)
+    args = parse_args([
+        "--no-gps", "--no-controller-bridge", "--output-dir", str(tmp_path),
+        "--max-runtime-s", "0.001", "--exposure-settle-s", "0.05",
+    ])
+
+    raw_event_recorder.record_raw_events(args)
+
+    assert submitted == []
+    root = next(tmp_path.glob("*_raw"))
+    assert json.loads((root / "metadata.json").read_text())["exposure_settle"] == {
+        "seconds": 0.05,
+        "dropped_frames": {"rgb": 3, "depth": 2},
+    }
+
+
+def test_exposure_settle_off_by_default_drops_nothing():
+    events = []
+    dropped = raw_event_recorder._drop_frames_until_exposure_settles(
+        0.0, {"rgb": object()}, None, None, None, {}, FakeDataset(events)
+    )
+
+    assert dropped == {"rgb": 0}
+    assert events == []

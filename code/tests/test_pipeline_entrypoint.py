@@ -97,6 +97,7 @@ def test_root_config_is_a_valid_capture_config() -> None:
     assert args.stereo_spatial_filter is False
     assert args.stereo_ae_max_exposure_us == 0
     assert args.stereo_ae_region == ""
+    assert args.exposure_settle_s == 3.0
 
 
 def test_removed_imu_config_and_environment_keys_are_ignored_once(tmp_path) -> None:
