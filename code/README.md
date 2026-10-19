@@ -474,6 +474,8 @@ SHP는 DBF 필드명/타입 제한이 있으므로 상세 원인은 CSV를 기�
 python -m geonova_depthai.debug_ui --config configs/debug_ui.yaml
 ```
 
+네트워크에서 의도적으로 접근하려면 `configs/debug_ui.yaml`에 `host: 0.0.0.0`을 설정하거나 `--host 0.0.0.0`을 전달합니다. 이때 UI가 네트워크에서 접근 가능하므로 신뢰할 수 있는 네트워크에서만 사용하세요. 기본값은 `127.0.0.1`입니다.
+
 브라우저에서 `http://127.0.0.1:8088`을 열어 RGB, Depth, GPS/IMU 동기화,
 YOLO 관측점과 세계좌표 품질을 확인합니다. 기본 bind는 `127.0.0.1`입니다.
 `--host 0.0.0.0`을 지정하면 네트워크에서 접근 가능하다는 경고를 출력합니다.

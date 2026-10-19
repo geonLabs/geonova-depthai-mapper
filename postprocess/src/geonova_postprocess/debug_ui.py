@@ -464,7 +464,7 @@ INDEX_HTML = r"""<!doctype html>
           </div>
           <div class="buttonRow">
             <button id="applyMountBtn" title="Apply mount values for this UI session">Apply</button>
-            <button id="saveMountBtn" title="Save mount values to metadata.json">Save</button>
+            <button id="saveMountBtn" title="Save mount values to dataset processing overrides">Save</button>
           </div>
           <div class="calibGrid" style="margin-top:10px;">
             <div class="calibField">
@@ -481,7 +481,7 @@ INDEX_HTML = r"""<!doctype html>
             </div>
           </div>
           <div class="buttonRow">
-            <button id="solveMountBtn" title="Use clicked point and actual coordinate to solve yaw/pitch">Calibrate & Save</button>
+            <button id="solveMountBtn" title="Solve yaw/pitch and save to dataset processing overrides">Calibrate & Save</button>
           </div>
           <div id="calibrationInfo" class="mono muted" style="margin-top:8px;">Click a point, enter its actual coordinate, then calibrate.</div>
         </div>
@@ -904,7 +904,7 @@ INDEX_HTML = r"""<!doctype html>
         renderFrame(state.frame);
       }
       el("calibrationInfo").textContent =
-        `${save ? "Saved" : "Applied"} camera_mount_rpy_deg: ` +
+        `${save ? "Saved to processing overrides" : "Applied"} camera_mount_rpy_deg: ` +
         data.camera_mount_rpy_deg.map(value => formatNumber(value, 3)).join(", ");
       await refreshActivePoints();
     }
@@ -940,7 +940,7 @@ INDEX_HTML = r"""<!doctype html>
         renderFrame(state.frame);
       }
       el("calibrationInfo").textContent =
-        `Saved r/p/y: ${proposed.map(value => formatNumber(value, 3)).join(", ")} deg\n` +
+        `Saved to processing overrides, r/p/y: ${proposed.map(value => formatNumber(value, 3)).join(", ")} deg\n` +
         `error: ${formatNumber(data.solution.error_before_m, 3)} m -> ${formatNumber(data.solution.error_after_m, 3)} m\n` +
         `course: ${formatNumber(data.solution.course.course_deg, 2)} deg (${data.solution.course.source})`;
       await refreshActivePoints();
@@ -1112,7 +1112,8 @@ def _resolve_dataset_file(dataset, path):
 def _validate_dataset_control_files(root):
     resolved_root = Path(root).resolve()
     for relative in (
-        "timestamps.csv", "imu.csv", "gps.csv", "metadata.json",
+        "timestamps.csv", "imu.csv", "imu_events.csv", "gps.csv", "metadata.json",
+        "metadata.sync.json", "metadata.overrides.json",
         "yolo_seg/detections.jsonl",
     ):
         candidate = resolved_root / relative

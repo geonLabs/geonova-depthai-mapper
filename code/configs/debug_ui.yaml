@@ -1,4 +1,4 @@
-# Local debug UI. Use --host 0.0.0.0 only when network access is intended.
+# Local debug UI. Set host to 0.0.0.0 only for access on a trusted network.
 host: 127.0.0.1
 port: 8088
 dataset_root: ../data

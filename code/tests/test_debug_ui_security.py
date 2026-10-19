@@ -75,6 +75,8 @@ def test_mutation_requires_post_json_and_read_only_get_works(tmp_path: Path) -> 
     root = tmp_path / "datasets"
     root.mkdir()
     dataset = _make_dataset(root / "run")
+    original_metadata = b'{"world_coordinates":{"camera_mount_rpy_deg":[0,0,0]}}\n'
+    (dataset / "metadata.json").write_bytes(original_metadata)
 
     with _running_server(root) as base:
         status, _ = _status(_url(base, "/"))
@@ -121,7 +123,9 @@ def test_mutation_requires_post_json_and_read_only_get_works(tmp_path: Path) -> 
         assert result["status"] == "ok"
         assert result["saved"] is True
         assert result["camera_mount_rpy_deg"] == [1.5, -2.0, 3.25]
-        assert (dataset / "metadata.json").is_file()
+        assert result["metadata"]["world_coordinates"]["camera_mount_rpy_deg"] == [1.5, -2.0, 3.25]
+        assert (dataset / "metadata.json").read_bytes() == original_metadata
+        assert (dataset / "metadata.overrides.json").is_file()
 
 
 def test_dataset_traversal_and_outside_absolute_path_are_rejected(tmp_path: Path) -> None:
@@ -172,3 +176,24 @@ def test_media_frame_path_cannot_escape_dataset_root(tmp_path: Path) -> None:
         ))
         assert status == 403
         assert str(tmp_path.resolve()).encode("utf-8") not in body
+
+
+@pytest.mark.parametrize(
+    "control_file",
+    ("imu_events.csv", "metadata.sync.json", "metadata.overrides.json"),
+)
+def test_control_file_symlink_cannot_escape_dataset_root(tmp_path: Path, control_file: str) -> None:
+    root = tmp_path / "datasets"
+    root.mkdir()
+    dataset = _make_dataset(root / "run")
+    external_file = tmp_path / "external-control-file"
+    external_file.write_text("outside dataset", encoding="utf-8")
+    try:
+        (dataset / control_file).symlink_to(external_file)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip("File symlinks are unavailable: {}".format(error))
+
+    with _running_server(root) as base:
+        status, body = _status(_url(base, "/api/dataset", {"path": str(dataset)}))
+        assert status == 403
+        assert str(external_file.resolve()).encode("utf-8") not in body
