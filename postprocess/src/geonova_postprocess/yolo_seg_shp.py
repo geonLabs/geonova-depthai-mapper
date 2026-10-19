@@ -29,18 +29,20 @@ from .dataset import (
     get_depth_frame,
     IMU_SETTINGS,
     ORIENTATION_DEFAULTS,
+    orientation_settings,
     validate_imu_settings,
 )
 from .fence_linearization import (
     LinearizationConfig, linearize_fence_points, add_linearization_arguments,
     linearization_config_from_args, validate_linearization_config,
 )
-from geonova_common.config_cli import parse_args_with_yaml
+from geonova_common.config_cli import load_yaml, parse_args_with_yaml
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "configs" / "yolo.yaml"
 YOLO_DEFAULTS = ORIENTATION_DEFAULTS
+ORIENTATION_KEYS = ("orientation_source",) + IMU_SETTINGS + ("trusted_max_hdop", "trajectory_max_hdop")
 
 
 def default_model_path(repository_root: Path = REPOSITORY_ROOT) -> Path:
@@ -418,7 +420,7 @@ def run_dataset(
     fragment_min_samples: int = YOLO_DEFAULTS["fragment_min_samples"],
     fragment_erosion_px: int = YOLO_DEFAULTS["fragment_erosion_px"],
     depth_confidence_max: int = YOLO_DEFAULTS["depth_confidence_max"],
-    orientation_source: str = YOLO_DEFAULTS["orientation_source"],
+    orientation_source: str | None = None,
     linearize: bool = not YOLO_DEFAULTS["no_linearize"],
     linearization_depth_sample_min: int | None = None,
     max_gap_connect_m: float | None = None,
@@ -459,7 +461,7 @@ def run_dataset(
         raise ValueError("depth_confidence_max must be between 0 and 255.")
     if classes is not None and any(not isinstance(value, int) or value < 0 for value in classes):
         raise ValueError("classes must contain nonnegative integers.")
-    if orientation_source not in ("gps-course", "gps-course-level"):
+    if orientation_source is not None and orientation_source not in ("gps-course", "gps-course-level"):
         raise ValueError(f"Unknown orientation_source: {orientation_source!r}.")
     settings = {key: YOLO_DEFAULTS[key] for key in IMU_SETTINGS + ("trusted_max_hdop", "trajectory_max_hdop")}
     settings.update(orientation_config or {})
@@ -478,8 +480,12 @@ def run_dataset(
     print("[YOLO] Loading dataset and model...", flush=True)
     dataset = Dataset(dataset_root)
     dataset.orientation_config = dict(orientation_config or {})
-    validate_imu_settings({**settings, **(dataset.metadata.get("world_coordinates") or {}),
-                           **dataset.orientation_config})
+    settings = orientation_settings(dataset)
+    validate_imu_settings(settings)
+    if orientation_source is None:
+        orientation_source = settings["orientation_source"]
+    if orientation_source not in ("gps-course", "gps-course-level"):
+        raise ValueError(f"Unknown orientation_source: {orientation_source!r}.")
     dataset._index_gps()
     if start_frame >= dataset.frame_count:
         raise ValueError(f"start_frame {start_frame} exceeds {dataset.frame_count} frames.")
@@ -786,6 +792,9 @@ def run_dataset(
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run YOLO-seg after frame 200 and export mapping observations and Shapefiles.",
+        epilog=("Orientation precedence (later wins): packaged YAML defaults, dataset metadata.json "
+                "merged with metadata.overrides.json, explicit --config values, explicit CLI flags. "
+                "Omitted orientation options preserve dataset settings."),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--dataset", type=Path, required=True, help="Synchronized dataset directory containing timestamps.csv and images")
@@ -832,7 +841,20 @@ def parse_args(argv=None) -> argparse.Namespace:
             value = action.type(value)
         parser.set_defaults(**{key: value})
         action.required = False
-    return parse_args_with_yaml(parser, argv)
+    args = parse_args_with_yaml(parser, argv)
+    # Keep public/default-config values equal to the packaged YAML while using
+    # SUPPRESS in a separate parse to identify intentional command-line values,
+    # including an explicit value equal to the default (false or identity).
+    explicit_parser = argparse.ArgumentParser(add_help=False)
+    for key in ORIENTATION_KEYS:
+        action = actions[key]
+        explicit_parser.add_argument(*action.option_strings, dest=key, type=action.type,
+                                     nargs=action.nargs, choices=action.choices, default=argparse.SUPPRESS)
+    explicit, _ = explicit_parser.parse_known_args(sys.argv[1:] if argv is None else argv)
+    configured = load_yaml(args.config) if args.config is not None else {}
+    args.orientation_overrides = {key: getattr(args, key) for key in ORIENTATION_KEYS
+                                  if key in vars(explicit) or key in configured}
+    return args
 
 
 def main(argv=None) -> None:
@@ -854,10 +876,11 @@ def main(argv=None) -> None:
         fragment_min_samples=args.fragment_min_samples,
         fragment_erosion_px=args.fragment_erosion_px,
         depth_confidence_max=args.depth_confidence_max,
-        orientation_source=args.orientation_source,
+        orientation_source=args.orientation_overrides.get("orientation_source"),
         linearize=not args.no_linearize,
         linearization_config=linearization_config_from_args(args, for_yolo=True),
-        orientation_config={key: getattr(args, key) for key in IMU_SETTINGS + ("trusted_max_hdop", "trajectory_max_hdop")},
+        orientation_config={key: value for key, value in args.orientation_overrides.items()
+                            if key != "orientation_source"},
     )
 
 

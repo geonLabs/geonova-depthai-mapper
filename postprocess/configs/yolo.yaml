@@ -15,6 +15,7 @@ max_depth_mm: 8000                     # 지도 관측점으로 사용할 최대
 fragment_min_samples: 20              # 마스크 안의 최소 유효 Depth 픽셀 수
 fragment_erosion_px: 2                # 배경 혼입을 줄이는 마스크 경계 erosion 반경(px)
 depth_confidence_max: 200             # DepthAI confidence 허용 상한. 낮을수록 신뢰도 높음
+# Orientation: packaged defaults < merged dataset metadata < explicit --config values < CLI flags.
 orientation_source: gps-course        # GPS yaw and OAK IMU tilt
 trusted_max_hdop: 2.0
 trajectory_max_hdop: 2.5
@@ -22,7 +23,7 @@ imu_max_delta_ms: 20.0
 imu_to_camera_rpy_deg: [0.0, 0.0, 0.0] # Native RDF camera fallback rotation
 imu_to_camera_validated: false        # Enable fallback only after physical validation; CLI 0/1
 imu_max_gap_ms: 100.0                 # Reset filter after either sensor has an outage
-imu_accel_innovation_deg: 7.0         # Reject acceleration inconsistent with gyro-predicted gravity
+imu_accel_innovation_deg: 7.0         # Cumulative bound against gyro-only gravity after initial still period
 imu_still_duration_s: 0.5             # Required still period before raw tilt becomes trusted
 imu_still_accel_tolerance_m_s2: 0.08   # Startup |a|-g tolerance, separate from correction rejection
 imu_filter_time_constant_s: 1.0

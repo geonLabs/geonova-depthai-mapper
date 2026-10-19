@@ -428,6 +428,49 @@ class CameraImuTests(unittest.TestCase):
             self.assertFalse(result["trusted"])
             self.assertLess(abs(result["pitch_deg"]), 7.0)
 
+    def test_twenty_second_acceleration_ramp_exceeds_cumulative_bound(self):
+        for acceleration, bound in ((2.0, 7.0), (-2.0, 7.0), (2.0, 3.0)):
+            with self.subTest(acceleration=acceleration, bound=bound):
+                # Two quiet seconds, then 0 -> 2 m/s^2 over twenty seconds.
+                events = [raw_row(1_000_000_000 + j * 10_000_000, [0, 1, 0]) for j in range(2701)]
+                for j, row in enumerate(events):
+                    row["accel_z_m_s2"] = acceleration * min(1.0, max(0.0, (j - 200) / 2000.0))
+                dataset = make_dataset(self.root, events, 23_000_000_000)
+                dataset.orientation_config["imu_accel_innovation_deg"] = bound
+                for timestamp in (23_000_000_000, 28_000_000_000):
+                    dataset.timestamps[0]["rgb_device_ts_ns"] = timestamp
+                    result = self.summary(dataset)
+                    self.assertFalse(result["trusted"])
+                    self.assertLess(abs(result["pitch_deg"]), bound)
+
+    def test_constant_velocity_recovers_trust_without_stopping(self):
+        events = [raw_row(1_000_000_000 + j * 10_000_000, [0, 1, 0]) for j in range(1701)]
+        for row in events[201:701]:
+            row["accel_z_m_s2"] = 2.0
+        dataset = make_dataset(self.root, events, 7_000_000_000)
+        self.assertFalse(self.summary(dataset)["trusted"])
+        dataset.timestamps[0]["rgb_device_ts_ns"] = 18_000_000_000
+        result = self.summary(dataset)
+        self.assertTrue(result["trusted"])
+        self.assertAlmostEqual(result["pitch_deg"], 0, places=8)
+        self.assertGreater(geometry.resolve_course_for_frame(dataset, dataset.frame(0))["speed_m_s"], 2.0)
+
+    def test_slow_road_grade_with_matching_gyro_is_followed(self):
+        for final_pitch in (-12.0, 12.0):
+            events = []
+            for j in range(2301):
+                fraction = min(1.0, max(0.0, (j - 201) / 2000.0))
+                rate = -math.radians(final_pitch / 20.0) if 201 <= j < 2201 else 0.0
+                events.append(raw_row(1_000_000_000 + j * 10_000_000,
+                                      down_vector(0, final_pitch * fraction), (rate, 0, 0)))
+            dataset = make_dataset(self.root, events)
+            for j in (1201, 2201, 2300):
+                dataset.timestamps[0]["rgb_device_ts_ns"] = 1_000_000_000 + j * 10_000_000
+                result = self.summary(dataset)
+                self.assertTrue(result["trusted"])
+                expected = final_pitch * min(1.0, (j - 201) / 2000.0)
+                self.assertAlmostEqual(result["pitch_deg"], expected, places=6)
+
     def test_outage_reinitializes_instead_of_integrating_held_gyro(self):
         events = [raw_row(1_000_000_000 + j * 10_000_000, [0, 1, 0]) for j in range(101)]
         events.append(raw_row(2_010_000_000, [0, 1, 0], (0.2, 0, 0)))
@@ -488,6 +531,51 @@ class CameraImuTests(unittest.TestCase):
         after = geometry.compute_world_coordinate(dataset, frame, 360, 265, 10000)
         np.testing.assert_allclose(list(solution["predicted_after_enu_m"].values()), list(after["enu_offset_m"].values()), atol=1e-12)
         self.assertLess(solution["error_after_m"], 0.002)
+        self.assertEqual(solution["proposed_rpy_deg"][:2], [3, 5])
+
+    def test_single_point_mount_solver_preserves_pitch_on_a_banked_grade(self):
+        mount = [3, 9.2, 17.3]
+        pose = reference_vehicle(35, 12, -7) @ reference_mount(mount)
+        point = np.array([0.8, 0.5, 10.0])
+        lever = np.array([0.2, -0.1, 0.4])
+        target = geometry.enu_to_llh(37, 127, 100, *(pose @ (point + lever)))
+        for pitch in (5.0, 9.2):
+            events = [raw_row(1_000_000_000 + j * 10_000_000, pose.T @ [0, 0, -1]) for j in range(101)]
+            dataset = make_dataset(self.root / str(pitch), events, 2_000_000_000,
+                                   metadata={"world_coordinates": {"camera_mount_rpy_deg": [3, pitch, 8],
+                                                                   "gps_to_camera_camera_m": lever.tolist()}})
+            solution = geometry.solve_camera_mount_from_point(dataset, dataset.frame(0), 360, 265, 10000, *target.values())
+            self.assertEqual(solution["proposed_rpy_deg"][:2], [3, pitch])
+            self.assertEqual(solution["solved_axes"], ["yaw"])
+            self.assertEqual(solution["fixed_axes"], ["roll", "pitch"])
+            self.assertIn("yaw only", solution["note"])
+            self.assertLess(solution["error_after_m"], 1e-5)
+            if pitch == mount[1]:
+                self.assertAlmostEqual(solution["proposed_rpy_deg"][2], mount[2], places=4)
+                level_pose = reference_vehicle(35, 0, 0) @ reference_mount(mount)
+                level_events = [raw_row(1_000_000_000 + j * 10_000_000, level_pose.T @ [0, 0, -1]) for j in range(101)]
+                level = make_dataset(self.root / "level", level_events, 2_000_000_000,
+                                     metadata={"world_coordinates": {"camera_mount_rpy_deg": solution["proposed_rpy_deg"],
+                                                                     "gps_to_camera_camera_m": lever.tolist()}})
+                actual = geometry.compute_world_coordinate(level, level.frame(0), 360, 265, 10000)
+                np.testing.assert_allclose(list(actual["enu_offset_m"].values()), level_pose @ (point + lever), atol=1e-5)
+
+    def test_incomplete_sync_refuses_fresh_and_cached_loads(self):
+        make_dataset(self.root, [])
+        marker = self.root / "sync.incomplete"
+        with patch.dict(geometry.DATASET_CACHE, {}, clear=True):
+            geometry.get_dataset(str(self.root))
+            marker.touch()
+            for load in (lambda: geometry.Dataset(self.root), lambda: geometry.get_dataset(str(self.root))):
+                with self.assertRaisesRegex(ValueError, r"sync.incomplete.*re-run sync"):
+                    load()
+            marker.unlink()
+            self.assertEqual(geometry.Dataset(self.root).frame_count, 1)
+
+    def test_incomplete_sync_error_precedes_missing_outputs(self):
+        (self.root / "sync.incomplete").touch()
+        with self.assertRaisesRegex(ValueError, r"sync.incomplete.*re-run sync"):
+            geometry.Dataset(self.root)
 
     def test_mount_overrides_merge_and_preserve_capture_bytes(self):
         dataset = make_dataset(self.root, [], metadata={"format_version": "raw_events_v1", "world_coordinates": {
@@ -511,6 +599,16 @@ class CameraImuTests(unittest.TestCase):
         self.assertEqual(geometry.Dataset(self.root).metadata["display"]["units"], "cm")
         self.assertEqual((self.root / "metadata.json").read_bytes(), original)
         self.assertFalse(list(self.root.glob(".metadata.overrides-*.tmp")))
+
+    def test_single_point_calibration_saved_details_describe_yaw_only(self):
+        dataset = make_dataset(self.root, [])
+        geometry.set_camera_mount_rpy(dataset, 3, 5, 17, save=True, calibration={
+            "source": "single_clicked_point", "note": "Legacy yaw/pitch note", "error_after_m": 0.01})
+        details = geometry.Dataset(self.root).metadata["world_coordinates"]["camera_mount_calibration"]
+        self.assertEqual(details["solved_axes"], ["yaw"])
+        self.assertEqual(details["fixed_axes"], ["roll", "pitch"])
+        self.assertIn("yaw only", details["note"])
+        self.assertEqual(details["error_after_m"], 0.01)
 
     def test_sidecar_replace_failure_preserves_previous_file(self):
         dataset = make_dataset(self.root, [])

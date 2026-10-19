@@ -27,6 +27,7 @@ IMU_SETTINGS = (
     "imu_to_camera_validated", "imu_max_gap_ms", "imu_accel_innovation_deg",
     "imu_still_duration_s", "imu_still_accel_tolerance_m_s2",
 )
+SINGLE_POINT_MOUNT_NOTE = "Single-point calibration solves yaw only; current roll and pitch are unchanged."
 
 
 def orientation_settings(dataset):
@@ -135,9 +136,15 @@ def _metadata_overrides(base, current):
     return overrides
 
 
+def _require_complete_sync(root):
+    if (root / "sync.incomplete").exists():
+        raise ValueError("Dataset sync is incomplete (sync.incomplete); re-run sync.")
+
+
 class Dataset:
     def __init__(self, root):
         self.root = root
+        _require_complete_sync(root)
         timestamps_path = root / "timestamps.csv"
         imu_path = root / "imu.csv"
         metadata_path = root / "metadata.json"
@@ -182,6 +189,7 @@ class Dataset:
         self.yolo_by_frame = {}
         self.yolo_results_mtime_ns = None
         self.reload_yolo_results()
+        _require_complete_sync(root)
 
     def _index_gps(self):
         self.valid_course_rows = []
@@ -280,6 +288,7 @@ class Dataset:
 
 def get_dataset(path_text):
     root = resolve_path(path_text)
+    _require_complete_sync(root)
     key = str(root)
     with CACHE_LOCK:
         cached = DATASET_CACHE.get(key)
@@ -627,9 +636,10 @@ def _build_camera_imu_series(dataset, settings):
                 if gravity is None or (not converged and still):
                     gravity = measured
                     gyro_gravity = measured.copy()
-                # Keep a gyro-only prediction between still periods. Comparing
-                # only against the corrected state lets a slow acceleration
-                # ramp drag both the estimate and its own rejection reference.
+                # After initial convergence, this reference is gyro-only until
+                # an outage. Quiet accelerometer windows cannot re-anchor it:
+                # a slow acceleration ramp can look quiet in every window.
+                # Innovation therefore includes cumulative disagreement.
                 innovation = float(np.rad2deg(np.arccos(np.clip(gyro_gravity @ measured, -1.0, 1.0))))
                 correction_ok = innovation <= settings["imu_accel_innovation_deg"]
                 if correction_ok and last_accel_time is not None:
@@ -647,12 +657,11 @@ def _build_camera_imu_series(dataset, settings):
                 if still_since is None:
                     still_since = timestamp
                     still_down = measured.copy()
-                if timestamp - still_since >= settings["imu_still_duration_s"] * 1e9:
+                if not converged and timestamp - still_since >= settings["imu_still_duration_s"] * 1e9:
                     converged = True
-                    if not correction_ok:
-                        gravity = measured
-                        correction_ok = True
-                    gyro_gravity = gravity.copy()
+                    gravity = measured.copy()
+                    gyro_gravity = measured.copy()
+                    correction_ok = True
             else:
                 still_since, still_down = None, None
             last_accel_time = timestamp
@@ -1188,6 +1197,10 @@ def set_camera_mount_rpy(dataset, roll, pitch, yaw, save=False, calibration=None
         "pitch +down, yaw +right from vehicle forward"
     )
     if calibration is not None:
+        if calibration.get("source") == "single_clicked_point":
+            # Keep legacy debug_ui callers' persisted details accurate too.
+            calibration = dict(calibration, solved_axes=["yaw"], fixed_axes=["roll", "pitch"],
+                               note=SINGLE_POINT_MOUNT_NOTE)
         world_cfg["camera_mount_calibration"] = calibration
     world_cfg["updated_wall_time"] = datetime.now().isoformat(timespec="seconds")
     if save:
@@ -1245,7 +1258,9 @@ def solve_camera_mount_from_point(dataset, frame, x, y, depth_mm, actual_lat, ac
     if not camera_imu["trusted"]:
         raise ValueError("OAK IMU timing or filter validity is outside trusted limits.")
 
-    roll = current_rpy[0]
+    # One point supplies only one observable rotation when gravity determines
+    # tilt for each candidate. Preserve the independently configured bank/tilt.
+    roll, pitch = current_rpy[:2]
 
     def predict(rpy):
         # Each candidate changes camera -> vehicle gravity, so vehicle tilt must
@@ -1253,33 +1268,22 @@ def solve_camera_mount_from_point(dataset, frame, x, y, depth_mm, actual_lat, ac
         rotation = _camera_pose_from_imu(course["course_deg"], rpy, camera_imu)
         return gps_to_camera_enu + (rotation @ camera_vector)
 
-    def error_for(pitch, yaw):
+    def error_for(yaw):
         pred = predict([roll, pitch, yaw]) - gps_to_camera_enu
         return float(np.linalg.norm(pred - target_from_origin))
 
-    best_pitch = current_rpy[1]
     best_yaw = current_rpy[2]
-    best_error = error_for(best_pitch, best_yaw)
-    for yaw_span, pitch_span, steps in [
-        (90.0, 60.0, 41),
-        (30.0, 20.0, 41),
-        (10.0, 8.0, 41),
-        (3.0, 3.0, 31),
-        (1.0, 1.0, 31),
-        (0.25, 0.25, 21),
-    ]:
+    best_error = error_for(best_yaw)
+    for yaw_span, steps in [(360.0, 361), (2.0, 41), (0.1, 41), (0.005, 41), (0.00025, 41)]:
         yaw_values = np.linspace(best_yaw - yaw_span / 2.0, best_yaw + yaw_span / 2.0, steps)
-        pitch_values = np.linspace(best_pitch - pitch_span / 2.0, best_pitch + pitch_span / 2.0, steps)
-        for pitch in pitch_values:
-            for yaw in yaw_values:
-                err = error_for(float(pitch), float(yaw))
-                if err < best_error:
-                    best_error = err
-                    best_pitch = float(pitch)
-                    best_yaw = float(yaw)
+        for yaw in yaw_values:
+            err = error_for(float(yaw))
+            if err < best_error:
+                best_error = err
+                best_yaw = float(yaw)
 
     before = predict(current_rpy)
-    after_rpy = [roll, best_pitch, best_yaw]
+    after_rpy = [roll, pitch, best_yaw]
     after = predict(after_rpy)
     return {
         "current_rpy_deg": current_rpy,
@@ -1292,4 +1296,7 @@ def solve_camera_mount_from_point(dataset, frame, x, y, depth_mm, actual_lat, ac
         "course": course,
         "depth_mm": int(depth_mm),
         "unprojection": unprojection,
+        "solved_axes": ["yaw"],
+        "fixed_axes": ["roll", "pitch"],
+        "note": SINGLE_POINT_MOUNT_NOTE,
     }

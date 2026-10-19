@@ -3,6 +3,7 @@
 import contextlib
 import csv
 import io
+import json
 import sys
 import tempfile
 import types
@@ -19,6 +20,7 @@ sys.path.insert(0, str(ROOT / "code"))
 from geonova_depthai import fence_linearization as lines
 from geonova_depthai import yolo_seg_shp as yolo
 from geonova_common.config_cli import load_yaml
+from geonova_postprocess import dataset as geometry
 
 
 class PostprocessConfigTests(unittest.TestCase):
@@ -47,6 +49,70 @@ class PostprocessConfigTests(unittest.TestCase):
         self.assertEqual(automatic.max_gap_connect_m, 10.0)
         self.assertEqual(yolo.parse_args([]).orientation_source, "gps-course")
         self.assertEqual(yolo.parse_args([]).max_frames, 999999)
+
+    def test_only_explicit_orientation_values_override_merged_dataset_metadata(self):
+        with (self.root / "timestamps.csv").open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=["rgb_file", "depth_file"])
+            writer.writeheader()
+            writer.writerows({"rgb_file": "rgb.png", "depth_file": "depth.png"} for _ in range(201))
+        (self.root / "imu.csv").write_text("frame_index\n", encoding="utf-8")
+        angles = [10.0, -20.0, 30.0]
+        (self.root / "metadata.json").write_text(json.dumps({"world_coordinates": {
+            "imu_to_camera_rpy_deg": angles, "imu_to_camera_validated": False,
+            "trusted_max_hdop": 1.2, "imu_accel_innovation_deg": 4.0,
+            "orientation_source": "gps-course-level"}}), encoding="utf-8")
+        (self.root / "metadata.overrides.json").write_text(json.dumps({"world_coordinates": {
+            "imu_to_camera_validated": True, "trajectory_max_hdop": 1.7}}), encoding="utf-8")
+        cases = [([], {}),
+                 (["--imu-to-camera-validated", "1"], {"imu_to_camera_validated": 1.0}),
+                 (["--imu-max-delta-ms", "25"], {"imu_max_delta_ms": 25.0}),
+                 (["--imu-to-camera-validated", "0"], {"imu_to_camera_validated": 0.0}),
+                 (["--imu-to-camera-rpy-deg", "0", "0", "0"], {"imu_to_camera_rpy_deg": [0.0, 0.0, 0.0]}),
+                 (["--orientation-source", "gps-course"], {"orientation_source": "gps-course"})]
+        for flags, expected in cases:
+            with self.subTest(flags=flags):
+                dataset = geometry.Dataset(self.root)
+                argv = ["--dataset", str(self.root), "--model", str(self.root / "missing.pt")] + flags
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(patch.object(yolo, "Dataset", return_value=dataset))
+                    run = stack.enter_context(patch.object(yolo, "run_dataset", wraps=yolo.run_dataset))
+                    stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                    with self.assertRaisesRegex(ValueError, "Model not found"):
+                        yolo.main(argv)
+                self.assertEqual(run.call_args.kwargs["orientation_source"], expected.get("orientation_source"))
+                overrides = {key: value for key, value in expected.items() if key != "orientation_source"}
+                self.assertEqual(dataset.orientation_config, overrides)
+                settings = geometry.orientation_settings(dataset)
+                self.assertEqual(settings["trusted_max_hdop"], 1.2)
+                self.assertEqual(settings["trajectory_max_hdop"], 1.7)
+                self.assertEqual(settings["imu_accel_innovation_deg"], 4.0)
+                self.assertEqual(settings["imu_to_camera_rpy_deg"], overrides.get("imu_to_camera_rpy_deg", angles))
+                rotation, source = geometry.camera_imu_extrinsics(dataset)
+                if settings["imu_to_camera_validated"]:
+                    self.assertEqual(source, "config_validated")
+                    np.testing.assert_allclose(rotation, geometry.rpy_matrix_deg(*settings["imu_to_camera_rpy_deg"]))
+                else:
+                    self.assertEqual(source, "unavailable")
+                    self.assertIsNone(rotation)
+
+    def test_explicit_yaml_orientation_values_and_cli_flags_override_in_order(self):
+        config_path = self.root / "orientation.yaml"
+        config_path.write_text("imu_to_camera_validated: true\nimu_to_camera_rpy_deg: [10, 20, 30]\n"
+                               "imu_accel_innovation_deg: 4\n", encoding="utf-8")
+        args = yolo.parse_args(["--config", str(config_path), "--imu-to-camera-validated", "0"])
+        self.assertEqual(args.orientation_overrides, {"imu_to_camera_validated": 0.0,
+                                                     "imu_to_camera_rpy_deg": [10.0, 20.0, 30.0],
+                                                     "imu_accel_innovation_deg": 4.0})
+        self.assertEqual(yolo.parse_args([]).orientation_overrides, {})
+
+    def test_orientation_help_explains_precedence(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as stopped:
+            yolo.parse_args(["--help"])
+        self.assertEqual(stopped.exception.code, 0)
+        help_text = " ".join(output.getvalue().split())
+        self.assertIn("packaged YAML defaults, dataset metadata.json merged with metadata.overrides.json", help_text)
+        self.assertIn("explicit --config values, explicit CLI flags", help_text)
 
     def test_yaml_and_cli_override_all_linearization_fields(self):
         values = asdict(lines.LinearizationConfig())
@@ -132,7 +198,7 @@ class PostprocessConfigTests(unittest.TestCase):
         model = types.SimpleNamespace(task="segment", names={0: "fence"}, predict=lambda **kwargs: [result])
         module = types.ModuleType("ultralytics")
         module.YOLO = lambda _: model
-        dataset = Mock(frame_count=201, metadata={})
+        dataset = Mock(frame_count=201, metadata={"world_coordinates": {"orientation_source": "gps-course-level"}})
         dataset.frame.return_value = {"rgb_path": self.root / "rgb.png", "row": {"rgb_file": "rgb.png"}}
         # Change EVERY configurable field so dropping any one is observable.
         changes = {}
@@ -157,8 +223,9 @@ class PostprocessConfigTests(unittest.TestCase):
             stack.enter_context(patch.object(yolo.cv2, "imwrite", return_value=True))
             run = stack.enter_context(patch.object(yolo, "linearize_fence_points", return_value={}))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
-            yolo.run_dataset(self.root, model_path, output, linearization_config=config)
+            summary = yolo.run_dataset(self.root, model_path, output, linearization_config=config)
         self.assertEqual(run.call_args.args[3], config)
+        self.assertEqual(summary["orientation_source"], "gps-course-level")
         with (output / "points.csv").open(encoding="utf-8-sig", newline="") as file:
             self.assertTrue(all(row["coordinate_quality"] == "approximate" for row in csv.DictReader(file)))
 
