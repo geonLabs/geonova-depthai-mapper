@@ -1,15 +1,32 @@
 #!/usr/bin/env python3
 """Optional local dataset inspection UI; never started by capture or batch jobs."""
 import argparse
+import json
 import mimetypes
 import os
-import socket
-import subprocess
 import urllib.parse
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from geonova_common.config_cli import parse_args_with_yaml
+from . import dataset as dataset_module
 from .dataset import *  # Preserve the existing inspection API.
+
+
+HOST = "127.0.0.1"
+DEFAULT_HOST = HOST
+DEFAULT_DATASET_ROOT = Path("../data")
+MAX_JSON_BODY_BYTES = 1024 * 1024
+FRAME_ROW_FIELDS = (
+    "stem", "rgb_sequence", "depth_sequence", "rgb_depth_delta_ms",
+    "rgb_imu_delta_ms", "depth_imu_delta_ms", "frame_queue_lag_ms",
+    "gps_frame_delta_ms", "gps_receive_latency_ms", "imu_packets",
+    "gps_sample_index", "gps_latitude_deg", "gps_longitude_deg",
+    "gps_altitude_m", "gps_fix_quality", "gps_fix_quality_name",
+    "gps_rtk_status", "gps_rtk_corrected", "gps_position_valid",
+    "gps_differential_age_s", "gps_satellites", "gps_reference_station_id",
+    "gps_hdop", "rgb_file", "depth_file", "confidence_file",
+)
 
 INDEX_HTML = r"""<!doctype html>
 <html lang="ko">
@@ -337,7 +354,7 @@ INDEX_HTML = r"""<!doctype html>
 <body>
   <div class="app">
     <header class="topbar">
-      <input id="pathInput" class="pathInput" placeholder="dataset folder path, e.g. /data/collections/2026-06-17-11-27-13_raw" />
+      <input id="pathInput" class="pathInput" placeholder="dataset folder under the configured dataset root" />
       <button id="latestBtn" title="Open latest dataset under this path">Latest</button>
       <button id="openBtn" title="Open dataset">Open</button>
       <select id="depthMaxSelect" title="Depth color range">
@@ -353,9 +370,7 @@ INDEX_HTML = r"""<!doctype html>
         <option value="7">15 px</option>
       </select>
       <select id="orientationSourceSelect" title="World coordinate orientation source">
-        <option value="compare" selected>Compare</option>
-        <option value="ebimu">EBIMU</option>
-        <option value="gps-course">GPS Course + Tilt</option>
+        <option value="gps-course" selected>GPS Course + Camera IMU Tilt</option>
         <option value="gps-course-level">GPS Course Level</option>
       </select>
       <div class="error" id="errorText"></div>
@@ -422,10 +437,10 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div class="section">
           <div class="sectionTitleRow">
-            <h2 class="sectionTitle">GPS / EBIMU</h2>
+            <h2 class="sectionTitle">GPS / Camera IMU</h2>
             <span id="rtkBadge" class="statusBadge">UNKNOWN</span>
           </div>
-          <div id="externalInfo" class="mono">-</div>
+          <div id="gpsCameraImuInfo" class="mono">-</div>
         </div>
         <div class="section">
           <h2 class="sectionTitle">World Config</h2>
@@ -486,7 +501,7 @@ INDEX_HTML = r"""<!doctype html>
       imageHeight: 720,
       depthMaxMm: 8000,
       sampleRadius: 4,
-      orientationSource: "compare",
+      orientationSource: "gps-course",
       hoverRequest: null,
       lastHover: null,
       lastClick: null,
@@ -508,8 +523,16 @@ INDEX_HTML = r"""<!doctype html>
       return new URLSearchParams(params).toString();
     }
 
-    async function api(path, params) {
-      const res = await fetch(`${path}?${qs(params)}`);
+    async function api(path, params, method="GET") {
+      const options = { method };
+      let url = path;
+      if (method === "POST") {
+        options.headers = { "Content-Type": "application/json" };
+        options.body = JSON.stringify(params);
+      } else {
+        url = `${path}?${qs(params)}`;
+      }
+      const res = await fetch(url, options);
       if (!res.ok) {
         const text = await res.text();
         throw new Error(text || res.statusText);
@@ -664,35 +687,8 @@ INDEX_HTML = r"""<!doctype html>
       );
     }
 
-    function coordDeltaText(a, b, label="Delta GPS-EBIMU") {
-      if (!a || !b || a.status !== "ok" || b.status !== "ok") return "";
-      const ea = a.enu_offset_m || {};
-      const eb = b.enu_offset_m || {};
-      const de = (eb.east ?? 0) - (ea.east ?? 0);
-      const dn = (eb.north ?? 0) - (ea.north ?? 0);
-      const du = (eb.up ?? 0) - (ea.up ?? 0);
-      const norm = Math.sqrt(de * de + dn * dn + du * du);
-      return `\n${label} e/n/u ${formatNumber(de, 3)}, ${formatNumber(dn, 3)}, ${formatNumber(du, 3)} m | ${formatNumber(norm, 3)} m`;
-    }
-
-    function coordText(world, worlds, source) {
-      if (source === "compare" && worlds) {
-        const ebimu = worlds.ebimu;
-        const gpsCourse = worlds.gps_course;
-        const gpsCourseLevel = worlds.gps_course_level;
-        return (
-          singleCoordText("EBIMU", ebimu) +
-          "\n\n" +
-          singleCoordText("GPS Course + Tilt", gpsCourse) +
-          "\n\n" +
-          singleCoordText("GPS Course Level", gpsCourseLevel) +
-          coordDeltaText(ebimu, gpsCourse, "Delta Tilt-EBIMU") +
-          coordDeltaText(gpsCourse, gpsCourseLevel, "Delta Level-Tilt")
-        );
-      }
-      let label = "EBIMU";
-      if (source === "gps-course") label = "GPS Course + Tilt";
-      if (source === "gps-course-level") label = "GPS Course Level";
+    function coordText(world, source) {
+      const label = source === "gps-course-level" ? "GPS Course Level" : "GPS Course + Camera IMU Tilt";
       return singleCoordText(label, world);
     }
 
@@ -742,7 +738,6 @@ INDEX_HTML = r"""<!doctype html>
         `camera queue lag: ${row.frame_queue_lag_ms || "-"} ms\n` +
         `gps measurement-frame: ${row.gps_frame_delta_ms || "-"} ms\n` +
         `gps receive latency: ${row.gps_receive_latency_ms || "-"} ms\n` +
-        `external IMU-frame: ${row.external_imu_frame_delta_ms || "-"} ms\n` +
         `imu packets in group: ${row.imu_packets || "-"}`;
 
       const alignment = frame.metadata?.depth_alignment;
@@ -773,8 +768,7 @@ INDEX_HTML = r"""<!doctype html>
       ) : "-";
 
       const gps = frame.gps_summary;
-      const ext = frame.external_imu_summary;
-      const mag = ext?.mag || {};
+      const cameraImu = frame.camera_imu_summary;
       const fixQuality = String(gps?.fix_quality ?? row.gps_fix_quality ?? "");
       const rtkStatus = gps?.rtk_status ?? row.gps_rtk_status ?? "unknown";
       const correctionAge = Number(gps?.differential_age_s ?? row.gps_differential_age_s);
@@ -794,7 +788,7 @@ INDEX_HTML = r"""<!doctype html>
         (fixQuality === "4" && !rtkTrusted) || fixQuality === "5" || fixQuality === "2"
       );
       rtkBadge.classList.toggle("bad", !["2", "4", "5"].includes(fixQuality));
-      el("externalInfo").textContent =
+      el("gpsCameraImuInfo").textContent =
         `GPS sample: ${gps?.sample_index ?? row.gps_sample_index ?? "-"}\n` +
         `lat/lon: ${formatNumber(gps?.latitude_deg ?? row.gps_latitude_deg, 8)}, ${formatNumber(gps?.longitude_deg ?? row.gps_longitude_deg, 8)}\n` +
         `alt: ${formatNumber(gps?.altitude_m ?? row.gps_altitude_m, 3)} m\n` +
@@ -804,24 +798,24 @@ INDEX_HTML = r"""<!doctype html>
         `sats/base/age: ${gps?.satellites ?? row.gps_satellites ?? "-"} / ${gps?.reference_station_id ?? row.gps_reference_station_id ?? "-"} / ${formatNumber(gps?.differential_age_s ?? row.gps_differential_age_s, 1)} s\n` +
         `course/speed: ${formatNumber(gps?.course_deg, 2)} deg / ${formatNumber((gps?.speed_knots ?? 0) * 0.514444, 2)} m/s\n` +
         `hdop: ${formatNumber(gps?.hdop, 2)}\n` +
-        `EBIMU sample: ${ext?.sample_index ?? row.external_imu_sample_index ?? "-"}\n` +
-        `orientation: ${ext?.orientation_format ?? "-"}\n` +
-        `q x/y/z/w: ${formatNumber(ext?.q_x, 4)}, ${formatNumber(ext?.q_y, 4)}, ${formatNumber(ext?.q_z, 4)}, ${formatNumber(ext?.q_w, 4)}\n` +
-        `mag x/y/z: ${formatNumber(mag.x, 2)}, ${formatNumber(mag.y, 2)}, ${formatNumber(mag.z, 2)}`;
+        `camera IMU: ${cameraImu?.source || "-"} (${cameraImu?.imu_type || "-"})\n` +
+        `roll/pitch: ${formatNumber(cameraImu?.roll_deg, 2)} / ${formatNumber(cameraImu?.pitch_deg, 2)} deg\n` +
+        `sample delta: ${formatNumber(cameraImu?.sample_delta_ms, 1)} ms\n` +
+        `tilt method: ${cameraImu?.tilt_method || "-"}\n` +
+        `extrinsics: ${cameraImu?.extrinsics_source || "-"}\n` +
+        `trusted: ${cameraImu?.trusted ?? "-"}`;
 
       const world = frame.metadata?.world_coordinates;
       const cameraModel = frame.metadata?.camera_model;
       const sensorHeights = world?.sensor_heights_above_ground_m;
       el("worldInfo").textContent = world ? (
         `camera intrinsics: ${cameraModel?.intrinsics ? "ok" : "missing"}\n` +
-        `height GPS/camera/IMU: ${formatNumber(sensorHeights?.gps_antenna, 2)} / ${formatNumber(sensorHeights?.camera, 2)} / ${formatNumber(sensorHeights?.external_imu, 2)} m\n` +
+        `height GPS/camera: ${formatNumber(sensorHeights?.gps_antenna, 2)} / ${formatNumber(sensorHeights?.camera, 2)} m\n` +
         `imu_from_camera r/p/y: ${vectorText(world.imu_from_camera_rpy_deg, 2)} deg\n` +
         `camera_mount r/p/y: ${vectorText(world.camera_mount_rpy_deg, 2)} deg\n` +
         `gps_to_camera e/n/u: ${vectorText(world.gps_to_camera_enu_m, 2)} m\n` +
         `gps_from_camera x/y/z: ${vectorText(world.gps_from_camera_camera_m, 2)} m\n` +
         `gps_to_camera x/y/z: ${vectorText(world.gps_to_camera_camera_m, 2)} m\n` +
-        `external_imu_from_camera x/y/z: ${vectorText(world.external_imu_from_camera_camera_m, 2)} m\n` +
-        `camera_from_external_imu x/y/z: ${vectorText(world.camera_from_external_imu_camera_m, 2)} m\n` +
         `mag declination: ${world.magnetic_declination_deg ?? 0} deg\n` +
         `orientation source: ${state.orientationSource}\n` +
         `world frame: ${world.local_frame || "-"}\n` +
@@ -881,7 +875,7 @@ INDEX_HTML = r"""<!doctype html>
         });
         depthEl.textContent = mmText(value.depth_mm, value.source, value.sample_count);
         depthEl.className = value.depth_mm === 0 ? "value warn" : "value accent";
-        coordEl.textContent = coordText(value.world, value.worlds, value.orientation_source);
+        coordEl.textContent = coordText(value.world, value.orientation_source);
         coordEl.className = value.world?.status === "ok" ? "coordValue accent" : "coordValue warn";
       } catch (err) {
         depthEl.textContent = "API error";
@@ -903,8 +897,8 @@ INDEX_HTML = r"""<!doctype html>
         roll_deg: mount.roll,
         pitch_deg: mount.pitch,
         yaw_deg: mount.yaw,
-        save: save ? "true" : "false"
-      });
+        save: save
+      }, "POST");
       if (state.frame) {
         state.frame.metadata = data.metadata;
         renderFrame(state.frame);
@@ -936,9 +930,9 @@ INDEX_HTML = r"""<!doctype html>
         latitude_deg: lat,
         longitude_deg: lon,
         altitude_m: alt,
-        apply: "true",
-        save: "true"
-      });
+        apply: true,
+        save: true
+      }, "POST");
       const proposed = data.solution.proposed_rpy_deg;
       setMountInputs(proposed);
       if (state.frame) {
@@ -1058,7 +1052,7 @@ INDEX_HTML = r"""<!doctype html>
     bindPointerSurface(el("depthPane"), depthImage);
 
     const initialParams = new URLSearchParams(location.search);
-    pathInput.value = initialParams.get("path") || "../data";
+    pathInput.value = initialParams.get("path") || "";
     window.addEventListener("load", () => {
       if (initialParams.get("path")) {
         openDataset(false);
@@ -1072,7 +1066,106 @@ INDEX_HTML = r"""<!doctype html>
 """
 
 
+class PathRejected(Exception):
+    def __init__(self, status=403):
+        self.status = status
+        super().__init__("Forbidden" if status == 403 else "Not found")
+
+
+def _path_is_within(path, root):
+    return path == root or root in path.parents
+
+
+def _resolve_request_path(path_text, allowed_roots):
+    if not isinstance(path_text, str) or not path_text.strip():
+        raise PathRejected(404)
+    requested = Path(path_text).expanduser()
+    if ".." in requested.parts:
+        raise PathRejected()
+    candidates = [requested] if requested.is_absolute() else [Path.cwd() / requested]
+    if not requested.is_absolute():
+        candidates.extend(root / requested for root in allowed_roots)
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if any(_path_is_within(resolved, root) for root in allowed_roots):
+            return resolved
+    raise PathRejected()
+
+
+def _resolve_dataset_file(dataset, path):
+    candidate = Path(path)
+    if ".." in candidate.parts:
+        raise PathRejected()
+    try:
+        resolved = candidate.resolve()
+        dataset_root = Path(dataset.root).resolve()
+    except (OSError, RuntimeError):
+        raise PathRejected()
+    if not _path_is_within(resolved, dataset_root):
+        raise PathRejected()
+    return resolved
+
+
+def _validate_dataset_control_files(root):
+    resolved_root = Path(root).resolve()
+    for relative in (
+        "timestamps.csv", "imu.csv", "gps.csv", "metadata.json",
+        "yolo_seg/detections.jsonl",
+    ):
+        candidate = resolved_root / relative
+        if not candidate.exists() and not candidate.is_symlink():
+            continue
+        try:
+            resolved = candidate.resolve()
+        except (OSError, RuntimeError):
+            raise PathRejected()
+        if not _path_is_within(resolved, resolved_root):
+            raise PathRejected()
+
+
+def _validated_frame(dataset, index):
+    frame = dataset.frame(index)
+    frame["rgb_path"] = _resolve_dataset_file(dataset, frame["rgb_path"])
+    frame["depth_path"] = _resolve_dataset_file(dataset, frame["depth_path"])
+    return frame
+
+
 class Handler(BaseHTTPRequestHandler):
+    mutating_endpoints = ("/api/update_mount_rpy", "/api/solve_mount_calibration")
+
+    def allowed_roots(self):
+        return self.server.dataset_roots
+
+    def request_dataset(self, path_text):
+        root = _resolve_request_path(path_text, self.allowed_roots())
+        _validate_dataset_control_files(root)
+        dataset = get_dataset(str(root))
+        resolved_root = Path(dataset.root).resolve()
+        if not any(_path_is_within(resolved_root, allowed) for allowed in self.allowed_roots()):
+            raise PathRejected()
+        return dataset
+
+    def read_json_body(self):
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise ValueError("Content-Type must be application/json.")
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            raise ValueError("Invalid Content-Length.")
+        if content_length <= 0 or content_length > MAX_JSON_BODY_BYTES:
+            raise ValueError("Invalid JSON body size.")
+        try:
+            payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            raise ValueError("Invalid JSON body.")
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object.")
+        return payload
+
     def send_bytes(self, data, content_type, status=200):
         try:
             self.send_response(status)
@@ -1092,15 +1185,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path in self.mutating_endpoints:
+            self.send_response(405)
+            self.send_header("Allow", "POST")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         params = {key: values[-1] for key, values in urllib.parse.parse_qs(parsed.query).items()}
         try:
             if parsed.path == "/":
                 self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
             elif parsed.path == "/api/latest":
-                root = latest_dataset_under(params.get("path", "."))
-                self.send_json({"path": str(root)})
+                requested = params.get("path") or str(self.allowed_roots()[0])
+                search_root = _resolve_request_path(requested, self.allowed_roots())
+                root = latest_dataset_under(str(search_root))
+                resolved_root = _resolve_request_path(str(root), self.allowed_roots())
+                self.send_json({"path": str(resolved_root)})
             elif parsed.path == "/api/dataset":
-                dataset = get_dataset(params.get("path"))
+                dataset = self.request_dataset(params.get("path"))
                 self.send_json({
                     "path": str(dataset.root),
                     "frame_count": dataset.frame_count,
@@ -1108,24 +1210,30 @@ class Handler(BaseHTTPRequestHandler):
                     "metadata": dataset.metadata,
                 })
             elif parsed.path == "/api/frame":
-                dataset = get_dataset(params.get("path"))
+                dataset = self.request_dataset(params.get("path"))
                 index = safe_int(params.get("index"), 0)
-                frame = dataset.frame(index)
+                frame = _validated_frame(dataset, index)
                 depth = get_depth_frame(dataset, frame["index"])
+                camera_imu_summarizer = getattr(dataset_module, "summarize_camera_imu", None)
+                camera_imu_summary = camera_imu_summarizer(dataset, frame) if callable(camera_imu_summarizer) else None
                 self.send_json({
                     "index": frame["index"],
-                    "row": frame["row"],
+                    "row": {
+                        key: frame["row"].get(key)
+                        for key in FRAME_ROW_FIELDS
+                        if key in frame["row"]
+                    },
                     "imu": frame["imu"],
                     "imu_summary": summarize_imu(frame["imu"]),
                     "gps_summary": summarize_gps(frame.get("gps")),
-                    "external_imu_summary": summarize_external_imu(frame.get("external_imu")),
+                    "camera_imu_summary": camera_imu_summary,
                     "estimated_fps": estimate_sequence_fps(dataset, frame["index"]),
                     "valid_depth_pixels": int((depth > 0).sum()),
                     "yolo": dataset.yolo_result(frame["index"]),
                     "metadata": dataset.metadata,
                 })
             elif parsed.path == "/api/first_valid_depth":
-                dataset = get_dataset(params.get("path"))
+                dataset = self.request_dataset(params.get("path"))
                 min_valid_pixels = clamp(
                     safe_int(params.get("min_valid_pixels"), 1000),
                     1,
@@ -1133,6 +1241,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 found = None
                 for index in range(dataset.frame_count):
+                    _validated_frame(dataset, index)
                     depth = get_depth_frame(dataset, index)
                     valid_pixels = int((depth > 0).sum())
                     if valid_pixels >= min_valid_pixels:
@@ -1142,41 +1251,20 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("No frame with enough valid depth pixels was found.")
                 self.send_json(found)
             elif parsed.path == "/api/depth_value":
-                dataset = get_dataset(params.get("path"))
+                dataset = self.request_dataset(params.get("path"))
                 index = safe_int(params.get("index"), 0)
                 x = clamp(safe_int(params.get("x"), 0), 0, dataset.image_width - 1)
                 y = clamp(safe_int(params.get("y"), 0), 0, dataset.image_height - 1)
                 radius = clamp(safe_int(params.get("radius"), 4), 0, 20)
-                orientation_source = params.get("orientation_source", "compare")
-                if orientation_source not in ("compare", "ebimu", "gps-course", "gps-course-level"):
-                    orientation_source = "compare"
-                frame = dataset.frame(index)
+                orientation_source = params.get("orientation_source", "gps-course")
+                if orientation_source not in ("gps-course", "gps-course-level"):
+                    orientation_source = "gps-course"
+                frame = _validated_frame(dataset, index)
                 depth = get_depth_frame(dataset, index)
                 depth_value = robust_depth_value(depth, x, y, radius)
-                worlds = {}
-                if orientation_source in ("compare", "ebimu"):
-                    worlds["ebimu"] = compute_world_coordinate_for_source(
-                        dataset, frame, x, y, depth_value["depth_mm"], "ebimu"
-                    )
-                if orientation_source in ("compare", "gps-course"):
-                    worlds["gps_course"] = compute_world_coordinate_for_source(
-                        dataset, frame, x, y, depth_value["depth_mm"], "gps-course"
-                    )
-                if orientation_source in ("compare", "gps-course-level"):
-                    worlds["gps_course_level"] = compute_world_coordinate_for_source(
-                        dataset, frame, x, y, depth_value["depth_mm"], "gps-course-level"
-                    )
-
-                if orientation_source == "gps-course":
-                    world = worlds.get("gps_course")
-                elif orientation_source == "gps-course-level":
-                    world = worlds.get("gps_course_level")
-                elif orientation_source == "ebimu":
-                    world = worlds.get("ebimu")
-                else:
-                    gps_world = worlds.get("gps_course_level") or worlds.get("gps_course")
-                    ebimu_world = worlds.get("ebimu")
-                    world = gps_world if gps_world and gps_world.get("status") == "ok" else ebimu_world
+                world = compute_world_coordinate_for_source(
+                    dataset, frame, x, y, depth_value["depth_mm"], orientation_source
+                )
 
                 self.send_json({
                     "x": x,
@@ -1184,16 +1272,50 @@ class Handler(BaseHTTPRequestHandler):
                     **depth_value,
                     "orientation_source": orientation_source,
                     "world": world,
-                    "worlds": worlds,
                 })
-            elif parsed.path == "/api/update_mount_rpy":
-                dataset = get_dataset(params.get("path"))
+            elif parsed.path == "/media/rgb":
+                dataset = self.request_dataset(params.get("path"))
+                frame = _validated_frame(dataset, safe_int(params.get("index"), 0))
+                data = frame["rgb_path"].read_bytes()
+                content_type = mimetypes.guess_type(frame["rgb_path"].name)[0] or "image/png"
+                self.send_bytes(data, content_type)
+            elif parsed.path == "/media/depth_preview":
+                dataset = self.request_dataset(params.get("path"))
+                index = safe_int(params.get("index"), 0)
+                max_mm = safe_int(params.get("max_mm"), 8000)
+                _validated_frame(dataset, index)
+                depth = get_depth_frame(dataset, index)
+                self.send_bytes(make_depth_preview(depth, max_mm), "image/png")
+            else:
+                self.send_error_text("Not found", 404)
+        except BrokenPipeError:
+            pass
+        except PathRejected as exc:
+            self.send_error_text(str(exc), exc.status)
+        except Exception as exc:
+            message = str(exc)
+            if any(os.path.normcase(str(root)) in os.path.normcase(message) for root in self.allowed_roots()):
+                message = "Request failed."
+            self.send_error_text(message, 400)
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path not in self.mutating_endpoints:
+            self.send_response(405)
+            self.send_header("Allow", "GET")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        try:
+            params = self.read_json_body()
+            dataset = self.request_dataset(params.get("path"))
+            if parsed.path == "/api/update_mount_rpy":
                 roll = safe_float(params.get("roll_deg"))
                 pitch = safe_float(params.get("pitch_deg"))
                 yaw = safe_float(params.get("yaw_deg"))
                 if roll is None or pitch is None or yaw is None:
                     raise ValueError("roll_deg, pitch_deg, and yaw_deg are required.")
-                save = params.get("save", "false").lower() in ("1", "true", "yes")
+                save = safe_bool(params.get("save"), False)
                 rpy = set_camera_mount_rpy(dataset, roll, pitch, yaw, save=save)
                 self.send_json({
                     "status": "ok",
@@ -1201,73 +1323,62 @@ class Handler(BaseHTTPRequestHandler):
                     "camera_mount_rpy_deg": rpy,
                     "metadata": dataset.metadata,
                 })
-            elif parsed.path == "/api/solve_mount_calibration":
-                dataset = get_dataset(params.get("path"))
-                index = safe_int(params.get("index"), 0)
-                x = clamp(safe_int(params.get("x"), 0), 0, dataset.image_width - 1)
-                y = clamp(safe_int(params.get("y"), 0), 0, dataset.image_height - 1)
-                radius = clamp(safe_int(params.get("radius"), 4), 0, 20)
-                actual_lat = safe_float(params.get("latitude_deg"))
-                actual_lon = safe_float(params.get("longitude_deg"))
-                actual_alt = safe_float(params.get("altitude_m"), 0.0)
-                if actual_lat is None or actual_lon is None:
-                    raise ValueError("latitude_deg and longitude_deg are required.")
-                frame = dataset.frame(index)
-                depth = get_depth_frame(dataset, index)
-                depth_value = robust_depth_value(depth, x, y, radius)
-                solution = solve_camera_mount_from_point(
-                    dataset,
-                    frame,
-                    x,
-                    y,
-                    depth_value["depth_mm"],
-                    actual_lat,
-                    actual_lon,
-                    actual_alt,
-                )
-                save = params.get("save", "false").lower() in ("1", "true", "yes")
-                apply_solution = params.get("apply", "true").lower() in ("1", "true", "yes")
-                if apply_solution:
-                    calibration = {
-                        "source": "single_clicked_point",
-                        "updated_wall_time": datetime.now().isoformat(timespec="seconds"),
-                        "frame_index": index,
-                        "x": x,
-                        "y": y,
-                        "actual_latitude_deg": actual_lat,
-                        "actual_longitude_deg": actual_lon,
-                        "actual_altitude_m": actual_alt,
-                        "error_before_m": solution["error_before_m"],
-                        "error_after_m": solution["error_after_m"],
-                        "note": "Single-point calibration updates yaw/pitch and keeps roll unchanged.",
-                    }
-                    set_camera_mount_rpy(dataset, *solution["proposed_rpy_deg"], save=save, calibration=calibration)
-                self.send_json({
-                    "status": "ok",
-                    "saved": save and apply_solution,
-                    "applied": apply_solution,
-                    **depth_value,
-                    "solution": solution,
-                    "metadata": dataset.metadata,
-                })
-            elif parsed.path == "/media/rgb":
-                dataset = get_dataset(params.get("path"))
-                frame = dataset.frame(safe_int(params.get("index"), 0))
-                data = frame["rgb_path"].read_bytes()
-                content_type = mimetypes.guess_type(frame["rgb_path"].name)[0] or "image/png"
-                self.send_bytes(data, content_type)
-            elif parsed.path == "/media/depth_preview":
-                dataset = get_dataset(params.get("path"))
-                index = safe_int(params.get("index"), 0)
-                max_mm = safe_int(params.get("max_mm"), 8000)
-                depth = get_depth_frame(dataset, index)
-                self.send_bytes(make_depth_preview(depth, max_mm), "image/png")
-            else:
-                self.send_error_text("Not found", 404)
-        except BrokenPipeError:
-            pass
+                return
+
+            index = safe_int(params.get("index"), 0)
+            x = clamp(safe_int(params.get("x"), 0), 0, dataset.image_width - 1)
+            y = clamp(safe_int(params.get("y"), 0), 0, dataset.image_height - 1)
+            radius = clamp(safe_int(params.get("radius"), 4), 0, 20)
+            actual_lat = safe_float(params.get("latitude_deg"))
+            actual_lon = safe_float(params.get("longitude_deg"))
+            actual_alt = safe_float(params.get("altitude_m"), 0.0)
+            if actual_lat is None or actual_lon is None:
+                raise ValueError("latitude_deg and longitude_deg are required.")
+            frame = _validated_frame(dataset, index)
+            depth = get_depth_frame(dataset, frame["index"])
+            depth_value = robust_depth_value(depth, x, y, radius)
+            solution = solve_camera_mount_from_point(
+                dataset,
+                frame,
+                x,
+                y,
+                depth_value["depth_mm"],
+                actual_lat,
+                actual_lon,
+                actual_alt,
+            )
+            save = safe_bool(params.get("save"), False)
+            apply_solution = safe_bool(params.get("apply"), True)
+            if apply_solution:
+                calibration = {
+                    "source": "single_clicked_point",
+                    "updated_wall_time": datetime.now().isoformat(timespec="seconds"),
+                    "frame_index": index,
+                    "x": x,
+                    "y": y,
+                    "actual_latitude_deg": actual_lat,
+                    "actual_longitude_deg": actual_lon,
+                    "actual_altitude_m": actual_alt,
+                    "error_before_m": solution["error_before_m"],
+                    "error_after_m": solution["error_after_m"],
+                    "note": "Single-point calibration updates yaw/pitch and keeps roll unchanged.",
+                }
+                set_camera_mount_rpy(dataset, *solution["proposed_rpy_deg"], save=save, calibration=calibration)
+            self.send_json({
+                "status": "ok",
+                "saved": save and apply_solution,
+                "applied": apply_solution,
+                **depth_value,
+                "solution": solution,
+                "metadata": dataset.metadata,
+            })
+        except PathRejected as exc:
+            self.send_error_text(str(exc), exc.status)
         except Exception as exc:
-            self.send_error_text(exc, 400)
+            message = str(exc)
+            if any(os.path.normcase(str(root)) in os.path.normcase(message) for root in self.allowed_roots()):
+                message = "Request failed."
+            self.send_error_text(message, 400)
 
     def log_message(self, fmt, *args):
         return
@@ -1278,68 +1389,31 @@ def parse_args(argv=None):
         description="Launch the DepthAI dataset debug UI.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--host", default=HOST, help="Bind address. Use 127.0.0.1 for local-only access.")
+    parser.add_argument("--host", default=DEFAULT_HOST, help="Bind address. Use 127.0.0.1 for local-only access.")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="HTTP server TCP port")
+    parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT, help="Allowed dataset directory")
     return parse_args_with_yaml(parser, argv)
 
 
-def discover_ipv4_addresses():
-    addresses = []
-    ignored_prefixes = ("docker", "br-", "veth")
-
-    try:
-        output = subprocess.check_output(
-            ["ip", "-4", "-o", "addr", "show", "scope", "global"],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        )
-        for line in output.splitlines():
-            parts = line.split()
-            if len(parts) < 4:
-                continue
-            interface = parts[1]
-            if interface.startswith(ignored_prefixes):
-                continue
-            if "inet" not in parts:
-                continue
-            address = parts[parts.index("inet") + 1].split("/", 1)[0]
-            if address and address not in addresses:
-                addresses.append(address)
-    except Exception:
-        pass
-
-    if not addresses:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-                sock.connect(("8.8.8.8", 80))
-                address = sock.getsockname()[0]
-                if address and not address.startswith("127.") and address not in addresses:
-                    addresses.append(address)
-        except Exception:
-            pass
-
-    return addresses
-
-
 def print_server_urls(host, port):
-    print(f"DepthAI dataset debug UI bind: http://{host}:{port}")
+    display_host = host or "0.0.0.0"
+    print(f"DepthAI dataset debug UI bind: http://{display_host}:{port}")
     if host in ("0.0.0.0", ""):
+        print("WARNING: The UI is reachable from the network.")
         print(f"Local URL: http://127.0.0.1:{port}")
-        addresses = discover_ipv4_addresses()
-        if addresses:
-            print("External/LAN URL candidates:")
-            for address in addresses:
-                print(f"  http://{address}:{port}")
-        else:
-            print("External/LAN URL candidates: unavailable; check `ip -4 addr`.")
-        print("External access requires the client to be on a reachable network and the firewall to allow this port.")
     else:
         print(f"URL: http://{host}:{port}")
 
 
+def create_server(host=DEFAULT_HOST, port=DEFAULT_PORT, dataset_root=DEFAULT_DATASET_ROOT):
+    server = ThreadingHTTPServer((host, port), Handler)
+    server.dataset_roots = (Path(dataset_root).expanduser().resolve(),)
+    return server
+
+
 def main(argv=None):
     args = parse_args(argv)
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server = create_server(args.host, args.port, args.dataset_root)
     print_server_urls(args.host, args.port)
     print("Open a dataset folder containing rgb/, depth_mm/, timestamps.csv, and imu.csv.")
     try:

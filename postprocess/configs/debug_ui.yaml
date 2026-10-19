@@ -1,3 +1,4 @@
-# Optional local inspection; expose externally only behind the server access controls.
+# Local debug UI. Use --host 0.0.0.0 only when network access is intended.
 host: 127.0.0.1
 port: 8088
+dataset_root: ../data
