@@ -169,8 +169,14 @@ class ControllerBridge:
             self._last_camera_monotonic = now_monotonic
             self._last_camera_epoch_ms = now_epoch_ms
             try:
-                self._camera_width = int(message.getWidth())
-                self._camera_height = int(message.getHeight())
+                width = int(message.getWidth())
+                height = int(message.getHeight())
+                # MJPEG EncodedFrame metadata is not an ImgFrame geometry.
+                # Only accept plausible raw dimensions; decoded preview pixels
+                # below provide the source geometry for encoded frames.
+                if 0 < width <= 16384 and 0 < height <= 16384:
+                    self._camera_width = width
+                    self._camera_height = height
             except Exception:
                 pass
             if (
@@ -224,6 +230,8 @@ class ControllerBridge:
             raise RuntimeError("Failed to encode controller camera preview")
         _atomic_write(self.preview_path, encoded.tobytes())
         with self._lock:
+            self._camera_width = width
+            self._camera_height = height
             self._last_preview_epoch_ms = int(time.time() * 1000)
             self._preview_error = None
 

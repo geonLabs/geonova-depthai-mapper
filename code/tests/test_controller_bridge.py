@@ -89,6 +89,20 @@ def test_bridge_writes_resized_jpeg_preview(tmp_path):
     decoded = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
     assert decoded.shape[:2] == (360, 640)
     assert bridge.snapshot()["camera"]["previewAvailable"] is True
+    assert bridge.snapshot()["camera"]["frameWidth"] == 1280
+    assert bridge.snapshot()["camera"]["frameHeight"] == 720
+    bridge.close()
+
+
+def test_bridge_encoded_frame_dimensions_come_from_decoded_pixels(tmp_path):
+    bridge = ControllerBridge(bridge_args(tmp_path))
+    encoded = SimpleNamespace(getWidth=lambda: 1030985, getHeight=lambda: 1030992)
+    bridge.offer_rgb(encoded)
+    assert bridge.snapshot()["camera"]["frameWidth"] is None
+    bridge.write_preview_frame(np.zeros((1200, 1920, 3), dtype=np.uint8))
+    bridge.offer_rgb(encoded)
+    assert bridge.snapshot()["camera"]["frameWidth"] == 1920
+    assert bridge.snapshot()["camera"]["frameHeight"] == 1200
     bridge.close()
 
 
