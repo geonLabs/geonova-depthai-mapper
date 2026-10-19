@@ -2528,7 +2528,20 @@ def connect_depthai_device(args):
     attempts = max(int(args.usb3_retries), 0) + 1
     last_speed = "UNKNOWN"
     for attempt in range(1, attempts + 1):
-        device = dai.Device(dai.UsbSpeed.SUPER)
+        try:
+            device = dai.Device(dai.UsbSpeed.SUPER)
+        except RuntimeError:
+            if not args.allow_usb2:
+                raise
+            if attempt < attempts:
+                print(
+                    f"DepthAI USB 3.x boot failed; retrying USB 3.x "
+                    f"{attempt}/{attempts - 1}."
+                )
+            else:
+                print("DepthAI USB 3.x boot failed; retrying in USB 2.0 mode (--allow-usb2).")
+            time.sleep(1.0)
+            continue
         last_speed = usb_speed_name(device)
         if last_speed in ("SUPER", "SUPER_PLUS") or args.allow_usb2:
             return device
@@ -2540,6 +2553,12 @@ def connect_depthai_device(args):
                 f"retrying USB 3.x negotiation {attempt}/{attempts - 1}..."
             )
             time.sleep(1.0)
+
+    if args.allow_usb2:
+        device = dai.Device(dai.UsbSpeed.HIGH)
+        last_speed = usb_speed_name(device)
+        if last_speed in ("SUPER", "SUPER_PLUS") or args.allow_usb2:
+            return device
 
     raise RuntimeError(
         f"DepthAI negotiated {last_speed}, not USB 3.x. RGB/depth/confidence at "
