@@ -365,6 +365,18 @@ def _prepare_writer(path: Path, shape_type: int) -> shapefile.Writer:
     return writer
 
 
+def _resolve_output_dir(dataset_root: Path, output_dir: Path | None) -> Path:
+    """Choose a dataset-local output unless a concrete output path was configured."""
+    if output_dir is None:
+        return (dataset_root / "yolo_seg").expanduser().resolve()
+    configured = str(output_dir)
+    if "REPLACE_" in configured.upper() or ("<" in configured and ">" in configured):
+        raise ValueError(
+            "output_dir contains an unresolved placeholder; set a run-specific path or use null."
+        )
+    return Path(output_dir).expanduser().resolve()
+
+
 def _record(writer: shapefile.Writer, point: dict) -> None:
     writer.record(
         point["frame_index"],
@@ -462,7 +474,7 @@ def run_dataset(
     line_config = replace(line_config, **{key: value for key, value in overrides.items() if value is not None})
     validate_linearization_config(line_config)
 
-    output_dir = (output_dir or dataset_root / "yolo_seg").expanduser().resolve()
+    output_dir = _resolve_output_dir(dataset_root, output_dir)
     print("[YOLO] Loading dataset and model...", flush=True)
     dataset = Dataset(dataset_root)
     dataset.orientation_config = dict(orientation_config or {})

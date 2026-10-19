@@ -18,6 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from geonova_depthai.yolo_seg_shp import (  # noqa: E402
     _feature_depth_mm,
+    _resolve_output_dir,
     default_model_path,
     main,
     mask_axis_points,
@@ -29,8 +30,35 @@ from geonova_depthai.fence_linearization import (  # noqa: E402
     CRS_WGS84,
     CRS_WORK,
     LinearizationConfig,
+    _smooth_xy,
     linearize_fence_points,
 )
+
+
+def test_yolo_output_defaults_to_selected_dataset_and_rejects_placeholders(tmp_path: Path) -> None:
+    first = tmp_path / "capture-a"
+    second = tmp_path / "capture-b"
+    assert _resolve_output_dir(first, None) == (first / "yolo_seg").resolve()
+    assert _resolve_output_dir(second, None) == (second / "yolo_seg").resolve()
+    with pytest.raises(ValueError, match="unresolved placeholder"):
+        _resolve_output_dir(first, Path("/srv/geonova/processed/REPLACE_RUN_ID/yolo"))
+
+
+def test_savgol_polyorder_changes_smoothed_trajectory() -> None:
+    axis = np.arange(-5.0, 6.0)
+    coords = np.column_stack((axis, axis ** 3))
+    linear = _smooth_xy(coords, 5, 1)
+    quadratic = _smooth_xy(coords, 5, 2)
+    cubic = _smooth_xy(coords, 5, 3)
+
+    assert not np.allclose(linear, quadratic)
+    assert not np.allclose(cubic, quadratic)
+
+
+def test_savgol_polyorder_must_fit_effective_window() -> None:
+    coords = np.column_stack((np.arange(3.0), np.arange(3.0) ** 3))
+    with pytest.raises(ValueError, match="effective smoothing window"):
+        _smooth_xy(coords, 11, 3)
 
 
 def test_default_model_path_uses_yaml_even_with_local_models(tmp_path: Path) -> None:
@@ -254,7 +282,7 @@ def test_fence_linearization_debug_outputs(tmp_path: Path) -> None:
         output_dir,
         trajectory_csv,
         LinearizationConfig(
-            gps_smoothing_window=1,
+            gps_smoothing_window=3,
             side_vote_window=7,
             residual_window=5,
             max_gap_connect_m=2.0,
@@ -341,7 +369,7 @@ def test_representative_is_the_only_modern_mapping_point(tmp_path: Path) -> None
         points_csv,
         tmp_path / "out",
         trajectory_csv,
-        LinearizationConfig(gps_smoothing_window=1, min_line_support=3),
+        LinearizationConfig(gps_smoothing_window=3, min_line_support=3),
     )
     assert summary["raw_points"] == 20
     assert summary["corrected_points"] == 5

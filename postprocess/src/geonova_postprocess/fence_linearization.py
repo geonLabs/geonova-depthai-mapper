@@ -255,20 +255,32 @@ def _normalise_points(path: Path, config: LinearizationConfig) -> list[dict]:
     return rows
 
 
-def _smooth_xy(coords: np.ndarray, window: int) -> np.ndarray:
-    if len(coords) < 3 or window <= 1:
+def _validate_smoothing_settings(window: int, polyorder: int) -> None:
+    if not isinstance(window, int) or window < 3 or window % 2 == 0:
+        raise ValueError("gps_smoothing_window must be an odd integer of at least 3.")
+    if not isinstance(polyorder, int) or polyorder < 0:
+        raise ValueError("gps_savgol_polyorder must be a nonnegative integer.")
+    if polyorder >= window:
+        raise ValueError("gps_savgol_polyorder must be less than gps_smoothing_window.")
+
+
+def _smooth_xy(coords: np.ndarray, window: int, polyorder: int) -> np.ndarray:
+    _validate_smoothing_settings(window, polyorder)
+    if len(coords) < 3:
         return coords.copy()
     width = min(window, len(coords) if len(coords) % 2 else len(coords) - 1)
-    width = max(1, width)
+    if polyorder >= width:
+        raise ValueError(
+            "gps_savgol_polyorder must be less than the effective smoothing window "
+            "({}).".format(width)
+        )
     half = width // 2
     output = np.empty_like(coords)
     for index in range(len(coords)):
         section = coords[max(0, index - half): min(len(coords), index + half + 1)]
         output[index] = np.median(section, axis=0)
-    if width >= 3:
-        polyorder = min(2, width - 1)
-        output[:, 0] = savgol_filter(output[:, 0], width, polyorder, mode="interp")
-        output[:, 1] = savgol_filter(output[:, 1], width, polyorder, mode="interp")
+    output[:, 0] = savgol_filter(output[:, 0], width, polyorder, mode="interp")
+    output[:, 1] = savgol_filter(output[:, 1], width, polyorder, mode="interp")
     return output
 
 
@@ -299,7 +311,11 @@ def _trajectory_from_csv(
         coordinates.append(transformer.transform(lon, lat))
     if len(coordinates) < 2:
         return None
-    coords = _smooth_xy(np.asarray(coordinates, dtype=float), config.gps_smoothing_window)
+    coords = _smooth_xy(
+        np.asarray(coordinates, dtype=float),
+        config.gps_smoothing_window,
+        config.gps_savgol_polyorder,
+    )
     keep = np.r_[True, np.linalg.norm(np.diff(coords, axis=0), axis=1) > 0.01]
     coords = coords[keep]
     return coords if len(coords) >= 2 else None
@@ -964,6 +980,7 @@ def linearization_config_from_args(args, for_yolo=False):
 
 
 def validate_linearization_config(config):
+    _validate_smoothing_settings(config.gps_smoothing_window, config.gps_savgol_polyorder)
     for field in fields(config):
         value = getattr(config, field.name)
         if field.name == "work_crs":

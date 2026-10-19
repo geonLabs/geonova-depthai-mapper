@@ -37,6 +37,7 @@ class PostprocessConfigTests(unittest.TestCase):
                     value = Path(value)
                 self.assertEqual(actual[key], value, key)
             self.assertEqual(config_path.read_bytes(), (ROOT / "code" / "configs" / config_path.name).read_bytes())
+        self.assertIsNone(yolo.parse_args([]).output_dir)
 
     def test_automatic_and_standalone_defaults_include_every_setting(self):
         automatic = lines.linearization_config_from_args(yolo.parse_args([]), for_yolo=True)
@@ -82,11 +83,28 @@ class PostprocessConfigTests(unittest.TestCase):
                    {"fragment_min_samples": 0}, {"fragment_erosion_px": -1}, {"depth_radius": -1},
                    {"depth_confidence_max": 256}, {"orientation_source": "invalid"}, {"classes": [-1]},
                    {"max_frames": float("inf")}, {"orientation_config": {"imu_max_delta_ms": -1}},
-                   {"linearization_config": replace(lines.LinearizationConfig(), side_window_m=-1)})
+                   {"linearization_config": replace(lines.LinearizationConfig(), side_window_m=-1)},
+                   {"linearization_config": replace(lines.LinearizationConfig(), gps_smoothing_window=4)},
+                   {"linearization_config": replace(lines.LinearizationConfig(), gps_savgol_polyorder=11)})
         for arguments in invalid:
             with self.subTest(arguments=arguments), self.assertRaises(ValueError):
                 yolo.run_dataset(self.root / "missing", self.root / "missing.pt", output, **arguments)
             self._assert_outputs_untouched(output)
+
+    def test_placeholder_output_is_rejected_before_existing_outputs_are_cleared(self):
+        output = self.root / "REPLACE_RUN_ID" / "yolo"
+        for name in ("detected_plot", "detected_rgb", "overlays"):
+            path = output / name
+            path.mkdir(parents=True, exist_ok=True)
+            (path / "keep.txt").write_text("original", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "unresolved placeholder"):
+            yolo.run_dataset(
+                self.root / "missing",
+                self.root / "missing.pt",
+                self.root / "REPLACE_RUN_ID" / "yolo",
+            )
+        for name in ("detected_plot", "detected_rgb", "overlays"):
+            self.assertEqual((output / name / "keep.txt").read_text(encoding="utf-8"), "original")
 
     def test_out_of_bounds_and_bad_model_leave_outputs_untouched(self):
         output = self._outputs()

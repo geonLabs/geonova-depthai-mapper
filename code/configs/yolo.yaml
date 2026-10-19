@@ -1,7 +1,7 @@
 # YOLO segmentation, Depth 대표점 생성, 자동 선형화 설정입니다.
 dataset: /srv/geonova/processed/REPLACE_RUN_ID/synced        # 필수: timestamps.csv가 있는 동기 데이터셋
 model: /srv/geonova/models/guardrail.pt         # 서버에서 별도로 관리하는 segmentation 모델
-output_dir: /srv/geonova/processed/REPLACE_RUN_ID/yolo
+output_dir: null                          # null saves to <dataset>/yolo_seg
 start_frame: 200                       # 카메라 안정화 이후 시작 프레임. 200 이상 필수
 max_frames: 999999                     # stride 적용 후 최대 처리 프레임 수. 큰 값=끝까지
 stride: 1                              # 1=모든 프레임, 2=두 프레임마다 한 장 처리
