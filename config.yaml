@@ -18,11 +18,25 @@ controller_preview_max_width: 1920
 controller_preview_jpeg_quality: 78
 
 depth_alignment_mode: auto
-depth_preset: FAST_ACCURACY
+depth_preset: FAST_DENSITY     # 노면처럼 무늬가 약한 면의 깊이 밀도 우선(3.1.0: confidence 15, LR 10). 이전 값 FAST_ACCURACY
 lr_check: true
 subpixel: true
 subpixel_fractional_bits: 5
 stereo_median_filter: "off"
+stereo_confidence_threshold: -1    # -1=프리셋 값. DepthAI v3는 값이 낮을수록 더 많은 픽셀을 남김
+stereo_lr_check_threshold: -1      # -1=프리셋 값
+stereo_speckle_filter: false       # 켜기 전 30초 시험 녹화로 depth 15 FPS 유지 확인
+stereo_speckle_range: 50
+stereo_speckle_difference_threshold: 2
+stereo_spatial_filter: false       # 가로 방향 작은 구멍 메움. 켜기 전 FPS 확인
+stereo_spatial_hole_filling_radius: 2
+stereo_spatial_alpha: 0.5
+stereo_spatial_delta: 0            # 0=자동(정수 시차 3단계)
+stereo_spatial_iterations: 1
+stereo_postprocessing_shaves: 0    # 0=DepthAI 기본. 필터를 켠 뒤 FPS가 떨어지면 3/3
+stereo_postprocessing_memory_slices: 0
+stereo_ae_max_exposure_us: 0       # 0=기본(최대 약 프레임 시간). 흐린 날 주행이면 2000
+stereo_ae_region: ""               # 저장 영상 기준 x0,y0,x1,y1(0~1). 비우면 화면 전체로 노출 측정
 imu_rate: 200                  # Requested OAK IMU rate; monitor mode clamps to 100 Hz
 imu_batch: 10
 save_confidence_map: false

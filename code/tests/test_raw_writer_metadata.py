@@ -78,6 +78,31 @@ def test_raw_metadata_records_versions_and_stereo_config(tmp_path) -> None:
     }
 
 
+def test_raw_metadata_records_effective_stereo_tuning(tmp_path) -> None:
+    args = recorder_args()
+    args.depth_preset = "FAST_DENSITY"
+    args.stereo_config_effective = {
+        "confidence_threshold": 15,
+        "lr_check_threshold": 10,
+        "speckle_filter": {"enable": True, "range": 50, "difference_threshold": 2},
+    }
+    args.stereo_auto_exposure_effective = {
+        "max_exposure_us": 2000, "region": None, "sensor_region": None,
+    }
+    dataset = RawEventDataset(tmp_path, args)
+    try:
+        stereo = json.loads((dataset.root / "metadata.json").read_text())["stereo_config"]
+    finally:
+        dataset.close()
+
+    assert stereo["depth_preset"] == "FAST_DENSITY"
+    assert stereo["confidence_threshold"] == 15
+    assert stereo["lr_check_threshold"] == 10
+    assert stereo["speckle_filter"]["enable"] is True
+    assert stereo["auto_exposure"]["max_exposure_us"] == 2000
+    assert stereo["extended_disparity"] is False
+
+
 def test_dataset_roots_are_unique_when_wall_clock_is_identical(
     tmp_path, monkeypatch
 ) -> None:

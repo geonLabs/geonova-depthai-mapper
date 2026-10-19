@@ -17,6 +17,7 @@ import numpy as np
 import serial
 
 from geonova_depthai.serial_devices import resolve_serial_device, resolve_serial_devices
+from geonova_depthai.stereo_settings import parse_ae_region, sensor_ae_region, validate_stereo_args
 
 
 WIDTH = 1280
@@ -2642,6 +2643,144 @@ def configure_monitor_pipeline(pipeline, args):
     return {"mode": "monitor", "rgb": rgb_output, "imu": imu.out if imu is not None else None}
 
 
+def _int_setting(args, name, default):
+    value = getattr(args, name, default)
+    return default if value is None else int(value)
+
+
+def _config_value(obj, path):
+    for name in path.split("."):
+        obj = getattr(obj, name, None)
+        if obj is None:
+            return None
+    if isinstance(obj, (bool, int, float, str)):
+        return obj
+    return getattr(obj, "name", str(obj))
+
+
+def configure_stereo_exposure(cameras, args, sensor_size):
+    """Apply the same optional auto-exposure limit and region to both stereo cameras.
+
+    Outdoors the sky can dominate whole-frame metering and leave the road dark,
+    and by default auto exposure may lengthen up to about the frame time, which
+    blurs the fast-moving road while driving.
+    """
+    limit_us = _int_setting(args, "stereo_ae_max_exposure_us", 0)
+    region = parse_ae_region(getattr(args, "stereo_ae_region", ""))
+    sensor_region = None
+    if region is not None:
+        sensor_region = sensor_ae_region(
+            region,
+            sensor_size,
+            rotate_180=bool(getattr(args, "rotate_180", False)),
+            flip=bool(getattr(args, "flip", False)),
+        )
+    for camera in cameras:
+        if limit_us > 0:
+            camera.initialControl.setAutoExposureLimit(limit_us)
+        if sensor_region is not None:
+            camera.initialControl.setAutoExposureRegion(*sensor_region)
+    args.stereo_auto_exposure_effective = {
+        "max_exposure_us": limit_us or None,
+        "region": list(region) if region is not None else None,
+        "sensor_region": list(sensor_region) if sensor_region is not None else None,
+    }
+    if limit_us > 0 or sensor_region is not None:
+        print(
+            f"Stereo auto exposure: max={limit_us or 'default'} us, "
+            f"sensor_region={list(sensor_region) if sensor_region else 'full frame'}"
+        )
+
+
+def configure_stereo_depth(stereo, args):
+    """Apply the StereoDepth preset, the fixed capture choices and optional tuning.
+
+    The preset supplies the confidence and left-right thresholds. LR-check,
+    subpixel, median and extended disparity always follow the capture config.
+    Threshold values below 0 keep the preset's value; filters left off keep the
+    preset's own choice (off for FAST_ACCURACY and FAST_DENSITY).
+    """
+    validate_stereo_args(args)
+    stereo.setDefaultProfilePreset(enum_by_name(dai.node.StereoDepth.PresetMode, args.depth_preset))
+    stereo.setLeftRightCheck(args.lr_check)
+    stereo.setSubpixel(args.subpixel)
+    if args.subpixel:
+        stereo.setSubpixelFractionalBits(args.subpixel_fractional_bits)
+    median_filter_name = args.stereo_median_filter
+    if args.subpixel and args.subpixel_fractional_bits > 3 and median_filter_name != "off":
+        print("Stereo median filter disabled because subpixel fractional bits 4/5 do not support it.")
+        median_filter_name = "off"
+    median_filter = {
+        "off": dai.MedianFilter.MEDIAN_OFF,
+        "3x3": dai.MedianFilter.KERNEL_3x3,
+        "5x5": dai.MedianFilter.KERNEL_5x5,
+        "7x7": dai.MedianFilter.KERNEL_7x7,
+    }[median_filter_name]
+    config = stereo.initialConfig
+    config.setMedianFilter(median_filter)
+    args.stereo_median_filter_effective = median_filter_name
+    stereo.setExtendedDisparity(False)
+
+    # DepthAI v3 keeps disparities whose confidence is above this threshold:
+    # the 3.1.0 presets use 55 for FAST_ACCURACY and 15 for FAST_DENSITY.
+    confidence_threshold = _int_setting(args, "stereo_confidence_threshold", -1)
+    if confidence_threshold >= 0:
+        config.setConfidenceThreshold(confidence_threshold)
+    lr_check_threshold = _int_setting(args, "stereo_lr_check_threshold", -1)
+    if lr_check_threshold >= 0:
+        config.setLeftRightCheckThreshold(lr_check_threshold)
+
+    post = config.postProcessing
+    if getattr(args, "stereo_speckle_filter", False):
+        post.speckleFilter.enable = True
+        post.speckleFilter.speckleRange = int(args.stereo_speckle_range)
+        post.speckleFilter.differenceThreshold = int(args.stereo_speckle_difference_threshold)
+    if getattr(args, "stereo_spatial_filter", False):
+        post.spatialFilter.enable = True
+        post.spatialFilter.holeFillingRadius = int(args.stereo_spatial_hole_filling_radius)
+        post.spatialFilter.alpha = float(args.stereo_spatial_alpha)
+        post.spatialFilter.delta = int(args.stereo_spatial_delta)
+        post.spatialFilter.numIterations = int(args.stereo_spatial_iterations)
+    shaves = _int_setting(args, "stereo_postprocessing_shaves", 0)
+    memory_slices = _int_setting(args, "stereo_postprocessing_memory_slices", 0)
+    if shaves > 0:
+        stereo.setPostProcessingHardwareResources(shaves, memory_slices)
+
+    args.stereo_config_effective = {
+        "confidence_threshold": optional_call(config, "getConfidenceThreshold"),
+        "lr_check_threshold": optional_call(config, "getLeftRightCheckThreshold"),
+        "speckle_filter": {
+            "enable": _config_value(post, "speckleFilter.enable"),
+            "range": _config_value(post, "speckleFilter.speckleRange"),
+            "difference_threshold": _config_value(post, "speckleFilter.differenceThreshold"),
+        },
+        "spatial_filter": {
+            "enable": _config_value(post, "spatialFilter.enable"),
+            "hole_filling_radius": _config_value(post, "spatialFilter.holeFillingRadius"),
+            "alpha": _config_value(post, "spatialFilter.alpha"),
+            "delta": _config_value(post, "spatialFilter.delta"),
+            "iterations": _config_value(post, "spatialFilter.numIterations"),
+        },
+        "temporal_filter": {"enable": _config_value(post, "temporalFilter.enable")},
+        "decimation_factor": _config_value(post, "decimationFilter.decimationFactor"),
+        "threshold_filter_mm": {
+            "min": _config_value(post, "thresholdFilter.minRange"),
+            "max": _config_value(post, "thresholdFilter.maxRange"),
+        },
+        "postprocessing_resources": (
+            {"shaves": shaves, "memory_slices": memory_slices} if shaves > 0 else None
+        ),
+    }
+    effective = args.stereo_config_effective
+    print(
+        f"StereoDepth: preset={args.depth_preset}, "
+        f"confidence_threshold={effective['confidence_threshold']}, "
+        f"lr_check_threshold={effective['lr_check_threshold']}, "
+        f"speckle={effective['speckle_filter']['enable']}, "
+        f"spatial={effective['spatial_filter']['enable']}"
+    )
+
+
 def configure_pipeline(pipeline, args, sync_imu=True):
     require_depthai_v3()
 
@@ -2719,25 +2858,8 @@ def configure_pipeline(pipeline, args, sync_imu=True):
     )
     left_output = request_camera_output(mono_left, depth_fps, size=mono_size, frame_type=dai.ImgFrame.Type.GRAY8)
     right_output = request_camera_output(mono_right, depth_fps, size=mono_size, frame_type=dai.ImgFrame.Type.GRAY8)
-
-    stereo.setDefaultProfilePreset(enum_by_name(dai.node.StereoDepth.PresetMode, args.depth_preset))
-    stereo.setLeftRightCheck(args.lr_check)
-    stereo.setSubpixel(args.subpixel)
-    if args.subpixel:
-        stereo.setSubpixelFractionalBits(args.subpixel_fractional_bits)
-    median_filter_name = args.stereo_median_filter
-    if args.subpixel and args.subpixel_fractional_bits > 3 and median_filter_name != "off":
-        print("Stereo median filter disabled because subpixel fractional bits 4/5 do not support it.")
-        median_filter_name = "off"
-    median_filter = {
-        "off": dai.MedianFilter.MEDIAN_OFF,
-        "3x3": dai.MedianFilter.KERNEL_3x3,
-        "5x5": dai.MedianFilter.KERNEL_5x5,
-        "7x7": dai.MedianFilter.KERNEL_7x7,
-    }[median_filter_name]
-    stereo.initialConfig.setMedianFilter(median_filter)
-    args.stereo_median_filter_effective = median_filter_name
-    stereo.setExtendedDisparity(False)
+    configure_stereo_exposure((mono_left, mono_right), args, mono_size)
+    configure_stereo_depth(stereo, args)
     if effective_alignment == "image-align":
         image_align.setOutputSize(*rgb_size)
         if confidence_align is not None:

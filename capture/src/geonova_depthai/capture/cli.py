@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from .defaults import DEFAULTS
 from geonova_common.config_cli import SafeDefaultsHelpFormatter, parse_args_with_yaml
+from geonova_depthai.stereo_settings import validate_stereo_args
 
 
 # YAML compatibility only: these are no longer CLI options or runtime settings.
@@ -43,6 +44,24 @@ def png_compression_level(value):
     if number < 0 or number > 9:
         raise argparse.ArgumentTypeError("PNG compression must be 0..9")
     return number
+
+
+def int_in_range(low, high):
+    def parse(value):
+        number = int(value)
+        if number < low or number > high:
+            raise argparse.ArgumentTypeError(f"Value must be {low}..{high}")
+        return number
+    return parse
+
+
+def float_in_range(low, high):
+    def parse(value):
+        number = float(value)
+        if not low <= number <= high:
+            raise argparse.ArgumentTypeError(f"Value must be {low:g}..{high:g}")
+        return number
+    return parse
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -110,6 +129,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-subpixel", dest="subpixel", action="store_false", help="Disable subpixel disparity")
     parser.add_argument("--subpixel-fractional-bits", type=int, choices=[3, 4, 5], default=d["subpixel_fractional_bits"], help="Fractional disparity precision bits")
     parser.add_argument("--stereo-median-filter", choices=["off", "3x3", "5x5", "7x7"], default=d["stereo_median_filter"], help="Stereo disparity median-filter kernel")
+    parser.add_argument("--stereo-confidence-threshold", type=int_in_range(-1, 255), default=d["stereo_confidence_threshold"], help="Keep disparities above this confidence (DepthAI v3: lower keeps more pixels); -1 keeps the preset value")
+    parser.add_argument("--stereo-lr-check-threshold", type=int_in_range(-1, 128), default=d["stereo_lr_check_threshold"], help="Left-right check threshold; -1 keeps the preset value")
+    parser.add_argument("--stereo-speckle-filter", type=str2bool, nargs="?", const=True, default=d["stereo_speckle_filter"], help="Remove small disparity speckles on the device; false keeps the preset's choice")
+    parser.add_argument("--stereo-speckle-range", type=int_in_range(1, 240), default=d["stereo_speckle_range"], help="Speckle filter search range")
+    parser.add_argument("--stereo-speckle-difference-threshold", type=int_in_range(1, 16), default=d["stereo_speckle_difference_threshold"], help="Largest disparity step, in integer levels, within one speckle blob")
+    parser.add_argument("--stereo-spatial-filter", type=str2bool, nargs="?", const=True, default=d["stereo_spatial_filter"], help="Edge-preserving spatial filter with horizontal hole filling; false keeps the preset's choice")
+    parser.add_argument("--stereo-spatial-hole-filling-radius", type=int_in_range(0, 16), default=d["stereo_spatial_hole_filling_radius"], help="Spatial filter hole-filling search radius in pixels")
+    parser.add_argument("--stereo-spatial-alpha", type=float_in_range(0.0, 1.0), default=d["stereo_spatial_alpha"], help="Spatial filter smoothing; 1 means no smoothing")
+    parser.add_argument("--stereo-spatial-delta", type=int_in_range(0, 100), default=d["stereo_spatial_delta"], help="Spatial filter edge threshold; 0 is automatic (3 integer disparity levels)")
+    parser.add_argument("--stereo-spatial-iterations", type=int_in_range(1, 4), default=d["stereo_spatial_iterations"], help="Spatial filter passes")
+    parser.add_argument("--stereo-postprocessing-shaves", type=int_in_range(0, 6), default=d["stereo_postprocessing_shaves"], help="SHAVEs for stereo post-processing; 0 keeps the DepthAI default")
+    parser.add_argument("--stereo-postprocessing-memory-slices", type=int_in_range(0, 6), default=d["stereo_postprocessing_memory_slices"], help="Memory slices for stereo post-processing; 0 keeps the DepthAI default")
+    parser.add_argument("--stereo-ae-max-exposure-us", type=int_in_range(0, 100000), default=d["stereo_ae_max_exposure_us"], help="Longest auto-exposure time for both stereo cameras in microseconds; 0 keeps the DepthAI default")
+    parser.add_argument("--stereo-ae-region", default=d["stereo_ae_region"], help="Stereo auto-exposure region as x0,y0,x1,y1 fractions of the saved image; empty meters the whole frame")
     parser.add_argument("--imu-rate", type=int, default=d["imu_rate"], help="OAK IMU sampling rate in Hz")
     parser.add_argument("--imu-batch", type=int, default=d["imu_batch"], help="Maximum IMU reports batched per device message")
 
@@ -197,4 +230,8 @@ def parse_args(argv=None):
             ignored_environment_keys=tuple(key.upper() for key in REMOVED_CONFIG_KEYS),
         )
     )
+    try:
+        validate_stereo_args(args)
+    except ValueError as error:
+        parser.error(str(error))
     return apply_monitor_only_defaults(args)

@@ -286,6 +286,10 @@ class RawEventDataset:
                 "subpixel_fractional_bits": int(getattr(args, "subpixel_fractional_bits", 0) or 0),
                 "median_filter": getattr(args, "stereo_median_filter_effective", getattr(args, "stereo_median_filter", "")),
                 "extended_disparity": False,
+                # Read back from the configured StereoDepth node so the preset's
+                # thresholds and any enabled filters are on record.
+                **dict(getattr(args, "stereo_config_effective", None) or {}),
+                "auto_exposure": getattr(args, "stereo_auto_exposure_effective", None),
             },
             "depth_alignment": {
                 "enabled": True,

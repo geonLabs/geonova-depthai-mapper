@@ -88,6 +88,15 @@ def test_root_config_is_a_valid_capture_config() -> None:
     assert args.fps == 15.0
     assert args.depth_fps == 15.0
     assert (args.rgb_width, args.rgb_height) == (1920, 1200)
+    # Density-first preset; filters and exposure limits stay opt-in until
+    # a field run confirms depth still keeps 15 FPS.
+    assert args.depth_preset == "FAST_DENSITY"
+    assert (args.lr_check, args.subpixel, args.subpixel_fractional_bits) == (True, True, 5)
+    assert args.stereo_confidence_threshold == -1
+    assert args.stereo_speckle_filter is False
+    assert args.stereo_spatial_filter is False
+    assert args.stereo_ae_max_exposure_us == 0
+    assert args.stereo_ae_region == ""
 
 
 def test_removed_imu_config_and_environment_keys_are_ignored_once(tmp_path) -> None:
