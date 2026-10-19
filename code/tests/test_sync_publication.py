@@ -204,7 +204,8 @@ sync.build_synced_dataset(Path(sys.argv[2]), gps_max_delta_ms=25.0)
     def check_unsafe_links(self, kind):
         names = list(sync.SYNC_OUTPUT_FILES)
         names += [name + ".prev" for name in sync.SYNC_OUTPUT_FILES]
-        names += [sync.SYNC_INCOMPLETE, sync.SYNC_LOCK, ".timestamps.csv.crashed.tmp"]
+        names += [sync.SYNC_INCOMPLETE, sync.SYNC_LOCK, sync.SYNC_EPOCH,
+                  ".timestamps.csv.crashed.tmp", ".sync.epoch.crashed.tmp"]
         for interrupted in (False, True):
             for index, name in enumerate(names):
                 with self.subTest(kind=kind, interrupted=interrupted, name=name):
@@ -250,7 +251,7 @@ sync.build_synced_dataset(Path(sys.argv[2]), gps_max_delta_ms=25.0)
 
     def test_non_regular_outputs_and_backups_are_refused(self):
         dataset = self.make_raw()
-        for name in list(sync.SYNC_OUTPUT_FILES) + [name + ".prev" for name in sync.SYNC_OUTPUT_FILES]:
+        for name in list(sync.SYNC_OUTPUT_FILES) + [sync.SYNC_EPOCH] + [name + ".prev" for name in sync.SYNC_OUTPUT_FILES]:
             with self.subTest(name=name):
                 path = dataset / name
                 path.mkdir()
@@ -289,6 +290,39 @@ sync.build_synced_dataset(Path(sys.argv[2]), gps_max_delta_ms=25.0)
             generations.append(generation)
         self.assertEqual(len(set(generations)), 3)
 
+    def test_rollback_keeps_advanced_epoch_and_next_attempt_increments_again(self):
+        dataset = self.make_raw()
+        sync.build_synced_dataset(dataset)
+        old = self.outputs(dataset)
+        self.assertEqual((dataset / sync.SYNC_EPOCH).read_text().strip(), "1")
+        replace = sync.os.replace
+        failed = False
+
+        def fail_after_imu(source, destination):
+            nonlocal failed
+            replace(source, destination)
+            if destination.name == "imu.csv" and not failed:
+                failed = True
+                self.assertEqual((dataset / sync.SYNC_EPOCH).read_text().strip(), "2")
+                raise OSError("Rollback this publication")
+
+        with mock.patch.object(sync.os, "replace", side_effect=fail_after_imu):
+            with self.assertRaisesRegex(OSError, "Rollback this publication"):
+                sync.build_synced_dataset(dataset)
+        self.assertEqual(self.outputs(dataset), old)
+        self.assertEqual((dataset / sync.SYNC_EPOCH).read_text().strip(), "2")
+        # Recovery must never copy the previous generation's epoch back.
+        for name, data in old.items():
+            (dataset / (name + ".prev")).write_bytes(data)
+            (dataset / name).write_bytes(b"mixed output")
+        (dataset / sync.SYNC_INCOMPLETE).write_text("interrupted\n")
+        self.recover(dataset)
+        self.assertEqual(self.outputs(dataset), old)
+        self.assertEqual((dataset / sync.SYNC_EPOCH).read_text().strip(), "2")
+        sync.build_synced_dataset(dataset)
+        self.assertEqual((dataset / sync.SYNC_EPOCH).read_text().strip(), "3")
+        self.assert_clean(dataset)
+
     def test_durable_order_and_lock_through_cleanup(self):
         dataset = self.make_raw()
         sync.build_synced_dataset(dataset)
@@ -315,7 +349,12 @@ sync.build_synced_dataset(Path(sys.argv[2]), gps_max_delta_ms=25.0)
 
         def replaced(source, destination):
             self.assertIn(source.stat().st_ino, synced_inodes)
-            self.assertIn("publishing", events)
+            if destination.name == sync.SYNC_EPOCH:
+                self.assertIn("preparing", events)
+                self.assertNotIn("publishing", events)
+                self.assertTrue((dataset / sync.SYNC_INCOMPLETE).exists())
+            else:
+                self.assertIn("publishing", events)
             replace(source, destination)
             events.append(destination.name)
 
@@ -338,6 +377,9 @@ sync.build_synced_dataset(Path(sys.argv[2]), gps_max_delta_ms=25.0)
                         with mock.patch.object(Path, "unlink", unlinked):
                             sync.build_synced_dataset(dataset)
         self.assertEqual(events[:3], ["file-sync", "preparing", "directory-sync"])
+        epoch_swap = events.index(sync.SYNC_EPOCH)
+        self.assertEqual(events[epoch_swap - 1:epoch_swap + 2],
+                         ["file-sync", sync.SYNC_EPOCH, "directory-sync"])
         swaps = [event for event in events if event in sync.SYNC_OUTPUT_FILES]
         self.assertEqual(swaps, ["timestamps.csv", "imu.csv", "quality_report.json", "metadata.sync.json"])
         last_swap = events.index("metadata.sync.json")

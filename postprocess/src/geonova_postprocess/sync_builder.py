@@ -46,6 +46,7 @@ DEFAULT_GPS_MAX_DELTA_MS = 150.0
 SYNC_OUTPUT_FILES = ("timestamps.csv", "imu.csv", "quality_report.json", "metadata.sync.json")
 SYNC_INCOMPLETE = "sync.incomplete"
 SYNC_LOCK = "sync.lock"
+SYNC_EPOCH = "sync.epoch"
 RAW_EVENT_FORMATS = ("raw_events_v1", "synced_from_raw_events_v1")
 
 
@@ -120,9 +121,10 @@ def validate_sync_file(path):
 
 def validate_sync_paths(output_dir):
     # Validate the whole transaction before recovery, lock creation or cleanup.
-    for name in SYNC_OUTPUT_FILES:
+    for name in SYNC_OUTPUT_FILES + (SYNC_EPOCH,):
         validate_sync_file(output_dir / name)
-        validate_sync_file(output_dir / (name + ".prev"))
+        if name in SYNC_OUTPUT_FILES:
+            validate_sync_file(output_dir / (name + ".prev"))
         for temporary in output_dir.glob("." + name + ".*.tmp"):
             validate_sync_file(temporary)
     for name in (SYNC_INCOMPLETE, SYNC_LOCK):
@@ -199,6 +201,32 @@ def write_sync_state(file, state, previous=None):
     os.fsync(file.fileno())
 
 
+def bump_sync_epoch(output_dir):
+    """Caller holds sync.lock and sync.incomplete; never back up this counter."""
+    path = output_dir / SYNC_EPOCH
+    try:
+        epoch = int(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        epoch = 0
+    if epoch < 0:
+        raise ValueError("Invalid sync.epoch: expected a nonnegative integer")
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=str(output_dir),
+            prefix="." + SYNC_EPOCH + ".", suffix=".tmp", delete=False,
+        ) as file:
+            temporary = Path(file.name)
+            file.write(str(epoch + 1) + "\n")
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, path)
+        fsync_directory(output_dir)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def read_sync_state(output_dir):
     state, previous = None, None
     for line in (output_dir / SYNC_INCOMPLETE).read_text(encoding="utf-8").splitlines(keepends=True):
@@ -231,6 +259,8 @@ def finish_sync_generation(output_dir):
         (output_dir / (name + ".prev")).unlink(missing_ok=True)
         for temporary in output_dir.glob("." + name + ".*.tmp"):
             temporary.unlink(missing_ok=True)
+    for temporary in output_dir.glob("." + SYNC_EPOCH + ".*.tmp"):
+        temporary.unlink(missing_ok=True)
     fsync_directory(output_dir)
     (output_dir / SYNC_INCOMPLETE).unlink()
     fsync_directory(output_dir)
@@ -316,6 +346,9 @@ def write_sync_outputs(output_dir, timestamp_rows, synced_imu_rows, metadata):
             marker_created = True
             write_sync_state(file, "preparing", previous)
         fsync_directory(output_dir)
+        # Hold the marker before advancing the epoch: a reader that sees the
+        # new epoch must also see the marker, or the fully settled generation.
+        bump_sync_epoch(output_dir)
         for filename, fieldnames, payload in payloads:
             with tempfile.NamedTemporaryFile(
                 mode="w", encoding="utf-8", newline="", dir=str(output_dir),

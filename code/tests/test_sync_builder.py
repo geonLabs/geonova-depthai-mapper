@@ -33,9 +33,10 @@ def write_rows(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 def file_bytes(root):
-    # sync.lock is a permanent coordination entry, including after failed runs.
+    # Coordination entries persist/advance even after failed runs; epoch
+    # durability and rollback behavior have their own publication tests.
     return {p: p.read_bytes() for p in root.rglob("*")
-            if p.is_file() and p.name != "sync.lock"}
+            if p.is_file() and p.name not in ("sync.lock", "sync.epoch")}
 
 
 def make_dataset(tmp_path: Path, rgb_rows, depth_rows, imu_rows) -> Path:
@@ -279,6 +280,8 @@ class SyncSafetyTests(unittest.TestCase):
         replace = sync_builder.os.replace
 
         def record_replace(source, destination):
+            if destination.name == "sync.epoch":
+                return replace(source, destination)
             self.assertEqual(source.parent, dataset)
             self.assertTrue(source.name.startswith("." + destination.name + "."))
             self.assertTrue((dataset / "sync.incomplete").is_file())
@@ -309,7 +312,8 @@ class SyncSafetyTests(unittest.TestCase):
         self.assertEqual(sidecar["quality_report"], report)
         self.assertEqual(validate_capture(dataset)["state"], "complete")
         self.assertEqual({path for path in dataset.rglob("*") if path.is_file()},
-                         set(original) | {dataset / "sync.lock"} | {dataset / name for name in SYNC_OUTPUT_FILES})
+                         set(original) | {dataset / "sync.lock", dataset / "sync.epoch"}
+                         | {dataset / name for name in SYNC_OUTPUT_FILES})
 
     def test_existing_outputs_require_recognisable_raw_metadata(self):
         dataset = self.make_raw()
@@ -351,7 +355,7 @@ class SyncSafetyTests(unittest.TestCase):
 
         def fail_once(source, destination):
             nonlocal failed
-            if not failed:
+            if destination.name != "sync.epoch" and not failed:
                 failed = True
                 raise OSError("Interrupted before replace")
             return replace_output(source, destination)
@@ -360,7 +364,7 @@ class SyncSafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "Interrupted before replace"):
                 build_synced_dataset(dataset, gps_max_delta_ms=25.0)
 
-        self.assertEqual(replace.call_count, 5)  # Failed publication, then four fresh restorations.
+        self.assertEqual(replace.call_count, 6)  # Epoch, failed output swap, four restorations.
         self.assertEqual(file_bytes(dataset), original)
 
     def test_interrupted_serialization_keeps_all_previous_outputs(self):
@@ -386,10 +390,10 @@ class SyncSafetyTests(unittest.TestCase):
 
                 with mock.patch.object(sync_builder, "write_csv", side_effect=interrupt_csv):
                     with mock.patch.object(json, "dump", side_effect=interrupt_json):
-                        with mock.patch.object(sync_builder.os, "replace") as replace:
+                        with mock.patch.object(sync_builder.os, "replace", wraps=sync_builder.os.replace) as replace:
                             with self.assertRaisesRegex(OSError, "Interrupted write"):
                                 build_synced_dataset(dataset, gps_max_delta_ms=25.0)
-                replace.assert_not_called()
+                self.assertEqual([call.args[1].name for call in replace.call_args_list], ["sync.epoch"])
                 self.assertEqual(file_bytes(dataset), original)
 
     def test_each_failed_swap_restores_the_previous_generation(self):
@@ -410,6 +414,8 @@ class SyncSafetyTests(unittest.TestCase):
                     failed = False
                     def fail_swap(source, destination):
                         nonlocal failed
+                        if destination.name == "sync.epoch":
+                            return replace(source, destination)
                         self.assertTrue((dataset / "sync.incomplete").is_file())
                         for name in SYNC_OUTPUT_FILES[:previous_count]:
                             self.assertEqual((dataset / (name + ".prev")).read_bytes(), first_outputs[name])
@@ -436,10 +442,10 @@ class SyncSafetyTests(unittest.TestCase):
             return copy(source, destination)
 
         with mock.patch.object(sync_builder.shutil, "copy2", side_effect=fail_backup):
-            with mock.patch.object(sync_builder.os, "replace") as replace:
+            with mock.patch.object(sync_builder.os, "replace", wraps=sync_builder.os.replace) as replace:
                 with self.assertRaisesRegex(OSError, "Backup failed"):
                     build_synced_dataset(dataset)
-        replace.assert_not_called()
+        self.assertEqual([call.args[1].name for call in replace.call_args_list], ["sync.epoch"])
         self.assertEqual(file_bytes(dataset), original)
 
     def test_crash_after_each_swap_recovers_before_the_next_sync(self):
@@ -458,9 +464,10 @@ swaps = 0
 def crash(source, destination):
     global swaps
     replace(source, destination)
-    swaps += 1
-    if swaps == int(sys.argv[3]):
-        os._exit(87)
+    if destination.name in sync_builder.SYNC_OUTPUT_FILES:
+        swaps += 1
+        if swaps == int(sys.argv[3]):
+            os._exit(87)
 sync_builder.os.replace = crash
 sync_builder.build_synced_dataset(Path(sys.argv[2]), gps_max_delta_ms=25.0)
 """
@@ -676,7 +683,8 @@ sync_builder.build_synced_dataset(Path(sys.argv[2]), gps_max_delta_ms=25.0)
                         self.assertEqual(path.read_bytes(), content, str(path))
                     self.assertEqual(validate_capture(dataset)["state"], "complete")
                     self.assertEqual({p for p in dataset.rglob("*") if p.is_file()},
-                                     set(original) | {dataset / "sync.lock"} | {dataset / name for name in SYNC_OUTPUT_FILES})
+                                     set(original) | {dataset / "sync.lock", dataset / "sync.epoch"}
+                                     | {dataset / name for name in SYNC_OUTPUT_FILES})
 
     def test_legacy_synced_format_resyncs_through_both_entrypoints(self):
         dataset = self.make_raw()

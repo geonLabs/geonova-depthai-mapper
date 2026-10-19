@@ -12,6 +12,7 @@ for source in ("postprocess/src", "shared/src"):
     sys.path.insert(0, str(ROOT / source))
 
 from geonova_postprocess import dataset as geometry
+from geonova_postprocess import sync_builder as sync
 
 
 class DatasetSyncGenerationTests(unittest.TestCase):
@@ -68,6 +69,72 @@ class DatasetSyncGenerationTests(unittest.TestCase):
                 geometry.Dataset(self.root)
         self.assertEqual(len(generations), 3)
 
+    def test_rollback_between_checks_retries_even_when_generation_is_unchanged(self):
+        (self.root / "quality_report.json").write_text("{}", encoding="utf-8")
+        original = {name: (self.root / name).read_bytes() for name in sync.SYNC_OUTPUT_FILES}
+        read_csv, replace = geometry.read_csv, sync.os.replace
+        timestamp_reads, mixed_imu = [], []
+        failed = False
+
+        def replace_then_fail(source, destination):
+            nonlocal failed
+            replace(source, destination)
+            if destination.name == "imu.csv" and not failed:
+                failed = True
+                mixed_imu.extend(read_csv(destination))
+                raise OSError("Publication failed after IMU replacement")
+
+        def read_across_rollback(path):
+            if path.name == "timestamps.csv":
+                rows = read_csv(path)
+                timestamp_reads.append(rows)
+                return rows
+            if path.name == "imu.csv" and len(timestamp_reads) == 1:
+                with sync.sync_writer_lock(self.root):
+                    with patch.object(sync.os, "replace", side_effect=replace_then_fail):
+                        with self.assertRaisesRegex(OSError, "Publication failed"):
+                            sync.write_sync_outputs(
+                                self.root, [{"rgb_file": "new.png", "depth_file": "depth.png"}],
+                                [{"frame_index": 0, "message_index": "new"}], {"quality_report": {}},
+                            )
+                # Reader saw IMU B before the failed writer restored A. Both
+                # generation checks see A; only the epoch reveals the ABA.
+                return mixed_imu
+            return read_csv(path)
+
+        with patch.object(geometry, "read_csv", side_effect=read_across_rollback):
+            dataset = geometry.Dataset(self.root)
+        self.assertEqual(mixed_imu[0]["message_index"], "new")
+        self.assertEqual(len(timestamp_reads), 2)
+        self.assertEqual(dataset.sync_generation, "old")
+        self.assertEqual(dataset.sync_epoch, 1)
+        self.assertEqual(dataset.timestamps[0]["rgb_file"], "old.png")
+        self.assertEqual(dataset.imu_by_frame[0][0]["message_index"], "old")
+        self.assertEqual({name: (self.root / name).read_bytes() for name in sync.SYNC_OUTPUT_FILES}, original)
+
+    def test_old_synced_dataset_without_epoch_loads_as_epoch_zero(self):
+        self.assertFalse((self.root / "sync.epoch").exists())
+        dataset = geometry.Dataset(self.root)
+        self.assertEqual(dataset.sync_epoch, 0)
+        self.assertEqual(dataset.sync_generation, "old")
+        self.assertEqual(dataset.imu_by_frame[0][0]["message_index"], "old")
+
+    def test_repeated_epoch_changes_fail_after_bounded_retries(self):
+        read_csv = geometry.read_csv
+        epochs = []
+
+        def read_then_bump(path):
+            rows = read_csv(path)
+            if path.name == "timestamps.csv":
+                epochs.append(len(epochs) + 1)
+                (self.root / "sync.epoch").write_text(str(epochs[-1]), encoding="utf-8")
+            return rows
+
+        with patch.object(geometry, "read_csv", side_effect=read_then_bump):
+            with self.assertRaisesRegex(ValueError, "sync changed while loading"):
+                geometry.Dataset(self.root)
+        self.assertEqual(epochs, [1, 2, 3])
+
     def test_legacy_without_generation_still_checks_marker_after_reading(self):
         (self.root / "metadata.sync.json").write_text("{}", encoding="utf-8")
         self.assertIsNone(geometry.Dataset(self.root).sync_generation)
@@ -90,6 +157,15 @@ class DatasetSyncGenerationTests(unittest.TestCase):
             self.assertIsNot(old, new)
             self.assertEqual(new.sync_generation, "new")
             self.assertEqual(new.timestamps[0]["rgb_file"], "new.png")
+
+    def test_cached_dataset_reloads_after_epoch_changes_with_same_generation(self):
+        with patch.dict(geometry.DATASET_CACHE, {}, clear=True):
+            old = geometry.get_dataset(str(self.root))
+            (self.root / "sync.epoch").write_text("1\n", encoding="utf-8")
+            new = geometry.get_dataset(str(self.root))
+            self.assertIsNot(old, new)
+            self.assertEqual(new.sync_generation, old.sync_generation)
+            self.assertEqual(new.sync_epoch, 1)
 
 
 if __name__ == "__main__":

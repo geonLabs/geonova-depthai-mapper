@@ -95,7 +95,7 @@ def make_dataset(root, events, timestamp=1_000_000_000, metadata=None, gps_rows=
     if events:
         write_rows(root / "imu_events.csv", events)
     if gps_rows is None:
-        gps_rows = [{"sample_index": 0, "host_monotonic_ns": 1_000_000_000,
+        gps_rows = [{"sample_index": 0, "nmea_type": "RMC", "host_monotonic_ns": 1_000_000_000,
                      "course_deg": 35, "speed_knots": 10, "hdop": 0.5, "altitude_m": 100}]
     write_rows(root / "gps.csv", gps_rows)
     value = {"camera_model": {"intrinsics": [[500, 0, 320], [0, 500, 240], [0, 0, 1]],
@@ -107,13 +107,17 @@ def make_dataset(root, events, timestamp=1_000_000_000, metadata=None, gps_rows=
 
 
 def confirm_gps_stops(dataset, *windows):
-    """Add independent 10 Hz GPS speed reports, mapped through the synced clock."""
+    """Add RMC reports and stationary RTK positions, including a 1 s baseline."""
     row = dataset.timestamps[0]
     offset = int(row["frame_host_monotonic_ns"]) - int(row["rgb_device_ts_ns"])
     for start, end in windows:
         for timestamp in range(start, end + 1, 100_000_000):
-            dataset.gps_rows.append({"host_monotonic_ns": timestamp + offset,
+            dataset.gps_rows.append({"nmea_type": "RMC", "host_monotonic_ns": timestamp + offset,
                                      "speed_knots": 0, "hdop": 0.5, "position_valid": 1})
+        for timestamp in range(start - 1_000_000_000, end + 1, 100_000_000):
+            dataset.gps_rows.append({"nmea_type": "GGA", "host_monotonic_ns": timestamp + offset,
+                                     "latitude_deg": 37, "longitude_deg": 127,
+                                     "fix_quality": 4, "hdop": 0.5, "position_valid": 1})
 
 
 class CameraImuTests(unittest.TestCase):
@@ -283,9 +287,9 @@ class CameraImuTests(unittest.TestCase):
 
     def test_named_hdop_settings_control_trust_and_course_selection(self):
         gps = [
-            {"sample_index": 0, "host_monotonic_ns": 1_000_000_000, "course_deg": 10,
+            {"sample_index": 0, "nmea_type": "RMC", "host_monotonic_ns": 1_000_000_000, "course_deg": 10,
              "speed_knots": 10, "hdop": 2.2, "altitude_m": 100},
-            {"sample_index": 1, "host_monotonic_ns": 1_010_000_000, "course_deg": 60,
+            {"sample_index": 1, "nmea_type": "RMC", "host_monotonic_ns": 1_010_000_000, "course_deg": 60,
              "speed_knots": 10, "hdop": 0.7, "altitude_m": 100},
         ]
         dataset = make_dataset(self.root, [rv_row(1_000_000_000)], gps_rows=gps)
@@ -453,6 +457,94 @@ class CameraImuTests(unittest.TestCase):
                     result = self.summary(dataset)
                     self.assertFalse(result["trusted"])
                     self.assertLess(abs(result["pitch_deg"]), bound)
+
+    def test_rmc_dropout_during_twenty_second_ramp_cannot_certify_tilt(self):
+        events = [raw_row(1_000_000_000 + j * 10_000_000, [0, 1, 0]) for j in range(2701)]
+        for j, row in enumerate(events):
+            row["accel_z_m_s2"] = 2.0 * min(1.0, max(0.0, (j - 200) / 2000.0))
+        dataset = make_dataset(self.root, events, 28_000_000_000)
+        dataset.timestamps[0]["frame_host_monotonic_ns"] = 28_000_000_000
+        dataset.gps_rows = []
+        confirm_gps_stops(dataset, (1_000_000_000, 3_000_000_000))
+        # GGA keeps the last stopped RMC's speed/course while the vehicle moves.
+        for j in range(301, 2801, 10):
+            elapsed = (j - 300) / 100.0
+            distance = (elapsed ** 3 / 60.0 if elapsed <= 20 else
+                        400.0 / 3 + 20 * (elapsed - 20) + (elapsed - 20) ** 2)
+            position = geometry.enu_to_llh(37, 127, 100, 0, distance, 0)
+            dataset.gps_rows.append(dict(position, nmea_type="GGA", fix_quality=4, hdop=0.5,
+                                         host_monotonic_ns=j * 10_000_000,
+                                         speed_knots=0, course_deg=35, position_valid=1))
+        dataset.gps_rows.append({"sample_index": 0, "nmea_type": "RMC",
+                                 "host_monotonic_ns": 28_000_000_000, "speed_knots": 50,
+                                 "course_deg": 35, "hdop": 0.5})
+        dataset.gps_by_sample_index = {0: dataset.gps_rows[-1]}
+        dataset._index_gps()
+        result = self.summary(dataset)
+        self.assertFalse(result["trusted"])
+        self.assertLess(abs(result["pitch_deg"]), 7)
+        world = geometry.compute_world_coordinate(dataset, dataset.frame(0), 320, 240, 4000)
+        self.assertEqual(world["status"], "ok")
+        self.assertFalse(world["trusted"])
+
+    def test_gga_inherited_course_cannot_supply_yaw(self):
+        gps = [{"sample_index": 0, "nmea_type": "GGA", "host_monotonic_ns": 10_000_000_000,
+                "measurement_host_monotonic_ns": 10_000_000_000,
+                "speed_knots": 10, "course_deg": 150, "hdop": 0.5},
+               {"sample_index": 1, "nmea_type": "RMC", "host_monotonic_ns": 10_000_000_000,
+                "measurement_host_monotonic_ns": 1_000_000_000,
+                "speed_knots": 10, "course_deg": 35, "hdop": 0.5}]
+        dataset = make_dataset(self.root, [rv_row(1_000_000_000)], gps_rows=gps)
+        dataset.timestamps[0]["frame_host_monotonic_ns"] = 10_000_000_000
+        self.assertIsNone(geometry.resolve_course_for_frame(dataset, dataset.frame(0))["course_deg"])
+        self.assertIsNone(geometry.summarize_gps(dataset.gps_rows[0])["course_deg"])
+        self.assertIsNone(geometry.summarize_gps(dataset.gps_rows[0])["speed_knots"])
+        world = geometry.compute_world_coordinate(dataset, dataset.frame(0), 320, 240, 4000)
+        self.assertFalse(world["trusted"])
+        dataset.timestamps[0]["gps_sample_index"] = 1
+        self.assertIsNone(geometry.resolve_course_for_frame(dataset, dataset.frame(0))["course_deg"])
+        dataset.timestamps[0]["frame_host_monotonic_ns"] = 1_000_000_000
+        course = geometry.resolve_course_for_frame(dataset, dataset.frame(0))
+        self.assertEqual(course["course_deg"], 35)
+        self.assertEqual(course["delta_ms"], 0)
+
+    def test_gps_stop_requires_fresh_rmc_and_stationary_rtk_positions(self):
+        dataset = make_dataset(self.root, [], 4_000_000_000)
+        dataset.timestamps[0]["frame_host_monotonic_ns"] = 4_000_000_000
+        dataset.gps_rows = []
+        confirm_gps_stops(dataset, (1_000_000_000, 4_000_000_000))
+        settings = geometry.orientation_settings(dataset)
+
+        def stopped():
+            times, speeds = geometry._gps_speed_samples(dataset, settings)
+            return geometry._gps_confirms_still(4_000_000_000, times, speeds, settings)
+
+        self.assertTrue(stopped())
+        reports = dataset.gps_rows
+        for sentence in ("RMC", "GGA"):
+            dataset.gps_rows = [r for r in reports if r["nmea_type"] == sentence]
+            self.assertFalse(stopped())
+        dataset.gps_rows = reports
+        for row in reports:
+            if row["nmea_type"] == "GGA":
+                row["fix_quality"] = 1
+        self.assertFalse(stopped())
+        for row in reports:
+            if row["nmea_type"] == "GGA":
+                row["fix_quality"] = 4
+                seconds = row["host_monotonic_ns"] / 1e9
+                row["latitude_deg"] += seconds / 111000.0  # About 1 m/s despite fresh zero RMC speed.
+        self.assertFalse(stopped())
+        settings["imu_still_speed_m_s"] = 1.1
+        self.assertTrue(stopped())
+        settings["imu_still_speed_m_s"] = 0.2
+        for row in reports:
+            if row["nmea_type"] == "GGA":
+                row["latitude_deg"] = 37
+            else:
+                # A late receive time must not make an old RMC measurement fresh.
+                row["measurement_host_monotonic_ns"] = 1_000_000_000
+        self.assertFalse(stopped())
 
     def test_constant_velocity_recovers_after_gps_confirmed_initial_stop(self):
         events = [raw_row(1_000_000_000 + j * 10_000_000, [0, 1, 0]) for j in range(1701)]

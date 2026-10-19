@@ -101,6 +101,18 @@ def clamp(value, low, high):
     return max(low, min(high, value))
 
 
+def gps_measurement_time(row):
+    return safe_int(row.get("measurement_host_monotonic_ns"),
+                    safe_int(row.get("host_monotonic_ns"), None))
+
+
+def gps_rmc_motion(row):
+    # Capture carries the last RMC values into other sentence types.
+    if not row or row.get("nmea_type") != "RMC" or gps_measurement_time(row) is None:
+        return None, None
+    return safe_float(row.get("speed_knots")), safe_float(row.get("course_deg"))
+
+
 def metadata_image_size(metadata):
     size = (metadata or {}).get("image_size") or {}
     if isinstance(size, dict):
@@ -143,20 +155,24 @@ def _require_complete_sync(root):
 
 
 def _sync_state(root):
+    try:
+        epoch = int((root / "sync.epoch").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        epoch = 0
     incomplete = (root / "sync.incomplete").exists()
     if incomplete:
-        return True, None
+        return True, None, epoch
     path = root / "metadata.sync.json"
     generation = None
     if path.exists():
         with path.open(encoding="utf-8") as file:
             generation = json.load(file).get("generation")
-    return incomplete, generation
+    return incomplete, generation, epoch
 
 
 def _read_synced_rows(root):
     # The writer publishes metadata.sync.json last, with the marker held.
-    # Generation catches a complete publication between the two marker checks.
+    # Epoch also catches a failed publication that restores the same generation.
     for attempt in range(3):
         before = _sync_state(root)
         if not before[0]:
@@ -172,7 +188,7 @@ def _read_synced_rows(root):
             else:
                 after = _sync_state(root)
                 if not after[0] and before == after:
-                    return timestamps, imu, after[1]
+                    return timestamps, imu, after[1], after[2]
         if attempt < 2:
             time.sleep(0.02)
     _require_complete_sync(root)
@@ -185,7 +201,7 @@ class Dataset:
         timestamps_path = root / "timestamps.csv"
         metadata_path = root / "metadata.json"
 
-        self.timestamps, imu_rows, self.sync_generation = _read_synced_rows(root)
+        self.timestamps, imu_rows, self.sync_generation, self.sync_epoch = _read_synced_rows(root)
         self.imu_by_frame = {}
         for row in imu_rows:
             frame_index = safe_int(row.get("frame_index"), -1)
@@ -226,9 +242,8 @@ class Dataset:
         max_hdop = orientation_settings(self)["trajectory_max_hdop"]
         self._course_max_hdop = max_hdop
         for row in self.gps_rows:
-            host_ns = safe_int(row.get("host_monotonic_ns"), None)
-            course_deg = safe_float(row.get("course_deg"))
-            speed_knots = safe_float(row.get("speed_knots"))
+            host_ns = gps_measurement_time(row)
+            speed_knots, course_deg = gps_rmc_motion(row)
             hdop = safe_float(row.get("hdop"))
             if host_ns is None or course_deg is None or speed_knots is None:
                 continue
@@ -318,11 +333,12 @@ class Dataset:
 
 def get_dataset(path_text):
     root = resolve_path(path_text)
-    incomplete, generation = _sync_state(root)
+    incomplete, generation, epoch = _sync_state(root)
     key = str(root)
     with CACHE_LOCK:
         cached = DATASET_CACHE.get(key)
-        if not incomplete and cached is not None and cached.sync_generation == generation:
+        if (not incomplete and cached is not None
+                and (cached.sync_generation, cached.sync_epoch) == (generation, epoch)):
             DATASET_CACHE.move_to_end(key)
             return cached
 
@@ -397,6 +413,7 @@ def summarize_imu(rows):
 def summarize_gps(row):
     if not row:
         return None
+    speed_knots, course_deg = gps_rmc_motion(row)
     return {
         "sample_index": row.get("sample_index"),
         "nmea_type": row.get("nmea_type"),
@@ -414,8 +431,8 @@ def summarize_gps(row):
         "hdop": safe_float(row.get("hdop")),
         "differential_age_s": safe_float(row.get("differential_age_s")),
         "reference_station_id": row.get("reference_station_id"),
-        "speed_knots": safe_float(row.get("speed_knots")),
-        "course_deg": safe_float(row.get("course_deg")),
+        "speed_knots": speed_knots,
+        "course_deg": course_deg,
     }
 
 
@@ -567,18 +584,43 @@ def _gps_speed_samples(dataset, settings):
         return [], []
     offset = int(np.median(offsets))
     samples = {}
+    positions = {}
     for row in dataset.gps_rows:
-        host = safe_int(row.get("measurement_host_monotonic_ns"),
-                        safe_int(row.get("host_monotonic_ns"), None))
-        speed = safe_float(row.get("speed_knots"))
+        host = gps_measurement_time(row)
         hdop = safe_float(row.get("hdop"))
-        if (host is None or speed is None or speed < 0
+        if (host is None
                 or safe_bool(row.get("position_valid")) is False
                 or (hdop is not None and hdop > settings["trajectory_max_hdop"])):
             continue
-        # Conflicting samples at one time must not fabricate a stop.
         timestamp = host - offset
-        samples[timestamp] = max(samples.get(timestamp, 0), speed * 0.514444)
+        speed, _ = gps_rmc_motion(row)
+        if speed is not None and speed >= 0:
+            # Conflicting samples at one time must not fabricate a stop.
+            samples[timestamp] = max(samples.get(timestamp, 0), speed * 0.514444)
+        if row.get("nmea_type") == "GGA" and safe_int(row.get("fix_quality")) == 4:
+            lat = safe_float(row.get("latitude_deg"))
+            lon = safe_float(row.get("longitude_deg"))
+            if lat is not None and lon is not None and abs(lat) <= 90 and abs(lon) <= 180:
+                positions[timestamp] = (lat, lon)
+    position_times = sorted(positions)
+    # A low RMC speed alone is insufficient: require about one second of
+    # independent RTK displacement, with neither endpoint stale or too sparse.
+    for timestamp in samples:
+        end = bisect.bisect_right(position_times, timestamp) - 1
+        if end < 0 or timestamp - position_times[end] > 1_000_000_000:
+            samples[timestamp] = float("inf")
+            continue
+        end_time = position_times[end]
+        start = bisect.bisect_right(position_times, end_time - 1_000_000_000) - 1
+        if start < 0 or end_time - position_times[start] > 2_000_000_000:
+            samples[timestamp] = float("inf")
+            continue
+        start_time = position_times[start]
+        lat, lon = positions[start_time]
+        end_lat, end_lon = positions[end_time]
+        displacement = llh_to_enu(lat, lon, 0, end_lat, end_lon, 0)
+        position_speed = float(np.linalg.norm(displacement)) / ((end_time - start_time) / 1e9)
+        samples[timestamp] = max(samples[timestamp], position_speed)
     times = sorted(samples)
     return times, [samples[t] for t in times]
 
@@ -1207,11 +1249,13 @@ def resolve_course_for_frame(dataset, frame):
     row = frame["row"]
     frame_host_ns = safe_int(row.get("frame_host_monotonic_ns"), None)
     gps_row = frame.get("gps")
-    course_row = gps_row
+    course_row = gps_row if gps_rmc_motion(gps_row)[1] is not None else None
     course_source = "frame_gps"
-    course_delta_ms = None
-    course_deg = safe_float(course_row.get("course_deg")) if course_row else None
-    speed_knots = safe_float(course_row.get("speed_knots")) if course_row else None
+    course_delta_ms = ((gps_measurement_time(course_row) - frame_host_ns) / 1e6
+                       if course_row and frame_host_ns is not None else None)
+    speed_knots, course_deg = gps_rmc_motion(course_row)
+    if course_delta_ms is None or abs(course_delta_ms) > 5000:
+        course_row, speed_knots, course_deg = None, None, None
     speed_m_s = speed_knots * 0.514444 if speed_knots is not None else None
     hdop = safe_float(course_row.get("hdop")) if course_row else None
     weak = (
@@ -1226,8 +1270,7 @@ def resolve_course_for_frame(dataset, frame):
             course_row = replacement_row
             course_source = "nearest_moving_gps"
             course_delta_ms = replacement_delta_ms
-            course_deg = safe_float(course_row.get("course_deg"))
-            speed_knots = safe_float(course_row.get("speed_knots"))
+            speed_knots, course_deg = gps_rmc_motion(course_row)
             speed_m_s = speed_knots * 0.514444 if speed_knots is not None else None
             hdop = safe_float(course_row.get("hdop"))
     return {
