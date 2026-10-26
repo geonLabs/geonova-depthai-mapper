@@ -24,6 +24,18 @@ Controller가 전달한 `JETSON_PIPELINE_RESULTS_DIR`, `JETSON_PIPELINE_SENSOR_B
 
 원본에는 `rgb/`, `depth_mm/`, 선택적 `confidence/`, 이벤트 CSV, 센서 CSV, 카메라 보정정보가 있는 `metadata.json`이 포함됩니다. 파일 크기와 CSV/JSON 체크섬으로 불완전한 전송을 검사합니다. 이미지 전체 해시는 계산하지 않으므로 같은 크기의 이미지 손상까지 검출하는 기능은 아닙니다.
 
+## 카메라 해상도 자동 선택
+
+`rgb_width: 0`, `rgb_height: 0`이면 연결된 색 카메라의 지원 모드에서 요청 FPS와 상한을 만족하는 최대 면적을 고릅니다. 요청 FPS를 지원하는 각 모드에서 종횡비 오차 1% 이내의 축소 후보도 비교합니다. 장치에서 늘리지 않으며 초해상화는 서버에서 수행합니다. RGB와 정렬 Depth의 저장 크기는 같습니다. `depth_input_width: 0`, `depth_input_height: 0`은 캘리브레이션 좌우 카메라의 공통 입력 최대를 고르고 RVC2에서는 너비 1280까지 축소합니다.
+
+- `rgb_max_pixels: 0`: 기본 2,304,000화소(1920×1200). RGB 자동 선택 상한입니다.
+- `camera_stream_budget_mb_s: 0`: USB SUPER/SUPER_PLUS는 150 MB/s, HIGH/UNKNOWN 등은 30 MB/s입니다. USB와 Jetson 저장·인코딩 경로의 실측 상한을 함께 대신합니다. RGB NV12 + 정렬 uint16 Depth + 선택적 confidence를 계산하며 MJPEG 스트림은 원본의 1/4로 추정합니다. RVC2 confidence는 스테레오 입력 크기, ImageAlign 경로의 confidence는 RGB 크기로 계산합니다. 실제 처리량을 보장하는 값은 아닙니다.
+- 크기를 직접 지정하려면 폭·높이를 모두 양수로 설정합니다(예: `rgb_width: 1920`, `rgb_height: 1200`). RGB는 상한 초과 시 경고하고 지정값을 유지하며, 센서보다 큰 동일 종횡비 요청은 기존 장치 업스케일 경로를 사용합니다. RVC2에서 `depth_input_width`가 1280을 넘으면 오류입니다.
+
+새 키는 동일한 CLI 옵션(`--depth-input-width`, `--depth-input-height`, `--rgb-max-pixels`, `--camera-stream-budget-mb-s`)으로도 지정합니다. monitor-only도 RGB 설정을 따르며 Depth 없이 예산을 계산하고, 재접속마다 원래 요청값과 새 USB 속도로 다시 선택합니다. 자동 선택에서 보고된 모든 모드의 최대 FPS가 요청보다 낮으면 RGB·스테레오 모두 오류로 거부합니다. 오류에 역할·소켓·센서·요청 FPS·지원 최대 FPS와 `fps`/`depth_fps`를 낮추라는 안내가 표시됩니다. 최대 FPS 미보고(0) 모드는 허용하며, 명시 크기의 FPS 초과는 경고합니다. 축소해도 상한을 만족하는 후보가 없으면 오류입니다. 전체 연결 카메라, 역할, 선택·탈락 사유와 추정 전송률은 로그 및 `metadata.json`의 `camera_resolution`에 기록됩니다.
+
+크기와 화소 상한은 유한한 0 이상의 정수여야 합니다. `fps`는 유한한 양수, `depth_fps`는 유한한 0 이상의 값이며 0은 RGB FPS를 따릅니다. CLI와 YAML에 같은 검증을 적용합니다. Depth 정렬 시 RGB 너비 16 배수·높이 짝수, RVC2 MJPEG 너비 32 배수 검사는 보수적 정책입니다. 너비 32 배수는 [공식 문서](https://docs.luxonis.com/software-v3/depthai/depthai-components/nodes/video_encoder)의 H.264/H.265 항목에 있으며 MJPEG에도 보수적으로 적용합니다.
+
 ## 깊이(StereoDepth) 설정과 밀도 점검
 
 `depth_preset`이 confidence·LR-check 임계값을 정하고, `lr_check`·`subpixel`·`subpixel_fractional_bits`·`stereo_median_filter`는 프리셋 뒤에 항상 설정값으로 덮어씁니다. 확장 시차는 끕니다. DepthAI 3.1.0 RVC2에서 `FAST_ACCURACY`는 confidence 55·LR 5, `FAST_DENSITY`는 15·10이며 두 프리셋 모두 후처리 필터를 켜지 않습니다. v3에서는 confidence 값이 낮을수록 더 많은 픽셀을 남깁니다.

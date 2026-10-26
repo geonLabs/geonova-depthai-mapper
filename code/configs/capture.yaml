@@ -1,10 +1,14 @@
 # RGB-D/GPS/IMU 원시 이벤트 수집 설정입니다.
 # 없는 장치 포트와 NTRIP 값은 코드 기본값 또는 NTRIP_* 환경변수를 사용합니다.
 output_dir: ../data            # 타임스탬프별 *_raw 폴더가 만들어질 저장소 루트 데이터 폴더
-fps: 15.0                      # 1920x1200 RGB-D 저장 실측에서 안정적으로 유지되는 프레임률
+fps: 15.0                      # RGB와 Depth에 요청할 기본 프레임률
 depth_fps: 15                  # RGB와 같은 cadence로 요청해 인접 프레임 오매칭을 방지
-rgb_width: 1920                # OAK-D Pro W RGB 및 RGB 정렬 Depth 저장 폭
-rgb_height: 1200               # 저장 RGB와 aligned Depth가 동일한 픽셀 geometry 사용
+rgb_width: 0                   # 0=연결된 색 카메라의 최대 해상도. 장치에서 늘리지 않으며 초해상화는 서버에서 수행
+rgb_height: 0                  # 0=자동. RGB와 정렬 Depth는 같은 저장 크기 사용
+depth_input_width: 0           # 0=좌우 공통 최대 입력 폭. RVC2는 최대 1280
+depth_input_height: 0          # 0=좌우 공통 최대 입력 높이. 폭과 함께 지정
+rgb_max_pixels: 0              # 0=기본 2304000화소 상한. RGB 자동 선택에만 적용
+camera_stream_budget_mb_s: 0   # 0=USB SUPER/SUPER_PLUS 150 MB/s, 그 밖 30 MB/s. 자동 선택에만 적용
 max_runtime_s: 0               # 최대 수집 시간(초). 0이면 Ctrl-C까지 계속 수집
 exposure_settle_s: 3.0         # 카메라 시작 후 이 시간 동안 영상 프레임을 저장하지 않음(자동노출 수렴). IMU·GNSS는 계속 기록
 monitor_only: false            # true면 데이터셋 없이 저대역폭 센서 상태/프리뷰만 계속 게시

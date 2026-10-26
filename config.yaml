@@ -4,8 +4,12 @@
 output_dir: results
 fps: 15.0
 depth_fps: 15.0
-rgb_width: 1920
-rgb_height: 1200
+rgb_width: 0                   # 0=연결된 색 카메라의 최대 해상도. 장치에서 늘리지 않으며 초해상화는 서버에서 수행
+rgb_height: 0                  # 0=자동. RGB와 정렬 Depth는 같은 저장 크기 사용
+depth_input_width: 0           # 0=좌우 공통 최대 입력 폭. RVC2는 최대 1280
+depth_input_height: 0          # 0=좌우 공통 최대 입력 높이. 폭과 함께 지정
+rgb_max_pixels: 0              # 0=기본 2304000화소 상한. RGB 자동 선택에만 적용
+camera_stream_budget_mb_s: 0   # 0=USB SUPER/SUPER_PLUS 150 MB/s, 그 밖 30 MB/s. 자동 선택에만 적용
 max_runtime_s: 0.0
 exposure_settle_s: 3.0         # 시작 직후 과다노출 프레임을 저장하지 않음(9월 녹화는 처음 29~39프레임이 절반 이상 흰색). IMU·GNSS는 계속 기록
 monitor_only: false

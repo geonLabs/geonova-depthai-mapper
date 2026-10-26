@@ -222,6 +222,7 @@ class RawEventDataset:
                 "platform": getattr(args, "depthai_platform", "unknown"),
             },
             "camera_model": camera_model,
+            "camera_resolution": runtime.build_resolution_metadata(args),
             "stereo_depth_model": stereo_depth_model,
             "imu": getattr(args, "imu_metadata", None) or runtime.read_imu_metadata(None, args),
             "image_size": {"width": width, "height": height},

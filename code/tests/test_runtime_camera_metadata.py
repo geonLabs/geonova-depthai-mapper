@@ -116,7 +116,7 @@ def test_oak_d_lr_like_stereo_sensor_uses_rvc2_width_limit():
     )
 
     assert (width, height) == (1280, 800)
-    assert source == "sensor_aspect_platform_limit"
+    assert source == "scaled_to_platform_limit"
 
 
 def test_ov9282_stereo_sensor_prefers_full_800p_height():
@@ -125,7 +125,7 @@ def test_ov9282_stereo_sensor_prefers_full_800p_height():
     )
 
     assert (width, height) == (1280, 800)
-    assert source == "sensor_aspect_platform_limit"
+    assert source == "sensor_max"
 
 
 def test_ov9782_rgb_uses_full_sensor_before_uniform_1920x1200_upscale():
@@ -221,3 +221,90 @@ def test_rgb_upscale_rejects_aspect_ratio_change():
         assert "different aspect ratio" in str(error)
     else:
         raise AssertionError("geometry-changing RGB resize was accepted")
+
+
+def test_geo_resolution_runtime_records_all_roles_and_preserves_legacy_metadata(tmp_path, capsys):
+    from geonova_depthai.capture.cli import parse_args
+    from geonova_depthai.capture.raw_writer import RawEventDataset
+    import json
+
+    def feature(socket, name, sensor_type):
+        return SimpleNamespace(
+            socket=socket, sensorName=name, width=1280, height=800,
+            supportedTypes=[sensor_type], configs=[SimpleNamespace(
+                width=1280, height=800, minFps=1, maxFps=120, type=sensor_type,
+            )],
+        )
+
+    cameras = [feature(dai.CameraBoardSocket.CAM_A, "OV9782", dai.CameraSensorType.COLOR),
+               feature(dai.CameraBoardSocket.CAM_B, "OV9282", dai.CameraSensorType.MONO),
+               feature(dai.CameraBoardSocket.CAM_C, "OV9282", dai.CameraSensorType.MONO),
+               feature(dai.CameraBoardSocket.CAM_D, "extra", dai.CameraSensorType.MONO)]
+    device = SimpleNamespace(getConnectedCameraFeatures=lambda: cameras,
+                             getUsbSpeed=lambda: dai.UsbSpeed.SUPER)
+    args = parse_args(["--no-gps"])
+    args.depthai_platform = "RVC2"
+    runtime.resolve_transport_options(args, device)
+    size = runtime.resolve_rgb_output_size(device, args)
+    assert size == (1280, 800)
+    assert runtime.resolve_rgb_camera_output_size(args, size) == size
+    assert runtime.resolve_stereo_input_size(device, args, dai.Platform.RVC2,
+                                             dai.CameraBoardSocket.CAM_B, dai.CameraBoardSocket.CAM_C) == size
+    runtime.record_camera_resolution(device, args)
+    with_dataset = RawEventDataset(tmp_path, args, camera_model={"width": 1280, "height": 800},
+                                   stereo_depth_model={"width": 1280, "height": 800})
+    try:
+        metadata = json.loads((with_dataset.root / "metadata.json").read_text())
+    finally:
+        with_dataset.close()
+    resolution = metadata["camera_resolution"]
+    assert [c["role"] for c in resolution["cameras"]] == ["rgb", "stereo_left", "stereo_right", "unused"]
+    assert resolution["rgb"]["source"] == "sensor_max"
+    assert resolution["rgb"]["camera_output_size"] == {"width": 1280, "height": 800}
+    assert resolution["rgb"]["upscaled"] is False
+    assert resolution["stereo"]["width"] == 1280
+    assert resolution["aligned_depth_output"] == {"width": 1280, "height": 800}
+    assert resolution["estimated_stream_mb_s"] == 53.76
+    assert metadata["camera_model"]["width"] == metadata["stereo_depth_model"]["width"] == 1280
+    assert metadata["rgb_sensor"]["width"] == 1280
+    assert metadata["stereo_sensors"]["input_size"] == {"width": 1280, "height": 800}
+    assert metadata["depth_alignment"]["stereo_matching_input_size"] == {"width": 1280, "height": 800}
+    log = capsys.readouterr().out
+    assert "Camera CAM_A OV9782 max 1280x800 configs=1280x800@120 role=rgb" in log
+    assert "53.8 MB/s of 150 MB/s budget (SUPER)" in log
+
+
+def test_monitor_auto_resolves_usb_transport_before_size_and_never_upscales(monkeypatch):
+    from geonova_depthai.capture.cli import parse_args
+
+    feature = SimpleNamespace(socket=dai.CameraBoardSocket.CAM_A, sensorName="OV9782",
+                              width=1280, height=800, supportedTypes=[dai.CameraSensorType.COLOR])
+    device = SimpleNamespace(getConnectedCameraFeatures=lambda: [feature],
+                             getUsbSpeed=lambda: dai.UsbSpeed.HIGH, getPlatform=lambda: dai.Platform.RVC2)
+    camera = SimpleNamespace(build=lambda socket: "camera")
+    created = []
+    requested = []
+
+    def create(node):
+        created.append(node)
+        assert node == dai.node.Camera
+        return camera
+
+    def request(camera, fps, size, **kwargs):
+        requested.append(size)
+        return "rgb"
+
+    pipeline = SimpleNamespace(getDefaultDevice=lambda: device, create=create)
+    monkeypatch.setattr(runtime, "configure_oak_imu", lambda pipeline, args: None)
+    monkeypatch.setattr(runtime, "request_camera_output", request)
+    monkeypatch.setattr(runtime, "create_mjpeg_output", lambda pipeline, output, fps, quality: "mjpeg")
+    args = parse_args(["--monitor-only"])
+    outputs = runtime.configure_monitor_pipeline(pipeline, args)
+    assert outputs["rgb"] == "mjpeg"
+    assert requested == [(1280, 800)]
+    assert created == [dai.node.Camera]
+    assert args.rgb_transport_effective == "mjpeg"
+    assert args.usb_speed == "HIGH"
+    assert args.camera_resolution["rgb"]["upscaled"] is False
+    assert args.camera_resolution["estimated_stream_mb_s"] == 5.76
+    assert args.camera_resolution["aligned_depth_output"] is None

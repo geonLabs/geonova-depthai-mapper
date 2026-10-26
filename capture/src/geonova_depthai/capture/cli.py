@@ -1,10 +1,14 @@
 import argparse
+import math
 import os
 from types import SimpleNamespace
 
 from .defaults import DEFAULTS
 from geonova_common.config_cli import SafeDefaultsHelpFormatter, parse_args_with_yaml
 from geonova_depthai.stereo_settings import validate_stereo_args
+from geonova_depthai.camera_resolution import (
+    nonnegative_integer, resolution_limits, validate_frame_rate, validate_size,
+)
 
 
 # YAML compatibility only: these are no longer CLI options or runtime settings.
@@ -26,9 +30,30 @@ def str2bool(value):
 
 
 def nonnegative_float(value):
-    number = float(value)
-    if number < 0:
-        raise argparse.ArgumentTypeError("Value must be >= 0.")
+    try:
+        return validate_frame_rate(value, "Value", allow_zero=True)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error))
+
+
+def nonnegative_int(value):
+    try:
+        return nonnegative_integer(value, "Value")
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error))
+
+
+def positive_fps(value):
+    try:
+        return validate_frame_rate(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error))
+
+
+def stream_budget(value):
+    number = nonnegative_float(value)
+    if not math.isfinite(number):
+        raise argparse.ArgumentTypeError("Value must be finite.")
     return number
 
 
@@ -74,10 +99,14 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=SafeDefaultsHelpFormatter,
     )
     parser.add_argument("--output-dir", default=d["output_dir"], help="Parent directory for timestamped raw datasets")
-    parser.add_argument("--fps", type=float, default=d["fps"], help="Requested RGB-D frame rate in frames per second")
+    parser.add_argument("--fps", type=positive_fps, default=d["fps"], help="Requested RGB-D frame rate in frames per second")
     parser.add_argument("--depth-fps", type=nonnegative_float, default=d["depth_fps"], help="Requested stereo mono/depth frame rate; 0 follows --fps")
-    parser.add_argument("--rgb-width", type=int, default=d["rgb_width"], help="RGB output width; 0 selects automatically from the connected color sensor")
-    parser.add_argument("--rgb-height", type=int, default=d["rgb_height"], help="RGB output height; 0 selects automatically from the connected color sensor")
+    parser.add_argument("--rgb-width", type=nonnegative_int, default=d["rgb_width"], help="RGB output width; 0 selects automatically from the connected color sensor")
+    parser.add_argument("--rgb-height", type=nonnegative_int, default=d["rgb_height"], help="RGB output height; 0 selects automatically from the connected color sensor")
+    parser.add_argument("--depth-input-width", type=nonnegative_int, default=d["depth_input_width"], help="Stereo input width; 0 selects the largest common sensor size")
+    parser.add_argument("--depth-input-height", type=nonnegative_int, default=d["depth_input_height"], help="Stereo input height; 0 selects automatically")
+    parser.add_argument("--rgb-max-pixels", type=nonnegative_int, default=d["rgb_max_pixels"], help="Automatic RGB pixel limit; 0 uses 2304000")
+    parser.add_argument("--camera-stream-budget-mb-s", type=stream_budget, default=d["camera_stream_budget_mb_s"], help="Automatic stream budget in decimal MB/s; 0 uses 150 on USB SUPER/SUPER_PLUS, otherwise 30")
     parser.add_argument("--sync-threshold-ms", type=nonnegative_float, default=d["sync_threshold_ms"], help="Post-process pairing window; saved in metadata")
     parser.add_argument("--queue-size", type=int, default=d["queue_size"], help="Maximum pending writer tasks before capture backpressure")
     parser.add_argument("--writer-threads", type=int, default=d["writer_threads"], help="Background image encoder/writer workers")
@@ -205,19 +234,13 @@ def apply_monitor_only_defaults(args):
     if not getattr(args, "monitor_only", False):
         return args
 
-    # Monitor mode never persists RGB-D data.  Use the same 1920x1200 output
-    # geometry and cadence as capture so the Controller preview is genuinely
-    # representative.  OV9782 devices provide a physical 1280x800 frame; the
-    # monitor pipeline uniformly upscales that full-FOV 16:10 image on-device.
-    # Monitor mode has no depth stream, and constrained USB links keep using
-    # MJPEG transport, so this remains bounded on USB2.
+    # Preserve the capture resolution policy for a representative preview.
+    # Monitor mode has no depth stream; USB2 still uses MJPEG and its budget.
     args.controller_bridge_enabled = True
     args.allow_usb2 = True
     args.save_confidence_map = False
     args.fps = min(max(float(args.fps), 1.0), 15.0)
     args.depth_fps = 0.0
-    args.rgb_width = 1920
-    args.rgb_height = 1200
     args.controller_preview_max_width = 1920
     args.imu_rate = min(max(int(args.imu_rate), 1), 100)
     return args
@@ -233,6 +256,11 @@ def parse_args(argv=None):
     )
     try:
         validate_stereo_args(args)
+        validate_size(args.rgb_width, args.rgb_height, "rgb")
+        validate_size(args.depth_input_width, args.depth_input_height, "depth_input")
+        resolution_limits(args.rgb_max_pixels, args.camera_stream_budget_mb_s)
+        validate_frame_rate(args.fps)
+        validate_frame_rate(args.depth_fps, "depth_fps", allow_zero=True)
     except ValueError as error:
         parser.error(str(error))
     return apply_monitor_only_defaults(args)

@@ -87,7 +87,7 @@ def test_root_config_is_a_valid_capture_config() -> None:
     assert args.allow_usb2 is False
     assert args.fps == 15.0
     assert args.depth_fps == 15.0
-    assert (args.rgb_width, args.rgb_height) == (1920, 1200)
+    assert (args.rgb_width, args.rgb_height) == (0, 0)
     # Density-first preset; filters and exposure limits stay opt-in until
     # a field run confirms depth still keeps 15 FPS.
     assert args.depth_preset == "FAST_DENSITY"

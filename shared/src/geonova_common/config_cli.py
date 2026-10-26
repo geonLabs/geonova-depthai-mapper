@@ -157,7 +157,7 @@ def parse_args_with_yaml(
             action = actions[key]
             try:
                 converted[key] = _argument_value(action, value)
-            except (TypeError, ValueError) as exc:
+            except (TypeError, ValueError, argparse.ArgumentTypeError) as exc:
                 parser.error(str(exc))
             if value is not None:
                 action.required = False

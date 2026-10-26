@@ -71,7 +71,9 @@ def probe_args(metadata: dict, args: argparse.Namespace) -> SimpleNamespace:
 def read_frame_camera_model(device, args: SimpleNamespace) -> dict:
     with dai.Pipeline(device) as pipeline:
         device = pipeline.getDefaultDevice()
-        runtime.resolve_rgb_output_size(device, args, getattr(args, "rgb_socket", dai.CameraBoardSocket.CAM_A))
+        runtime.resolve_rgb_output_size(
+            device, args, getattr(args, "rgb_socket", dai.CameraBoardSocket.CAM_A), depth_enabled=False
+        )
         factory_model = runtime.read_camera_model_metadata(device, args)
         cam_rgb = pipeline.create(dai.node.Camera).build(args.rgb_socket)
         rgb_output = runtime.request_camera_output(

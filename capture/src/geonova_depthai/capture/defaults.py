@@ -20,6 +20,10 @@ DEFAULTS = {
     "depth_fps": 0.0,
     "rgb_width": 0,
     "rgb_height": 0,
+    "depth_input_width": 0,
+    "depth_input_height": 0,
+    "rgb_max_pixels": 0,
+    "camera_stream_budget_mb_s": 0.0,
     "sync_threshold_ms": 50.0,
     "queue_size": 16,
     "writer_threads": 4,
@@ -31,8 +35,7 @@ DEFAULTS = {
     "controller_status_interval_s": 1.0,
     "controller_sensor_stale_after_s": 3.0,
     "controller_preview_fps": 15.0,
-    # The largest RGB geometry produced by the capture pipeline is 1920 px.
-    # Keeping that width preserves sensor detail in the Controller preview;
+    # Keep up to 1920 px of the selected camera output in the Controller preview;
     # JPEG encoding runs off the capture thread and keeps only the latest frame.
     "controller_preview_max_width": 1920,
     "controller_preview_jpeg_quality": 78,

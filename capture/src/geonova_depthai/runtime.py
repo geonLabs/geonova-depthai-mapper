@@ -10,6 +10,7 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import cv2
 import depthai as dai
@@ -17,23 +18,16 @@ import numpy as np
 import serial
 
 from geonova_depthai.serial_devices import resolve_serial_device, resolve_serial_devices
+from geonova_depthai.camera_resolution import (
+    MAX_RVC2_STEREO_WIDTH, build_resolution_metadata, describe_camera,
+    select_rgb_size, select_stereo_size, validate_frame_rate,
+)
 from geonova_depthai.stereo_settings import parse_ae_region, sensor_ae_region, validate_stereo_args
 
 
 WIDTH = 1280
 HEIGHT = 720
 MIN_DEPTHAI_MAJOR = 3
-PREFERRED_RGB_SIZES = (
-    (1920, 1200),
-    (1920, 1080),
-    (WIDTH, HEIGHT),
-)
-MAX_RVC2_STEREO_WIDTH = 1280
-PREFERRED_STEREO_SIZES = (
-    (1280, 800),
-    (1280, 720),
-    (640, 400),
-)
 
 GPS_FIX_QUALITY_NAMES = {
     "0": "invalid",
@@ -356,55 +350,25 @@ def rgb_size_from_args(args):
 
 
 def resolve_depth_fps(args):
-    depth_fps = float(getattr(args, "depth_fps", 0.0) or 0.0)
-    if depth_fps < 0:
-        raise ValueError("depth_fps must be >= 0")
-    effective = depth_fps if depth_fps > 0 else float(args.fps)
+    fps = validate_frame_rate(args.fps)
+    depth_fps = validate_frame_rate(getattr(args, "depth_fps", 0.0), "depth_fps", allow_zero=True)
+    effective = depth_fps or fps
     args.depth_fps_effective = effective
     return effective
 
 
-def choose_rgb_output_size(sensor_width, sensor_height, candidates=PREFERRED_RGB_SIZES):
-    if sensor_width <= 0 or sensor_height <= 0:
-        return WIDTH, HEIGHT, "fallback_unknown_sensor"
-
-    fitting = [
-        (width, height)
-        for width, height in candidates
-        if width <= sensor_width and height <= sensor_height
-    ]
-    if not fitting:
-        return WIDTH, HEIGHT, "fallback_sensor_too_small"
-
-    sensor_aspect = sensor_width / sensor_height
-    width, height = min(
-        fitting,
-        key=lambda size: (abs((size[0] / size[1]) - sensor_aspect), -size[0] * size[1]),
-    )
-    return width, height, "sensor_aspect"
+def choose_rgb_output_size(sensor_width, sensor_height, candidates=None):
+    """Compatibility wrapper for callers with only the sensor maximum."""
+    feature = SimpleNamespace(width=sensor_width, height=sensor_height)
+    result = select_rgb_size(feature, usb_speed="SUPER")
+    return result["width"], result["height"], result["source"]
 
 
-def choose_stereo_input_size(sensor_width, sensor_height, platform, candidates=PREFERRED_STEREO_SIZES):
-    if sensor_width <= 0 or sensor_height <= 0:
-        return WIDTH, 800, "fallback_unknown_sensor"
-
-    max_width = MAX_RVC2_STEREO_WIDTH if platform == dai.Platform.RVC2 else sensor_width
-    fitting = [
-        (width, height)
-        for width, height in candidates
-        if width <= sensor_width and height <= sensor_height and width <= max_width
-    ]
-    if not fitting:
-        width = min(sensor_width, max_width)
-        height = max(1, int(round(width * sensor_height / sensor_width)))
-        return width, height, "scaled_to_platform_limit"
-
-    sensor_aspect = sensor_width / sensor_height
-    width, height = min(
-        fitting,
-        key=lambda size: (abs((size[0] / size[1]) - sensor_aspect), -size[0] * size[1]),
-    )
-    return width, height, "sensor_aspect_platform_limit"
+def choose_stereo_input_size(sensor_width, sensor_height, platform, candidates=None):
+    """Compatibility wrapper; connected-camera paths use both sensors' configs."""
+    feature = SimpleNamespace(width=sensor_width, height=sensor_height)
+    result = select_stereo_size(feature, feature, platform)
+    return result["width"], result["height"], result["source"]
 
 
 def resolve_stereo_sockets(device, preferred_left=None, preferred_right=None):
@@ -421,14 +385,27 @@ def resolve_stereo_sockets(device, preferred_left=None, preferred_right=None):
     return left_socket, right_socket
 
 
+def requested_size(args, prefix):
+    """Keep user intent separate from the output sizes updated on each connection."""
+    for dimension in ("width", "height"):
+        name = prefix + "_" + dimension
+        if not hasattr(args, name + "_requested"):
+            setattr(args, name + "_requested", getattr(args, name, 0))
+    return getattr(args, prefix + "_width_requested"), getattr(args, prefix + "_height_requested")
+
+
 def resolve_stereo_input_size(device, args, platform, left_socket, right_socket):
     left_feature = find_connected_camera_feature(device, left_socket)
     right_feature = find_connected_camera_feature(device, right_socket)
-    left_width, left_height = camera_feature_size(left_feature)
-    right_width, right_height = camera_feature_size(right_feature)
-    sensor_width = min(value for value in (left_width, right_width) if value > 0) if left_width or right_width else 0
-    sensor_height = min(value for value in (left_height, right_height) if value > 0) if left_height or right_height else 0
-    width, height, source = choose_stereo_input_size(sensor_width, sensor_height, platform)
+    requested_width, requested_height = requested_size(args, "depth_input")
+    result = select_stereo_size(
+        left_feature, right_feature, platform, resolve_depth_fps(args),
+        width=requested_width, height=requested_height,
+    )
+    width, height, source = result["width"], result["height"], result["source"]
+    args.stereo_resolution_decision = result
+    for warning in result["warnings"]:
+        print("Warning: " + warning)
 
     args.left_socket = left_socket
     args.right_socket = right_socket
@@ -442,7 +419,7 @@ def resolve_stereo_input_size(device, args, platform, left_socket, right_socket)
 
     print(
         f"Stereo input size: {width}x{height} "
-        f"(source={source}, left={args.left_socket_name} "
+        f"(source={source}, reason={result['reason']}, left={args.left_socket_name} "
         f"{args.left_sensor.get('name') or 'unknown'} "
         f"{args.left_sensor.get('width')}x{args.left_sensor.get('height')}, "
         f"right={args.right_socket_name} "
@@ -466,25 +443,53 @@ def set_device_identity_metadata(device, args):
             args.depthai_device_id = ""
 
 
-def resolve_rgb_output_size(device, args, color_socket=None):
+def resolve_rgb_output_size(device, args, color_socket=None, depth_enabled=None):
+    if transport_options_need_resolution(args, device):
+        resolve_transport_options(args, device)
+    if not hasattr(args, "depthai_platform"):
+        try:
+            args.depthai_platform = enum_name(device.getPlatform())
+        except Exception:
+            args.depthai_platform = "unknown"
     color_socket = color_socket or dai.CameraBoardSocket.CAM_A
-    configured_width = int(getattr(args, "rgb_width", 0) or 0)
-    configured_height = int(getattr(args, "rgb_height", 0) or 0)
-    if configured_width < 0 or configured_height < 0:
-        raise ValueError("rgb_width/rgb_height must be >= 0")
-    if bool(configured_width) != bool(configured_height):
-        raise ValueError("Set both rgb_width and rgb_height, or set both to 0 for auto")
+    configured_width, configured_height = requested_size(args, "rgb")
     feature = select_color_camera_feature(device, color_socket)
     actual_socket = getattr(feature, "socket", color_socket) if feature is not None else color_socket
     sensor_width, sensor_height = camera_feature_size(feature) if feature is not None else (0, 0)
     sensor_name = getattr(feature, "sensorName", "") if feature is not None else ""
     sensor_types = camera_feature_type_names(feature) if feature is not None else []
 
-    if configured_width > 0 and configured_height > 0:
-        width, height = configured_width, configured_height
-        source = "configured"
-    else:
-        width, height, source = choose_rgb_output_size(sensor_width, sensor_height)
+    if depth_enabled is None:
+        depth_enabled = not getattr(args, "monitor_only", False)
+    # StereoDepth.confidenceMap remains at stereo input size. Only the separate
+    # ImageAlign confidence node produces RGB-sized confidence frames.
+    confidence_size = None
+    alignment = getattr(args, "depth_alignment_effective", getattr(args, "depth_alignment_mode", "auto"))
+    image_align = alignment == "image-align" or (alignment == "auto" and args.depthai_platform == "RVC4")
+    if depth_enabled and getattr(args, "save_confidence_map", False) and not image_align:
+        stereo = getattr(args, "stereo_resolution_decision", {})
+        if not stereo:
+            left_socket, right_socket = resolve_stereo_sockets(
+                device, getattr(args, "left_socket", None), getattr(args, "right_socket", None))
+            resolve_stereo_input_size(device, args, args.depthai_platform, left_socket, right_socket)
+        confidence_size = (args.depth_input_width, args.depth_input_height)
+    result = select_rgb_size(
+        feature, fps=float(getattr(args, "fps", 15.0)),
+        depth_fps=resolve_depth_fps(args) if depth_enabled else None,
+        width=configured_width, height=configured_height,
+        rgb_max_pixels=getattr(args, "rgb_max_pixels", 0),
+        stream_budget_mb_s=getattr(args, "camera_stream_budget_mb_s", 0),
+        usb_speed=getattr(args, "usb_speed", "UNKNOWN"),
+        rgb_transport=getattr(args, "rgb_transport_effective", "raw"),
+        confidence_transport=getattr(args, "confidence_transport_effective", "raw"),
+        depth_enabled=depth_enabled, save_confidence_map=getattr(args, "save_confidence_map", False),
+        platform=getattr(args, "depthai_platform", "RVC2"),
+        confidence_size=confidence_size,
+    )
+    width, height, source = result["width"], result["height"], result["source"]
+    args.rgb_resolution_decision = result
+    for warning in result["warnings"]:
+        print("Warning: " + warning)
 
     args.rgb_width = width
     args.rgb_height = height
@@ -503,7 +508,7 @@ def resolve_rgb_output_size(device, args, color_socket=None):
     )
     print(
         f"RGB output size: {width}x{height} "
-        f"(source={source}, socket={args.rgb_socket_name}, sensor={sensor_text})"
+        f"(source={source}, reason={result['reason']}, socket={args.rgb_socket_name}, sensor={sensor_text})"
     )
     if sensor_types and "COLOR" not in sensor_types:
         print(f"Warning: {args.rgb_socket_name} sensor types are {sensor_types}, not COLOR.")
@@ -545,6 +550,33 @@ def resolve_rgb_camera_output_size(args, requested_size):
     args.rgb_camera_height = camera_height
     args.rgb_camera_resolution_source = source
     return camera_width, camera_height
+
+
+def record_camera_resolution(device, args, stereo_enabled=True):
+    """Log every connected camera once the calibrated role sockets are known."""
+    roles = {getattr(args, "rgb_socket_name", "CAM_A"): "rgb"}
+    if stereo_enabled:
+        roles[getattr(args, "left_socket_name", "CAM_B")] = "stereo_left"
+        roles[getattr(args, "right_socket_name", "CAM_C")] = "stereo_right"
+    cameras = []
+    for feature in connected_camera_features(device):
+        camera = describe_camera(feature)
+        camera["role"] = roles.get(camera["socket"], "unused")
+        cameras.append(camera)
+        configs = list(dict.fromkeys(
+            "{width}x{height}@{max_fps:g}".format(**c) for c in camera["configs"]
+        ))
+        print("Camera {socket} {name} max {width}x{height} configs={configs} role={role}".format(
+            **dict(camera, configs=",".join(configs) or "unreported")
+        ))
+    args.connected_camera_metadata = cameras
+    args.camera_resolution = build_resolution_metadata(args)
+    decision = getattr(args, "rgb_resolution_decision", {})
+    if decision:
+        print("Camera stream estimate: {0:.1f} MB/s of {1:g} MB/s budget ({2})".format(
+            decision["estimated_stream_mb_s"], decision["limits"]["stream_budget_mb_s"],
+            getattr(args, "usb_speed", "UNKNOWN"),
+        ))
 
 
 def resize_camera_output(pipeline, camera_output, source_size, target_size):
@@ -2481,18 +2513,26 @@ def connect_depthai_device(args):
     )
 
 
+def transport_options_need_resolution(args, device):
+    speed = enum_name(getattr(args, "usb_speed", "UNKNOWN"))
+    return (getattr(args, "rgb_transport_effective", "auto") == "auto"
+            or speed == "UNKNOWN" or speed != usb_speed_name(device))
+
+
 def resolve_transport_options(args, device):
     speed_name = usb_speed_name(device)
 
     constrained_usb = speed_name in ("LOW", "FULL", "HIGH", "UNKNOWN")
+    rgb_transport = getattr(args, "rgb_transport", getattr(args, "rgb_transport_effective", "auto"))
+    confidence_transport = getattr(args, "confidence_transport", "auto")
     args.usb_speed = speed_name
     args.rgb_transport_effective = (
-        "mjpeg" if args.rgb_transport == "auto" and constrained_usb else args.rgb_transport
+        "mjpeg" if rgb_transport == "auto" and constrained_usb else rgb_transport
     )
     args.confidence_transport_effective = (
         "mjpeg"
-        if args.confidence_transport == "auto" and constrained_usb
-        else args.confidence_transport
+        if confidence_transport == "auto" and constrained_usb
+        else confidence_transport
     )
     if args.rgb_transport_effective == "auto":
         args.rgb_transport_effective = "raw"
@@ -2502,7 +2542,7 @@ def resolve_transport_options(args, device):
     print(
         f"DepthAI USB speed: {speed_name}; transports "
         f"rgb={args.rgb_transport_effective}, "
-        f"confidence={args.confidence_transport_effective if args.save_confidence_map else 'disabled'}"
+        f"confidence={args.confidence_transport_effective if getattr(args, 'save_confidence_map', False) else 'disabled'}"
     )
     if constrained_usb:
         print("USB 2.0-class link detected; using compressed image transport to prevent RGB starvation.")
@@ -2601,12 +2641,15 @@ def configure_oak_imu(pipeline, args):
 
 def configure_monitor_pipeline(pipeline, args):
     """Build the low-bandwidth RGB + OAK IMU pipeline used by --monitor-only."""
+    args.monitor_only = True
     require_depthai_v3()
     args.rgb_undistort = True
     args.rgb_undistort_effective = True
 
     device = pipeline.getDefaultDevice()
     set_device_identity_metadata(device, args)
+    if transport_options_need_resolution(args, device):
+        resolve_transport_options(args, device)
     try:
         args.depthai_platform = enum_name(device.getPlatform())
     except Exception:
@@ -2614,6 +2657,7 @@ def configure_monitor_pipeline(pipeline, args):
     rgb_size = resolve_rgb_output_size(device, args)
     rgb_camera_size = resolve_rgb_camera_output_size(args, rgb_size)
     color_socket = getattr(args, "rgb_socket", dai.CameraBoardSocket.CAM_A)
+    record_camera_resolution(device, args, stereo_enabled=False)
 
     camera = pipeline.create(dai.node.Camera).build(color_socket)
     rgb_output = request_camera_output(
@@ -2791,9 +2835,10 @@ def configure_pipeline(pipeline, args, sync_imu=True):
 
     device = pipeline.getDefaultDevice()
     set_device_identity_metadata(device, args)
+    if transport_options_need_resolution(args, device):
+        resolve_transport_options(args, device)
     platform = device.getPlatform()
-    rgb_size = resolve_rgb_output_size(device, args)
-    rgb_camera_size = resolve_rgb_camera_output_size(args, rgb_size)
+    args.depthai_platform = enum_name(platform)
     depth_fps = resolve_depth_fps(args)
     requested_alignment = args.depth_alignment_mode
     if requested_alignment == "auto":
@@ -2822,13 +2867,16 @@ def configure_pipeline(pipeline, args, sync_imu=True):
             "limited by the RGB alignment stream cadence."
         )
 
-    color_socket = getattr(args, "rgb_socket", dai.CameraBoardSocket.CAM_A)
     left_socket, right_socket = resolve_stereo_sockets(
         device,
         getattr(args, "left_socket", None),
         getattr(args, "right_socket", None),
     )
     mono_size = resolve_stereo_input_size(device, args, platform, left_socket, right_socket)
+    rgb_size = resolve_rgb_output_size(device, args)
+    rgb_camera_size = resolve_rgb_camera_output_size(args, rgb_size)
+    color_socket = getattr(args, "rgb_socket", dai.CameraBoardSocket.CAM_A)
+    record_camera_resolution(device, args)
 
     cam_rgb = pipeline.create(dai.node.Camera).build(color_socket)
     mono_left = pipeline.create(dai.node.Camera).build(left_socket)

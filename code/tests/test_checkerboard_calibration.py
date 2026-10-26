@@ -150,7 +150,8 @@ def capture_live(args: argparse.Namespace, pattern: tuple[int, int]):
         else:
             args.rgb_width = 0
             args.rgb_height = 0
-        args.width, args.height = runtime.resolve_rgb_output_size(device, args)
+        args.rgb_transport_effective = "raw"
+        args.width, args.height = runtime.resolve_rgb_output_size(device, args, depth_enabled=False)
         camera = pipeline.create(dai.node.Camera).build(
             getattr(args, "rgb_socket", dai.CameraBoardSocket.CAM_A)
         )
