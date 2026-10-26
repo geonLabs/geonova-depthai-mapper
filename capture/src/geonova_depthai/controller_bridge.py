@@ -104,6 +104,7 @@ class ControllerBridge:
         self._last_preview_epoch_ms = None
         self._preview_error = None
         self._next_preview_monotonic = 0.0
+        self._monotonic = time.monotonic
         self._last_status_monotonic = 0.0
         self._pending_rgb = None
         self._preview_thread = None
@@ -163,7 +164,7 @@ class ControllerBridge:
             self.publish()
 
     def offer_rgb(self, message):
-        now_monotonic = time.monotonic()
+        now_monotonic = self._monotonic()
         now_epoch_ms = int(time.time() * 1000)
         with self._condition:
             self._last_camera_monotonic = now_monotonic
@@ -179,12 +180,21 @@ class ControllerBridge:
                     self._camera_height = height
             except Exception:
                 pass
+            if self._preview_thread is not None and self.preview_fps > 0:
+                preview_period = 1.0 / self.preview_fps
+                preview_tolerance = preview_period * 0.1
+            else:
+                preview_period = None
+                preview_tolerance = 0.0
             if (
-                self._preview_thread is not None
-                and now_monotonic >= self._next_preview_monotonic
+                preview_period is not None
+                and now_monotonic + preview_tolerance >= self._next_preview_monotonic
             ):
                 self._pending_rgb = message
-                self._next_preview_monotonic = now_monotonic + 1.0 / self.preview_fps
+                next_preview = self._next_preview_monotonic + preview_period
+                if now_monotonic - self._next_preview_monotonic > preview_period:
+                    next_preview = now_monotonic + preview_period
+                self._next_preview_monotonic = next_preview
                 self._condition.notify_all()
 
     def configure_imu(self, enabled, error=None):

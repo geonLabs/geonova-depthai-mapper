@@ -25,6 +25,21 @@ def bridge_args(root: Path, preview_fps=0.0, status_interval_s=1.0):
     )
 
 
+def preview_acceptance_count(bridge, timestamps):
+    clock = [0.0]
+    bridge._monotonic = lambda: clock[0]
+    bridge._preview_thread = object()
+    message = SimpleNamespace(getWidth=lambda: 640, getHeight=lambda: 480)
+    accepted = 0
+    for timestamp in timestamps:
+        clock[0] = timestamp
+        bridge.offer_rgb(message)
+        if bridge._pending_rgb is message:
+            accepted += 1
+            bridge._pending_rgb = None
+    return accepted
+
+
 class FakeNtrip:
     connected = True
     current_mountpoint = "TEST-RTCM31"
@@ -139,6 +154,56 @@ def test_bridge_heartbeat_continues_during_transient_camera_failure(tmp_path):
     assert current["pipeline"]["error"] == "camera temporarily missing"
     assert current["gnss"]["connected"] is True
     bridge.close({"gps": gps})
+
+
+def test_preview_rate_handles_jitter_and_respects_configured_cap(tmp_path):
+    args = bridge_args(tmp_path, preview_fps=15.0)
+    args.controller_bridge_enabled = False
+    bridge = ControllerBridge(args)
+    period = 1.0 / 15.0
+    timestamps = [100.0]
+    timestamps.extend(
+        100.0 + index * period + (-0.005 if index % 2 else 0.005)
+        for index in range(1, 151)
+    )
+
+    assert preview_acceptance_count(bridge, timestamps) >= 149
+
+    bridge.preview_fps = 5.0
+    capped = preview_acceptance_count(
+        bridge, [200.0 + index * period for index in range(451)]
+    )
+    assert 4.9 <= (capped - 1) / 30.0 <= 5.1
+
+
+def test_preview_rate_disabled_and_recovers_after_camera_gap(tmp_path):
+    args = bridge_args(tmp_path, preview_fps=0.0)
+    args.controller_bridge_enabled = False
+    disabled = ControllerBridge(args)
+    disabled._monotonic = lambda: 1.0
+    disabled.offer_rgb(SimpleNamespace(getWidth=lambda: 640, getHeight=lambda: 480))
+    assert disabled._preview_thread is None
+    assert disabled._pending_rgb is None
+
+    args.controller_preview_fps = 15.0
+    bridge = ControllerBridge(args)
+    clock = [100.0]
+    bridge._monotonic = lambda: clock[0]
+    bridge._preview_thread = object()
+    message = SimpleNamespace(getWidth=lambda: 640, getHeight=lambda: 480)
+
+    def offer(timestamp):
+        clock[0] = timestamp
+        bridge.offer_rgb(message)
+        accepted = bridge._pending_rgb is message
+        bridge._pending_rgb = None
+        return accepted
+
+    assert offer(100.0)
+    gap_frame = 102.0
+    assert offer(gap_frame)
+    assert not offer(gap_frame + 1.0 / 30.0)
+    assert offer(gap_frame + 1.0 / 15.0)
 
 
 def test_imu_status_requires_oak_packets_and_expires_at_freshness_window(tmp_path, monkeypatch):
