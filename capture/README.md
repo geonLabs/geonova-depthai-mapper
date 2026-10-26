@@ -63,7 +63,7 @@ Controller가 전달한 `JETSON_PIPELINE_RESULTS_DIR`, `JETSON_PIPELINE_SENSOR_B
 
 `--allow-usb2`를 켜면 USB 3 연결 시작에 실패했을 때 `usb3_retries` 횟수만큼 USB 3 재시도한 뒤 USB 2 연결을 한 번 시도합니다. 기본 `usb3_retries`는 2입니다.
 
-NTRIP 계정은 `NTRIP_USERNAME`, `NTRIP_PASSWORD` 환경변수로 주입합니다. 앱의 모바일 RTK relay 플래그 자체를 새로운 TCP endpoint로 해석하지 않습니다. 기존 네트워크/NTRIP 구성과 Controller 센서 인계 설정을 사용하고 실기에서 확인합니다.
+NTRIP 계정은 `NTRIP_USERNAME`, `NTRIP_PASSWORD` 환경변수로 주입합니다. 기준국 선택 방식, RTS-1·RTS-3 YAML 프로필, 모바일 중계 주소 우선순위와 RTCM 진단은 [NTRIP 설정](NTRIP.md)을 참고합니다.
 
 `environment.freeze.txt`와 `environment.json`은 설치 후 생성되는 장치 환경 기록입니다. 앱은 패키지 설치·모델 다운로드를 수행하지 않습니다. 변경한 소스를 적용하려면 앱에서 재등록해 새 실행 스냅샷을 만듭니다.
 

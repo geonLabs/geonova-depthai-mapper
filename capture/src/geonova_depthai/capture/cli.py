@@ -1,6 +1,7 @@
 import argparse
 import math
 import os
+import sys
 from types import SimpleNamespace
 
 from .defaults import DEFAULTS
@@ -193,13 +194,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rtk-ntrip-host", default=os.getenv("NTRIP_HOST", d["rtk_ntrip_host"]), help="NTRIP caster hostname")
     parser.add_argument("--rtk-ntrip-port", type=int, default=int(os.getenv("NTRIP_PORT", d["rtk_ntrip_port"])), help="NTRIP caster TCP port")
     parser.add_argument("--rtk-ntrip-mountpoint", default=os.getenv("NTRIP_MOUNTPOINT", d["rtk_ntrip_mountpoint"]), help="NTRIP correction mountpoint")
+    parser.add_argument("--rtk-ntrip-selection", choices=["client", "caster"], default=d["rtk_ntrip_selection"], help="Select the base station in the client or let the caster select it using GGA")
     parser.add_argument("--rtk-ntrip-auto-mountpoint", type=str2bool, nargs="?", const=True, default=d["rtk_ntrip_auto_mountpoint"], help="Choose the nearest NTRIP mountpoint from the caster source table after GPS position is known")
     parser.add_argument("--rtk-ntrip-mountpoint-format", default=d["rtk_ntrip_mountpoint_format"], help="Mountpoint suffix/format to auto-select, such as RTCM31")
+    parser.add_argument("--rtk-ntrip-required-messages", type=int, nargs="*", default=d["rtk_ntrip_required_messages"], help="Require all these RTCM message numbers in source-table format details")
     parser.add_argument("--rtk-ntrip-mountpoint-candidates", default=d["rtk_ntrip_mountpoint_candidates"], help="Comma-separated fallback mountpoints to try when auto-selection has no position/source table")
-    parser.add_argument("--rtk-ntrip-username", default=os.getenv("NTRIP_USERNAME", d["rtk_ntrip_username"]), help="NTRIP username; prefer NTRIP_USERNAME environment variable")
-    parser.add_argument("--rtk-ntrip-password", default=os.getenv("NTRIP_PASSWORD", d["rtk_ntrip_password"]), help="NTRIP password; prefer NTRIP_PASSWORD environment variable")
+    parser.add_argument("--rtk-ntrip-username", type=str, default=os.getenv("NTRIP_USERNAME", d["rtk_ntrip_username"]), help="NTRIP username; prefer NTRIP_USERNAME environment variable")
+    parser.add_argument("--rtk-ntrip-password", type=str, default=os.getenv("NTRIP_PASSWORD", d["rtk_ntrip_password"]), help="NTRIP password; prefer NTRIP_PASSWORD environment variable")
     parser.add_argument("--rtk-ntrip-gga", default=d["rtk_ntrip_gga"], help="Fixed GGA sentence; empty uses the latest receiver position")
     parser.add_argument("--rtk-ntrip-gga-interval", type=nonnegative_float, default=d["rtk_ntrip_gga_interval"], help="Seconds between GGA updates sent to the caster")
+    parser.add_argument("--rtk-ntrip-gga-max-age-s", type=nonnegative_float, default=d["rtk_ntrip_gga_max_age_s"], help="Maximum receiver GGA age in host monotonic seconds")
     parser.add_argument("--rtk-ntrip-reconnect-delay", type=nonnegative_float, default=d["rtk_ntrip_reconnect_delay"], help="Seconds before reconnecting after NTRIP failure")
     parser.add_argument("--rtk-ntrip-position-wait-s", type=nonnegative_float, default=d["rtk_ntrip_position_wait_s"], help="Seconds to wait for an initial GPS position before choosing a mountpoint")
     parser.add_argument("--rtk-ntrip-connect-timeout-s", type=nonnegative_float, default=d["rtk_ntrip_connect_timeout_s"], help="Seconds before giving up on an NTRIP TCP/header connection")
@@ -247,14 +251,37 @@ def apply_monitor_only_defaults(args):
 
 
 def parse_args(argv=None):
+    arguments = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = apply_legacy_compat_defaults(
         parse_args_with_yaml(
-            parser, argv, ignored_keys=REMOVED_CONFIG_KEYS,
+            parser, arguments, ignored_keys=REMOVED_CONFIG_KEYS,
             ignored_environment_keys=tuple(key.upper() for key in REMOVED_CONFIG_KEYS),
         )
     )
+    if os.getenv("JETSON_PIPELINE_MOBILE_RTK_RELAY") == "1":
+        # Recover the configured upstream endpoint before applying relay values.
+        from geonova_common.config_cli import load_yaml
+        configured = load_yaml(args.config.expanduser().resolve()) if args.config else {}
+        # Let argparse recognize explicit options, including accepted abbreviations.
+        unspecified = object()
+        parser.set_defaults(rtk_ntrip_host=unspecified, rtk_ntrip_port=unspecified)
+        explicit_args = parser.parse_args(arguments)
+        relay_applied = False
+        for key, environment_key, convert in (
+            ("rtk_ntrip_host", "NTRIP_HOST", str),
+            ("rtk_ntrip_port", "NTRIP_PORT", int),
+        ):
+            explicit = getattr(explicit_args, key) is not unspecified
+            if not explicit and os.getenv(environment_key):
+                setattr(args, key, convert(os.environ[environment_key]))
+                relay_applied = True
+        if relay_applied:
+            args.rtk_ntrip_caster_host = configured.get("rtk_ntrip_host", DEFAULTS["rtk_ntrip_host"])
+            args.rtk_ntrip_caster_port = configured.get("rtk_ntrip_port", DEFAULTS["rtk_ntrip_port"])
     try:
+        if args.rtk_ntrip_selection not in ("client", "caster"):
+            raise ValueError("rtk_ntrip_selection must be client or caster")
         validate_stereo_args(args)
         validate_size(args.rgb_width, args.rgb_height, "rgb")
         validate_size(args.depth_input_width, args.depth_input_height, "depth_input")

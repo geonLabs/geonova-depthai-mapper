@@ -270,6 +270,7 @@ class ControllerBridge:
         quality = str(sample.get("fix_quality") or "")
         details = runtime.gps_fix_details(quality)
         ntrip = getattr(reader, "rtk_client", None) if reader is not None else None
+        diagnostics = ntrip.diagnostics_snapshot() if ntrip and hasattr(ntrip, "diagnostics_snapshot") else {}
         last_sample_epoch_ms = (
             now_epoch_ms - int(age_s * 1000) if age_s is not None else None
         )
@@ -292,6 +293,14 @@ class ControllerBridge:
             "ntripConnected": bool(ntrip and getattr(ntrip, "connected", False)),
             "ntripMountpoint": getattr(ntrip, "current_mountpoint", None) if ntrip else None,
             "rtcmBytes": int(getattr(ntrip, "bytes_received", 0) or 0) if ntrip else 0,
+            "ntripSelection": diagnostics.get("ntripSelection"),
+            "ntripError": diagnostics.get("ntripError"),
+            "rtcmLastAtEpochMillis": diagnostics.get("rtcmLastAtEpochMillis"),
+            "rtcmMessageTypes": diagnostics.get("rtcmMessageTypes", []),
+            "rtcmSignals": diagnostics.get("rtcmSignals", []),
+            "rtcmBaseStationId": diagnostics.get("rtcmBaseStationId"),
+            "rtcmBaseDistanceM": diagnostics.get("rtcmBaseDistanceM"),
+            "ntripLastGgaSentAtEpochMillis": diagnostics.get("ntripLastGgaSentAtEpochMillis"),
             "error": getattr(reader, "error", None) if reader is not None else None,
         }
 

@@ -95,8 +95,10 @@ DEFAULTS = {
     "rtk_ntrip_host": "www.gnssdata.or.kr",
     "rtk_ntrip_port": 2101,
     "rtk_ntrip_mountpoint": "YANJ-RTCM31",
+    "rtk_ntrip_selection": "client",
     "rtk_ntrip_auto_mountpoint": True,
     "rtk_ntrip_mountpoint_format": "RTCM31",
+    "rtk_ntrip_required_messages": [],
     "rtk_ntrip_mountpoint_candidates": (
         "GANS-RTCM31,GUMC-RTCM31,DBON-RTCM31,PAJU-RTCM31,YONS-RTCM31,"
         "SOUL-RTCM31,INCH-RTCM31,ICOR-RTCM31,SONP-RTCM31,OJBU-RTCM31,"
@@ -107,6 +109,7 @@ DEFAULTS = {
     "rtk_ntrip_password": "",
     "rtk_ntrip_gga": "",
     "rtk_ntrip_gga_interval": 10.0,
+    "rtk_ntrip_gga_max_age_s": 5.0,
     "rtk_ntrip_reconnect_delay": 5.0,
     "rtk_ntrip_position_wait_s": 10.0,
     "rtk_ntrip_connect_timeout_s": 10.0,

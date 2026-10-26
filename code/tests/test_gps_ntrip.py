@@ -50,13 +50,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rtk-ntrip-host", default=d["rtk_ntrip_host"], help="NTRIP caster hostname")
     parser.add_argument("--rtk-ntrip-port", type=int, default=d["rtk_ntrip_port"], help="NTRIP caster TCP port")
     parser.add_argument("--rtk-ntrip-mountpoint", default=d["rtk_ntrip_mountpoint"], help="NTRIP correction mountpoint")
+    parser.add_argument("--rtk-ntrip-selection", choices=["client", "caster"], default=d["rtk_ntrip_selection"], help="Base station selection mode")
     parser.add_argument("--rtk-ntrip-auto-mountpoint", type=str2bool, nargs="?", const=True, default=d["rtk_ntrip_auto_mountpoint"], help="Choose the nearest NTRIP mountpoint from the caster source table after GPS position is known")
     parser.add_argument("--rtk-ntrip-mountpoint-format", default=d["rtk_ntrip_mountpoint_format"], help="Mountpoint suffix/format to auto-select")
+    parser.add_argument("--rtk-ntrip-required-messages", type=int, nargs="*", default=d["rtk_ntrip_required_messages"], help="Required source-table RTCM messages")
     parser.add_argument("--rtk-ntrip-mountpoint-candidates", default=d["rtk_ntrip_mountpoint_candidates"], help="Comma-separated fallback mountpoints")
     parser.add_argument("--rtk-ntrip-username", default=d["rtk_ntrip_username"], help="NTRIP username")
     parser.add_argument("--rtk-ntrip-password", default=d["rtk_ntrip_password"], help="NTRIP password")
     parser.add_argument("--rtk-ntrip-gga", default=d["rtk_ntrip_gga"], help="Fixed GGA sentence; empty uses receiver position")
     parser.add_argument("--rtk-ntrip-gga-interval", type=nonnegative_float, default=d["rtk_ntrip_gga_interval"], help="Seconds between GGA updates")
+    parser.add_argument("--rtk-ntrip-gga-max-age-s", type=nonnegative_float, default=d["rtk_ntrip_gga_max_age_s"], help="Maximum receiver GGA age")
     parser.add_argument("--rtk-ntrip-reconnect-delay", type=nonnegative_float, default=d["rtk_ntrip_reconnect_delay"], help="Seconds before reconnecting")
     parser.add_argument("--rtk-ntrip-position-wait-s", type=nonnegative_float, default=d["rtk_ntrip_position_wait_s"], help="Seconds to wait for an initial GPS position")
     parser.add_argument("--rtk-ntrip-connect-timeout-s", type=nonnegative_float, default=d["rtk_ntrip_connect_timeout_s"], help="Seconds before giving up on an NTRIP TCP/header connection")
@@ -121,6 +124,7 @@ def main() -> None:
         "ntrip_candidates": [entry.get("mountpoint") for entry in ntrip.mountpoint_sequence] if ntrip else [],
         "rtcm_bytes": ntrip.bytes_received if ntrip else 0,
         "ntrip_error": ntrip.error if ntrip else None,
+        "ntrip_diagnostics": ntrip.diagnostics_snapshot() if ntrip else None,
     }
     print(json.dumps(report, indent=2, ensure_ascii=False))
     if not report["passed"]:
